@@ -1,0 +1,1848 @@
+//! Hybrid OLAP + OLTP storage engine, v3: compressed + scalable.
+//!
+//! Everything from v2 (blocked bloom, CHD minimal perfect hash + u16 perm,
+//! fastrange, wyhash-style mixing, radix sort, zone maps, delete bitmaps,
+//! delta memtable) plus:
+//!
+//!   * PER-COLUMN COMPRESSION: every column in every granule is
+//!     frame-of-reference (FOR) bit-packed: value = base + w-bit payload.
+//!     Width is chosen per granule per column, so clustered data packs to a
+//!     few bits/row. Crucially FOR keeps O(1) RANDOM ACCESS (one shifted
+//!     u128 load), so MPH point lookups verify keys directly against
+//!     compressed data -- no decompression step, no row groups to inflate.
+//!     Values are zigzag-encoded first so negatives pack tightly.
+//!   * TABLE COMPRESSION: segments no longer store raw columns at all; the
+//!     packed granules ARE the table. Compression ratio reported per column
+//!     and for the whole table.
+//!   * SCALABLE BUILDS: granules are independent, so segment construction
+//!     (pack + bloom + MPH per granule) fans out across all cores with
+//!     std::thread::scope. Zero unsafe sharing, order-preserving join.
+//!   * K-WAY MERGE COMPACTION: segments are already sorted, so compaction is
+//!     a heap merge over live-row cursors -- O(N log S), no re-sort.
+//!   * BATCHED LOOKUPS (multi_get): two-phase per segment -- compute all MPH
+//!     positions, software-prefetch the packed key words, then verify.
+//!     Overlapping the cache misses buys memory-level parallelism that a
+//!     one-at-a-time get() can't reach.
+//!
+//! `cargo test --release` = correctness. `cargo run --release` = benchmark.
+
+use std::collections::HashMap;
+use std::hash::{BuildHasherDefault, Hasher};
+
+const GRANULE_SIZE: usize = 1024; // must be a power of two (u16 perm, shift math)
+const G_SHIFT: u32 = GRANULE_SIZE.trailing_zeros();
+const MPH_BUCKET_AVG: usize = 4;
+const FP_SEED: u64 = 0x243F_6A88_85A3_08D3;
+const FP_BITS: u32 = 6; // per-slot fingerprint width (1/64 false-positive rate)
+
+// ---------------------------------------------------------------- hashing
+#[inline(always)]
+fn mum(a: u64, b: u64) -> u64 {
+    let r = (a as u128).wrapping_mul(b as u128);
+    (r as u64) ^ ((r >> 64) as u64)
+}
+
+/// Seed enters as an odd multiplier: distinct seeds give decorrelated hash
+/// families (required for CHD displacement search to converge).
+#[inline(always)]
+fn hash_key(key: u64, seed: u64) -> u64 {
+    mum(mum(key ^ 0xA076_1D64_78BD_642F, seed | 1), seed ^ 0xE703_7ED1_A0B4_28DB)
+}
+
+/// Lemire fastrange: hash -> [0, n) with one multiply, no div/mod.
+#[inline(always)]
+fn fastrange(h: u64, n: usize) -> usize {
+    (((h as u128) * (n as u128)) >> 64) as usize
+}
+
+/// Key fingerprint from the precomputed FP hash's top bits.
+#[inline(always)]
+fn fp6(fph: u64) -> u64 {
+    fph >> (64 - FP_BITS)
+}
+
+#[inline(always)]
+fn prefetch_read(p: *const u8) {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+        _mm_prefetch(p as *const i8, _MM_HINT_T0);
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = p;
+}
+
+// ---------------------------------------------------------------- zigzag
+#[inline(always)]
+fn zz_enc(v: i64) -> u64 {
+    ((v as u64) << 1) ^ ((v >> 63) as u64)
+}
+#[inline(always)]
+fn zz_dec(z: u64) -> i64 {
+    ((z >> 1) as i64) ^ -((z & 1) as i64)
+}
+
+// ------------------------------------------- frame-of-reference bit packing
+/// FOR-packed u64 column chunk: value[i] = base + payload. The physical
+/// layout is chosen per chunk for decode speed:
+///   * width == 0    -> constant column: no payload stored at all.
+///   * width 1..=32  -> WORD-ALIGNED LANES: floor(64/w) values per word,
+///     never straddling a word boundary. Random access replaces the divide
+///     with a magic-reciprocal multiply; bulk decode reads each word once and
+///     extracts lanes in a branch-free shift loop LLVM unrolls/vectorizes.
+///     Costs up to (64 mod (64/w*w)) pad bits per word.
+///   * width 33..=64 -> TIGHT STRADDLED: O(1) access via one shifted u128
+///     load. Wide payloads compress < 2x regardless and in practice are key
+///     columns -- point-verified and binary-searched, never bulk-decoded --
+///     so they keep maximum density while scan columns get the fast layout.
+pub struct PackedU64 {
+    base: u64,
+    width: u32,
+    per_word: u32, // lanes per word; 0 => constant or straddled layout
+    recip: u64,    // ceil(2^32 / per_word): branch-free i / per_word
+    mask: u64,
+    words: Vec<u64>, // +1 pad word so straddled get() never branches
+}
+
+impl PackedU64 {
+    fn pack(vals: &[u64]) -> Self {
+        let n = vals.len();
+        if n == 0 {
+            return PackedU64 { base: 0, width: 0, per_word: 0, recip: 0, mask: 0, words: vec![0; 2] };
+        }
+        let base = *vals.iter().min().unwrap();
+        let range = *vals.iter().max().unwrap() - base;
+        let width = (64 - range.leading_zeros()) as usize;
+        let mask = if width == 0 {
+            0
+        } else if width == 64 {
+            u64::MAX
+        } else {
+            (1u64 << width) - 1
+        };
+        if width == 0 {
+            return PackedU64 { base, width: 0, per_word: 0, recip: 0, mask, words: vec![0; 2] };
+        }
+        if width <= 32 {
+            let per = 64 / width; // 2..=64 lanes
+            let recip = ((1u64 << 32) + per as u64 - 1) / per as u64;
+            let mut words = vec![0u64; (n + per - 1) / per + 1];
+            for (i, &v) in vals.iter().enumerate() {
+                words[i / per] |= (v - base) << ((i % per) * width);
+            }
+            return PackedU64 { base, width: width as u32, per_word: per as u32, recip, mask, words };
+        }
+        // straddled
+        let mut words = vec![0u64; ((n * width + 63) / 64 + 1).max(2)];
+        let mut bit = 0usize;
+        for &v in vals {
+            let d = v - base;
+            let (wi, off) = (bit >> 6, bit & 63);
+            words[wi] |= d << off;
+            if off + width > 64 {
+                words[wi + 1] |= d >> (64 - off);
+            }
+            bit += width;
+        }
+        PackedU64 { base, width: width as u32, per_word: 0, recip: 0, mask, words }
+    }
+
+    #[inline(always)]
+    fn get(&self, i: usize) -> u64 {
+        let per = self.per_word as usize;
+        if per != 0 {
+            // exact for i < 2^26 given per <= 64; granules are <= 1024 rows
+            let q = ((i as u64).wrapping_mul(self.recip) >> 32) as usize;
+            let r = i - q * per;
+            let w = unsafe { *self.words.get_unchecked(q) };
+            self.base.wrapping_add((w >> (r * self.width as usize)) & self.mask)
+        } else if self.width == 0 {
+            self.base
+        } else {
+            let bit = i * self.width as usize;
+            let (wi, off) = (bit >> 6, bit & 63);
+            // SAFETY: wi+1 < words.len() by the pad word
+            let pair = unsafe {
+                (*self.words.get_unchecked(wi) as u128)
+                    | ((*self.words.get_unchecked(wi + 1) as u128) << 64)
+            };
+            self.base.wrapping_add(((pair >> off) as u64) & self.mask)
+        }
+    }
+
+    /// Bulk decode [s, e) into `out[..e-s]`. The aligned path reads each word
+    /// once and extracts all lanes with constant-stride shifts.
+    fn unpack_range(&self, s: usize, e: usize, out: &mut [u64]) {
+        debug_assert!(s <= e && out.len() >= e - s);
+        let base = self.base;
+        let per = self.per_word as usize;
+        if per != 0 {
+            let w = self.width as usize;
+            let mask = self.mask;
+            let (mut i, mut k) = (s, 0usize);
+            while i < e && i % per != 0 {
+                out[k] = base.wrapping_add((self.words[i / per] >> ((i % per) * w)) & mask);
+                i += 1;
+                k += 1;
+            }
+            let nwords = (e - i) / per;
+            if nwords > 0 {
+                let fw = i / per;
+                let dst = &mut out[k..k + nwords * per];
+                // monomorphized per lane count: inner loop fully unrolled,
+                // lane shifts become vpsrlvq-style SIMD with target-cpu=native
+                match per {
+                    2 => self.unpack_words::<2>(fw, nwords, dst),
+                    3 => self.unpack_words::<3>(fw, nwords, dst),
+                    4 => self.unpack_words::<4>(fw, nwords, dst),
+                    5 => self.unpack_words::<5>(fw, nwords, dst),
+                    6 => self.unpack_words::<6>(fw, nwords, dst),
+                    7 => self.unpack_words::<7>(fw, nwords, dst),
+                    8 => self.unpack_words::<8>(fw, nwords, dst),
+                    9 => self.unpack_words::<9>(fw, nwords, dst),
+                    10 => self.unpack_words::<10>(fw, nwords, dst),
+                    12 => self.unpack_words::<12>(fw, nwords, dst),
+                    16 => self.unpack_words::<16>(fw, nwords, dst),
+                    21 => self.unpack_words::<21>(fw, nwords, dst),
+                    32 => self.unpack_words::<32>(fw, nwords, dst),
+                    64 => self.unpack_words::<64>(fw, nwords, dst),
+                    _ => self.unpack_words_dyn(fw, nwords, per, dst),
+                }
+                i += nwords * per;
+                k += nwords * per;
+            }
+            while i < e {
+                out[k] = base.wrapping_add((self.words[i / per] >> ((i % per) * w)) & mask);
+                i += 1;
+                k += 1;
+            }
+        } else if self.width == 0 {
+            out[..e - s].fill(base);
+        } else {
+            let w = self.width as usize;
+            let mask = self.mask;
+            let mut bit = s * w;
+            for o in out[..e - s].iter_mut() {
+                let (wi, off) = (bit >> 6, bit & 63);
+                let pair = unsafe {
+                    (*self.words.get_unchecked(wi) as u128)
+                        | ((*self.words.get_unchecked(wi + 1) as u128) << 64)
+                };
+                *o = base.wrapping_add(((pair >> off) as u64) & mask);
+                bit += w;
+            }
+        }
+    }
+
+    #[inline(always)]
+    fn unpack_words<const PER: usize>(&self, first_word: usize, nwords: usize, out: &mut [u64]) {
+        let (base, w, mask) = (self.base, self.width as usize, self.mask);
+        for wi in 0..nwords {
+            let word = unsafe { *self.words.get_unchecked(first_word + wi) };
+            for l in 0..PER {
+                unsafe {
+                    *out.get_unchecked_mut(wi * PER + l) =
+                        base.wrapping_add((word >> (l * w)) & mask);
+                }
+            }
+        }
+    }
+
+    fn unpack_words_dyn(&self, first_word: usize, nwords: usize, per: usize, out: &mut [u64]) {
+        let (base, w, mask) = (self.base, self.width as usize, self.mask);
+        for wi in 0..nwords {
+            let word = unsafe { *self.words.get_unchecked(first_word + wi) };
+            for l in 0..per {
+                unsafe {
+                    *out.get_unchecked_mut(wi * per + l) =
+                        base.wrapping_add((word >> (l * w)) & mask);
+                }
+            }
+        }
+    }
+
+    #[inline(always)]
+    fn prefetch(&self, i: usize) {
+        let per = self.per_word as usize;
+        let wi = if per != 0 {
+            ((i as u64).wrapping_mul(self.recip) >> 32) as usize
+        } else {
+            (i * self.width as usize) >> 6
+        };
+        prefetch_read(unsafe { self.words.as_ptr().add(wi.min(self.words.len() - 1)) } as *const u8);
+    }
+
+    fn bytes(&self) -> usize {
+        self.words.len() * 8 + 32
+    }
+}
+
+/// Interpolation-guided lower bound directly over packed sorted data.
+fn packed_lower_bound(p: &PackedU64, len: usize, target: u64) -> usize {
+    let (mut lo, mut hi) = (0usize, len);
+    while lo < hi {
+        let mid = if hi - lo > 8 {
+            let (klo, khi) = (p.get(lo) as u128, p.get(hi - 1) as u128);
+            if khi > klo {
+                let t = (target as u128).clamp(klo, khi);
+                lo + (((t - klo) * (hi - lo - 1) as u128) / (khi - klo)) as usize
+            } else {
+                lo + (hi - lo) / 2
+            }
+        } else {
+            lo + (hi - lo) / 2
+        };
+        let mid = mid.clamp(lo, hi - 1);
+        if p.get(mid) < target {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    lo
+}
+
+// ---------------------------------------------------------------- bitset
+#[derive(Default, Clone)]
+pub struct BitSet {
+    words: Vec<u64>,
+}
+
+impl BitSet {
+    /// Lazily allocated: a clean (post-compaction) segment stores 0 bytes.
+    fn new() -> Self {
+        BitSet { words: Vec::new() }
+    }
+    /// Returns true if the bit was newly set.
+    #[inline(always)]
+    fn set(&mut self, i: usize) -> bool {
+        let w = i / 64;
+        if self.words.len() <= w {
+            self.words.resize(w + 1, 0);
+        }
+        let m = 1u64 << (i % 64);
+        let fresh = self.words[w] & m == 0;
+        self.words[w] |= m;
+        fresh
+    }
+    #[inline(always)]
+    fn get(&self, i: usize) -> bool {
+        let w = i / 64;
+        w < self.words.len() && (self.words[w] >> (i % 64)) & 1 == 1
+    }
+    fn bytes(&self) -> usize {
+        self.words.len() * 8
+    }
+}
+
+// ------------------------------------------- minimal perfect hash (CHD)
+pub struct Mph {
+    seeds: PackedU64, // displacement seeds are small; FOR bit-packed
+    nb: u32,
+    gs: u64,
+    n: usize,
+}
+
+impl Mph {
+    fn build(keys: &[u64]) -> Self {
+        let n = keys.len();
+        if n == 0 {
+            return Mph { seeds: PackedU64::pack(&[]), nb: 1, gs: 0, n: 0 };
+        }
+        let nb = (n + MPH_BUCKET_AVG - 1) / MPH_BUCKET_AVG;
+        'global: for attempt in 0..256u64 {
+            let gs = attempt.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0x51_7C_C1_B7;
+            let mut count = vec![0u32; nb + 1];
+            let bids: Vec<u32> = keys
+                .iter()
+                .map(|&k| fastrange(hash_key(k, gs), nb) as u32)
+                .collect();
+            for &b in &bids {
+                count[b as usize + 1] += 1;
+            }
+            for i in 0..nb {
+                count[i + 1] += count[i];
+            }
+            let mut flat = vec![0u64; n];
+            let mut cursor = count.clone();
+            for (i, &k) in keys.iter().enumerate() {
+                let b = bids[i] as usize;
+                flat[cursor[b] as usize] = k;
+                cursor[b] += 1;
+            }
+            let mut order: Vec<u32> = (0..nb as u32).collect();
+            order.sort_unstable_by_key(|&b| {
+                std::cmp::Reverse(count[b as usize + 1] - count[b as usize])
+            });
+
+            let mut occupied = vec![0u64; (n + 63) / 64];
+            let mut seeds = vec![0u32; nb];
+            for &bi in &order {
+                let (lo, hi) = (count[bi as usize] as usize, count[bi as usize + 1] as usize);
+                if lo == hi {
+                    continue;
+                }
+                let bucket = &flat[lo..hi];
+                let mut done = false;
+                'seed: for d in 1..=1_000_000u32 {
+                    let s = gs ^ ((d as u64) << 32);
+                    let mut placed = [0u32; 64];
+                    let mut np = 0usize;
+                    for &k in bucket {
+                        let p = fastrange(hash_key(k, s), n) as u32;
+                        if occupied[p as usize / 64] >> (p % 64) & 1 == 1
+                            || placed[..np].contains(&p)
+                        {
+                            continue 'seed;
+                        }
+                        placed[np] = p;
+                        np += 1;
+                    }
+                    for &p in &placed[..np] {
+                        occupied[p as usize / 64] |= 1 << (p % 64);
+                    }
+                    seeds[bi as usize] = d;
+                    done = true;
+                    break;
+                }
+                if !done {
+                    continue 'global;
+                }
+            }
+            let seeds64: Vec<u64> = seeds.iter().map(|&d| d as u64).collect();
+            return Mph { seeds: PackedU64::pack(&seeds64), nb: nb as u32, gs, n };
+        }
+        unreachable!("MPH construction failed");
+    }
+
+    #[inline(always)]
+    fn lookup(&self, key: u64) -> usize {
+        let d = self.seeds.get(fastrange(hash_key(key, self.gs), self.nb as usize));
+        fastrange(hash_key(key, self.gs ^ (d << 32)), self.n)
+    }
+
+    fn bytes(&self) -> usize {
+        self.seeds.bytes()
+    }
+}
+
+// ------------------------------------------------- segment-level filter
+/// One split-block bloom per SEGMENT (not per granule), 6 bits/key: a miss
+/// skips a whole foreign segment with a single cache-line probe before any
+/// MPH work. Only consulted when multiple segments exist; after compaction
+/// the per-granule fingerprints alone carry the filtering. Reuses the fp
+/// hash computed once per lookup -- zero extra hashing.
+const SEG_FILTER_BITS_PER_KEY: usize = 6;
+const FILTER_SALTS: [u64; 8] = [
+    0x47B6_137B_4497_4D91,
+    0x8824_AD5B_A2B7_289D,
+    0x7054_95C7_2DF1_424B,
+    0x9EFC_4947_5C6B_FB31,
+    0x5C6B_FB31_7054_95C7,
+    0x2DF1_424B_9EFC_4947,
+    0x4497_4D91_8824_AD5B,
+    0xA2B7_289D_47B6_137B,
+];
+
+#[repr(align(64))]
+#[derive(Clone, Copy)]
+struct FilterBlock([u64; 8]);
+
+pub struct SegFilter {
+    blocks: Vec<FilterBlock>,
+}
+
+impl SegFilter {
+    fn new(n: usize) -> Self {
+        let nblocks = ((n * SEG_FILTER_BITS_PER_KEY + 511) / 512).max(1);
+        SegFilter { blocks: vec![FilterBlock([0; 8]); nblocks] }
+    }
+    #[inline]
+    fn insert(&mut self, key: u64) {
+        let h = hash_key(key, FP_SEED);
+        let nb = self.blocks.len();
+        let blk = &mut self.blocks[fastrange(h, nb)].0;
+        for i in 0..8 {
+            blk[i] |= 1u64 << (h.wrapping_mul(FILTER_SALTS[i]) >> 58);
+        }
+    }
+    #[inline(always)]
+    fn contains_hash(&self, h: u64) -> bool {
+        let blk = unsafe { &self.blocks.get_unchecked(fastrange(h, self.blocks.len())).0 };
+        let mut ok = 1u64;
+        for i in 0..8 {
+            ok &= blk[i] >> (h.wrapping_mul(FILTER_SALTS[i]) >> 58);
+        }
+        ok & 1 == 1
+    }
+    fn bytes(&self) -> usize {
+        self.blocks.len() * 64
+    }
+}
+
+// ---------------------------------------------------------------- radix sort
+type Row = (u64, i64, u32);
+
+fn radix_sort_rows(rows: &mut Vec<Row>) {
+    let n = rows.len();
+    if n < 128 {
+        rows.sort_unstable_by_key(|r| r.0);
+        return;
+    }
+    let mut buf: Vec<Row> = vec![(0, 0, 0); n];
+    let mut counts = vec![0u32; 65536];
+    for pass in 0..4 {
+        let shift = pass * 16;
+        counts.iter_mut().for_each(|c| *c = 0);
+        for r in rows.iter() {
+            counts[((r.0 >> shift) & 0xFFFF) as usize] += 1;
+        }
+        let mut sum = 0u32;
+        for c in counts.iter_mut() {
+            let t = *c;
+            *c = sum;
+            sum += t;
+        }
+        for r in rows.iter() {
+            let d = ((r.0 >> shift) & 0xFFFF) as usize;
+            unsafe {
+                *buf.get_unchecked_mut(counts[d] as usize) = *r;
+            }
+            counts[d] += 1;
+        }
+        std::mem::swap(rows, &mut buf);
+    }
+}
+
+// ---------------------------------------------------------------- granule
+/// A granule owns its (compressed) columns. Its start row is implicit:
+/// granule i covers rows [i << G_SHIFT, i << G_SHIFT + len).
+pub struct Granule {
+    len: usize,
+    min: u64,
+    max: u64,
+    mph: Mph,
+    /// LEARNED RANKS: the sorted row is predicted by linear interpolation
+    /// over [min, max] (one multiply via `pmul` fixed-point scale), and only
+    /// the small per-key prediction ERROR is stored, fused with a 6-bit
+    /// fingerprint into one packed record per MPH slot:
+    ///     rec = fp6(key) << ebits | (rank - predicted - err_bias)
+    /// Clustered keys predict near-exactly (0-1 error bits/row); uniform
+    /// random keys need ~7. One record load filters foreign keys (1/64 FP)
+    /// and yields the row. Verification against the packed key stays exact.
+    fpr: PackedU64,
+    pmul: u64,     // ((len-1) << 64) / (max-min), saturating
+    err_bias: i32, // minimum prediction error (FOR bias for the error field)
+    ebits: u32,    // error field width
+    emask: u64,
+    keys: PackedU64, // FOR-packed sorted keys, O(1) access
+    vals: PackedU64, // zigzag + FOR-packed values
+    cats: PackedU64, // FOR-packed categories
+}
+
+impl Granule {
+    fn build(chunk: &[Row]) -> Self {
+        let len = chunk.len();
+        let keys_raw: Vec<u64> = chunk.iter().map(|r| r.0).collect();
+        let vals_raw: Vec<u64> = chunk.iter().map(|r| zz_enc(r.1)).collect();
+        let cats_raw: Vec<u64> = chunk.iter().map(|r| r.2 as u64).collect();
+        let mph = Mph::build(&keys_raw);
+        let (min, max) = (keys_raw[0], keys_raw[len - 1]);
+        let range = max - min;
+        let pmul = if range == 0 {
+            0
+        } else {
+            ((((len - 1) as u128) << 64) / range as u128).min(u64::MAX as u128) as u64
+        };
+        let predict =
+            |k: u64| -> i64 { ((((k - min) as u128) * pmul as u128) >> 64) as i64 };
+        let errs: Vec<i64> = keys_raw
+            .iter()
+            .enumerate()
+            .map(|(row, &k)| row as i64 - predict(k))
+            .collect();
+        let err_bias = *errs.iter().min().unwrap();
+        let espan = (*errs.iter().max().unwrap() - err_bias) as u64;
+        let ebits = 64 - espan.leading_zeros();
+        let emask = if ebits == 0 { 0 } else { (1u64 << ebits) - 1 };
+        let mut recs = vec![0u64; len];
+        for (row, &k) in keys_raw.iter().enumerate() {
+            recs[mph.lookup(k)] = (fp6(hash_key(k, FP_SEED)) << ebits)
+                | (errs[row] - err_bias) as u64;
+        }
+        Granule {
+            len,
+            min,
+            max,
+            mph,
+            fpr: PackedU64::pack(&recs),
+            pmul,
+            err_bias: err_bias as i32,
+            ebits,
+            emask,
+            keys: PackedU64::pack(&keys_raw),
+            vals: PackedU64::pack(&vals_raw),
+            cats: PackedU64::pack(&cats_raw),
+        }
+    }
+    fn data_bytes(&self) -> usize {
+        self.keys.bytes() + self.vals.bytes() + self.cats.bytes()
+    }
+    fn index_bytes(&self) -> usize {
+        self.mph.bytes() + self.fpr.bytes() + 16
+    }
+}
+
+// ---------------------------------------------------------------- segment
+pub struct Segment {
+    n_rows: usize,
+    granules: Vec<Granule>,
+    first_keys: Vec<u64>,
+    seg_max: u64,
+    deleted: BitSet,
+    deleted_count: usize,
+    /// O(1) granule router: key -> ((key - base) >> shift) buckets bracketing
+    /// the sparse-index answer, leaving only a tiny bounded binary search.
+    route_base: u64,
+    route_shift: u32,
+    router: Vec<u32>,
+    /// Built lazily only once a second segment exists (misses then skip
+    /// foreign segments in one probe); a compacted single-segment table
+    /// stores no filter at all.
+    filter: Option<SegFilter>,
+}
+
+#[derive(Default, Debug)]
+pub struct Stats {
+    pub filter_negative: u64,
+    pub zone_pruned_point: u64,
+    pub zone_pruned_scan: u64,
+    pub mph_probes: u64,
+    pub mph_false_probe: u64,
+}
+
+impl Segment {
+    /// `rows` must be sorted by key, keys unique. Granule construction
+    /// (pack + fingerprints + MPH) is embarrassingly parallel -> fan out over cores.
+    fn build(rows: Vec<Row>) -> Self {
+        let n = rows.len();
+        let chunks: Vec<&[Row]> = rows.chunks(GRANULE_SIZE).collect();
+        let nthreads = std::thread::available_parallelism()
+            .map(|p| p.get())
+            .unwrap_or(1)
+            .min(chunks.len().max(1));
+        let granules: Vec<Granule> = if nthreads > 1 && chunks.len() >= 8 {
+            let per = (chunks.len() + nthreads - 1) / nthreads;
+            std::thread::scope(|s| {
+                let handles: Vec<_> = chunks
+                    .chunks(per)
+                    .map(|part| s.spawn(move || part.iter().map(|c| Granule::build(c)).collect::<Vec<_>>()))
+                    .collect();
+                handles
+                    .into_iter()
+                    .flat_map(|h| h.join().expect("granule build thread panicked"))
+                    .collect()
+            })
+        } else {
+            chunks.iter().map(|c| Granule::build(c)).collect()
+        };
+        let first_keys: Vec<u64> = granules.iter().map(|g| g.min).collect();
+        let seg_max = granules.last().map(|g| g.max).unwrap_or(0);
+        let (route_base, route_shift, router) = Self::build_router(&first_keys, seg_max);
+        Segment {
+            n_rows: n,
+            seg_max,
+            granules,
+            first_keys,
+            deleted: BitSet::new(),
+            deleted_count: 0,
+            route_base,
+            route_shift,
+            router,
+            filter: None,
+        }
+    }
+
+    /// (Re)construct the segment filter by decoding the packed key column.
+    fn build_filter(&mut self) {
+        let mut f = SegFilter::new(self.n_rows);
+        let mut buf = [0u64; GRANULE_SIZE];
+        for g in &self.granules {
+            g.keys.unpack_range(0, g.len, &mut buf);
+            for &k in &buf[..g.len] {
+                f.insert(k);
+            }
+        }
+        self.filter = Some(f);
+    }
+
+    fn build_router(first_keys: &[u64], seg_max: u64) -> (u64, u32, Vec<u32>) {
+        let ngran = first_keys.len();
+        if ngran == 0 {
+            return (0, 63, vec![0, 0]);
+        }
+        let base = first_keys[0];
+        let range = seg_max - base;
+        let nb = (ngran * 2).next_power_of_two().clamp(2, 1 << 20);
+        let rb = 64 - range.leading_zeros();
+        let shift = rb.saturating_sub(nb.trailing_zeros());
+        let mut router = Vec::with_capacity(nb + 1);
+        for b in 0..=nb as u128 {
+            let start = base.saturating_add((b << shift).min(u64::MAX as u128) as u64);
+            router.push(first_keys.partition_point(|&fk| fk <= start) as u32);
+        }
+        (base, shift, router)
+    }
+
+    /// Router bucket + bounded binary search = granule index for `key`,
+    /// or None if key precedes the segment.
+    #[inline(always)]
+    fn locate_granule(&self, key: u64) -> Option<usize> {
+        if key < self.route_base {
+            return None;
+        }
+        let idx =
+            (((key - self.route_base) >> self.route_shift) as usize).min(self.router.len() - 2);
+        let (lo, hi) = unsafe {
+            (
+                *self.router.get_unchecked(idx) as usize,
+                *self.router.get_unchecked(idx + 1) as usize,
+            )
+        };
+        let p = lo + self.first_keys[lo..hi].partition_point(|&fk| fk <= key);
+        if p == 0 {
+            None
+        } else {
+            Some(p - 1)
+        }
+    }
+
+    /// Phase 1 of a lookup: router -> zone map -> MPH slot -> fused
+    /// fingerprint|rank record. One record load both filters foreign keys
+    /// (1/256 FP) and yields the sorted row. Verification against packed
+    /// keys is phase 2 (find_live does both; multi_get splits them to
+    /// overlap the cache misses).
+    #[inline]
+    fn candidate(&self, key: u64, fph: u64, stats: &mut Stats) -> Option<(u32, u16)> {
+        if key > self.seg_max {
+            return None;
+        }
+        let gi = self.locate_granule(key)?;
+        let g = unsafe { self.granules.get_unchecked(gi) };
+        if key > g.max {
+            stats.zone_pruned_point += 1;
+            return None;
+        }
+        stats.mph_probes += 1;
+        let rec = g.fpr.get(g.mph.lookup(key));
+        if rec >> g.ebits != fp6(fph) {
+            stats.filter_negative += 1;
+            return None;
+        }
+        // learned rank: interpolation prediction + stored error. Clamped so a
+        // fingerprint-colliding foreign key can never index out of bounds.
+        let pred = (((key - g.min) as u128 * g.pmul as u128) >> 64) as i64;
+        let row = (pred + g.err_bias as i64 + (rec & g.emask) as i64)
+            .clamp(0, g.len as i64 - 1) as usize;
+        Some((gi as u32, row as u16))
+    }
+
+    #[inline]
+    fn find_live(&self, key: u64, fph: u64, stats: &mut Stats) -> Option<usize> {
+        let (gi, row) = self.candidate(key, fph, stats)?;
+        let g = unsafe { self.granules.get_unchecked(gi as usize) };
+        if g.keys.get(row as usize) != key {
+            stats.mph_false_probe += 1;
+            return None;
+        }
+        let pos = ((gi as usize) << G_SHIFT) + row as usize;
+        if self.deleted.get(pos) {
+            return None;
+        }
+        Some(pos)
+    }
+
+    #[inline]
+    fn row_at(&self, pos: usize) -> Row {
+        let g = &self.granules[pos >> G_SHIFT];
+        let i = pos & (GRANULE_SIZE - 1);
+        (g.keys.get(i), zz_dec(g.vals.get(i)), g.cats.get(i) as u32)
+    }
+
+    fn data_bytes(&self) -> usize {
+        self.granules.iter().map(|g| g.data_bytes()).sum()
+    }
+    fn index_bytes(&self) -> usize {
+        self.first_keys.len() * 8
+            + self.router.len() * 4
+            + 24
+            + self.deleted.bytes()
+            + self.filter.as_ref().map_or(0, |f| f.bytes())
+            + self.granules.iter().map(|g| g.index_bytes()).sum::<usize>()
+    }
+}
+
+// ---------------------------------------------------------------- database
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum DeltaOp {
+    Put(i64, u32),
+    Del,
+}
+
+#[derive(Default)]
+pub struct FastHasher(u64);
+impl Hasher for FastHasher {
+    #[inline(always)]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    #[inline(always)]
+    fn write_u64(&mut self, x: u64) {
+        self.0 = mum(x ^ 0x2545_F491_4F6C_DD1D, 0x9E37_79B9_7F4A_7C15);
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 = mum(self.0 ^ b as u64, 0x9E37_79B9_7F4A_7C15);
+        }
+    }
+}
+type DeltaMap = HashMap<u64, DeltaOp, BuildHasherDefault<FastHasher>>;
+
+pub struct Db {
+    delta: DeltaMap,
+    segments: Vec<Segment>,
+    delta_limit: usize,
+    pub stats: Stats,
+}
+
+impl Db {
+    pub fn new(delta_limit: usize) -> Self {
+        Db {
+            delta: DeltaMap::default(),
+            segments: Vec::new(),
+            delta_limit,
+            stats: Stats::default(),
+        }
+    }
+
+    // ---------------- OLTP writes ----------------
+    #[inline]
+    pub fn put(&mut self, key: u64, value: i64, category: u32) {
+        self.delta.insert(key, DeltaOp::Put(value, category));
+        if self.delta.len() >= self.delta_limit {
+            self.flush();
+        }
+    }
+
+    #[inline]
+    pub fn delete(&mut self, key: u64) {
+        self.delta.insert(key, DeltaOp::Del);
+        if self.delta.len() >= self.delta_limit {
+            self.flush();
+        }
+    }
+
+    // ---------------- OLTP reads ----------------
+    #[inline]
+    pub fn get(&mut self, key: u64) -> Option<(i64, u32)> {
+        if !self.delta.is_empty() {
+            match self.delta.get(&key) {
+                Some(DeltaOp::Put(v, c)) => return Some((*v, *c)),
+                Some(DeltaOp::Del) => return None,
+                None => {}
+            }
+        }
+        let fph = hash_key(key, FP_SEED); // once, shared by every segment
+        let multi = self.segments.len() > 1;
+        let stats = &mut self.stats;
+        for seg in self.segments.iter().rev() {
+            if multi {
+                if let Some(f) = &seg.filter {
+                    if !f.contains_hash(fph) {
+                        stats.filter_negative += 1;
+                        continue;
+                    }
+                }
+            }
+            if let Some(pos) = seg.find_live(key, fph, stats) {
+                let g = &seg.granules[pos >> G_SHIFT];
+                let i = pos & (GRANULE_SIZE - 1);
+                return Some((zz_dec(g.vals.get(i)), g.cats.get(i) as u32));
+            }
+        }
+        None
+    }
+
+    /// Batched point lookups. Per segment: phase 1 computes every candidate's
+    /// packed-key location and prefetches it; phase 2 verifies + reads values.
+    /// Overlapped misses = memory-level parallelism.
+    pub fn multi_get(&mut self, qk: &[u64], out: &mut [Option<(i64, u32)>]) {
+        assert_eq!(qk.len(), out.len());
+        out.iter_mut().for_each(|o| *o = None);
+        let mut pending: Vec<u32> = (0..qk.len() as u32).collect();
+        if !self.delta.is_empty() {
+            pending.retain(|&qi| match self.delta.get(&qk[qi as usize]) {
+                Some(DeltaOp::Put(v, c)) => {
+                    out[qi as usize] = Some((*v, *c));
+                    false
+                }
+                Some(DeltaOp::Del) => false, // out stays None
+                None => true,
+            });
+        }
+        let stats = &mut self.stats;
+        let mut cands: Vec<(u32, u32, u16)> = Vec::with_capacity(pending.len());
+        for seg in self.segments.iter().rev() {
+            if pending.is_empty() {
+                break;
+            }
+            cands.clear();
+            let mut next_pending: Vec<u32> = Vec::with_capacity(pending.len());
+            // phase 1: locate + prefetch
+            let multi = self.segments.len() > 1;
+            for &qi in &pending {
+                let key = qk[qi as usize];
+                let fph = hash_key(key, FP_SEED);
+                if multi {
+                    if let Some(f) = &seg.filter {
+                        if !f.contains_hash(fph) {
+                            stats.filter_negative += 1;
+                            next_pending.push(qi);
+                            continue;
+                        }
+                    }
+                }
+                match seg.candidate(key, fph, stats) {
+                    Some((gi, row)) => {
+                        let g = unsafe { seg.granules.get_unchecked(gi as usize) };
+                        g.keys.prefetch(row as usize);
+                        cands.push((qi, gi, row));
+                    }
+                    None => next_pending.push(qi),
+                }
+            }
+            // phase 2: verify + read (prefetched lines now resident)
+            for &(qi, gi, row) in &cands {
+                let g = unsafe { seg.granules.get_unchecked(gi as usize) };
+                let key = qk[qi as usize];
+                let pos = ((gi as usize) << G_SHIFT) + row as usize;
+                if g.keys.get(row as usize) == key && !seg.deleted.get(pos) {
+                    out[qi as usize] =
+                        Some((zz_dec(g.vals.get(row as usize)), g.cats.get(row as usize) as u32));
+                } else {
+                    stats.mph_false_probe += 1;
+                    next_pending.push(qi);
+                }
+            }
+            pending = next_pending;
+        }
+    }
+
+    pub fn flush(&mut self) {
+        if self.delta.is_empty() {
+            return;
+        }
+        let mut rows: Vec<Row> = Vec::with_capacity(self.delta.len());
+        let mut touched: Vec<u64> = Vec::with_capacity(self.delta.len());
+        for (k, op) in self.delta.drain() {
+            touched.push(k);
+            if let DeltaOp::Put(v, c) = op {
+                rows.push((k, v, c));
+            }
+        }
+        // existing segments are about to coexist with a new one: give each a
+        // filter (built once, by decoding its packed keys) so marking and
+        // future lookups can skip foreign segments in one probe
+        for seg in self.segments.iter_mut() {
+            if seg.filter.is_none() {
+                seg.build_filter();
+            }
+        }
+        let stats = &mut self.stats;
+        for &k in &touched {
+            let fph = hash_key(k, FP_SEED);
+            for seg in self.segments.iter_mut() {
+                if let Some(f) = &seg.filter {
+                    if !f.contains_hash(fph) {
+                        continue;
+                    }
+                }
+                if let Some(pos) = seg.find_live(k, fph, stats) {
+                    if seg.deleted.set(pos) {
+                        seg.deleted_count += 1;
+                    }
+                    break;
+                }
+            }
+        }
+        radix_sort_rows(&mut rows);
+        if !rows.is_empty() {
+            self.segments.push(Segment::build(rows));
+        }
+    }
+
+    /// Segments are sorted and live keys are disjoint across segments, so
+    /// compaction is a k-way heap merge over live-row cursors: O(N log S).
+    pub fn compact(&mut self) {
+        self.flush();
+        if self.segments.len() == 1 && self.segments[0].deleted_count == 0 {
+            return; // already compact
+        }
+        use std::cmp::Reverse;
+        use std::collections::BinaryHeap;
+
+        let total: usize = self
+            .segments
+            .iter()
+            .map(|s| s.n_rows - s.deleted_count)
+            .sum();
+        let next_live = |seg: &Segment, mut pos: usize| -> Option<usize> {
+            while pos < seg.n_rows {
+                if !seg.deleted.get(pos) {
+                    return Some(pos);
+                }
+                pos += 1;
+            }
+            None
+        };
+        let mut cursors: Vec<usize> = Vec::with_capacity(self.segments.len());
+        let mut heap: BinaryHeap<Reverse<(u64, usize)>> = BinaryHeap::new();
+        for (si, seg) in self.segments.iter().enumerate() {
+            match next_live(seg, 0) {
+                Some(pos) => {
+                    cursors.push(pos);
+                    heap.push(Reverse((seg.row_at(pos).0, si)));
+                }
+                None => cursors.push(seg.n_rows),
+            }
+        }
+        let mut rows: Vec<Row> = Vec::with_capacity(total);
+        while let Some(Reverse((_, si))) = heap.pop() {
+            let seg = &self.segments[si];
+            let pos = cursors[si];
+            rows.push(seg.row_at(pos));
+            if let Some(np) = next_live(seg, pos + 1) {
+                cursors[si] = np;
+                heap.push(Reverse((seg.row_at(np).0, si)));
+            }
+        }
+        self.segments.clear();
+        if !rows.is_empty() {
+            self.segments.push(Segment::build(rows)); // parallel granule build
+        }
+    }
+
+    /// Scalable bulk ingest for a fresh table: radix sort + one parallel
+    /// segment build. O(N) end to end -- no per-key delta machinery. Keys
+    /// must be unique; rows may arrive in any order.
+    pub fn bulk_load(&mut self, mut rows: Vec<Row>) {
+        radix_sort_rows(&mut rows);
+        if !rows.is_empty() {
+            self.segments.push(Segment::build(rows));
+        }
+    }
+
+    // ---------------- OLAP reads ----------------
+    /// SUM(value) WHERE key BETWEEN a AND b: zone-map pruning + interpolation
+    /// search over packed keys; decode-and-accumulate over packed values.
+    pub fn range_sum(&mut self, a: u64, b: u64) -> i64 {
+        let mut sum = 0i64;
+        let mut buf = [0u64; GRANULE_SIZE]; // reused scratch, plain u64 slice
+        let delta_empty = self.delta.is_empty();
+        for seg in &self.segments {
+            if seg.n_rows == 0 || a > seg.seg_max || b < seg.first_keys[0] {
+                continue;
+            }
+            let no_del = seg.deleted_count == 0;
+            let gi0 = seg
+                .first_keys
+                .partition_point(|&fk| fk <= a)
+                .saturating_sub(1);
+            for (grel, g) in seg.granules[gi0..].iter().enumerate() {
+                if g.min > b {
+                    break;
+                }
+                if g.max < a {
+                    self.stats.zone_pruned_scan += 1;
+                    continue;
+                }
+                let s = if a <= g.min {
+                    0
+                } else {
+                    packed_lower_bound(&g.keys, g.len, a)
+                };
+                let e = if b >= g.max {
+                    g.len
+                } else {
+                    packed_lower_bound(&g.keys, g.len, b + 1) // b < g.max, no overflow
+                };
+                if no_del && delta_empty {
+                    // bulk decode once, then a pure slice reduction (SIMD)
+                    g.vals.unpack_range(s, e, &mut buf);
+                    sum += buf[..e - s].iter().map(|&z| zz_dec(z)).sum::<i64>();
+                } else {
+                    let base = (gi0 + grel) << G_SHIFT;
+                    for i in s..e {
+                        if seg.deleted.get(base + i) {
+                            continue;
+                        }
+                        if !delta_empty && self.delta.contains_key(&g.keys.get(i)) {
+                            continue;
+                        }
+                        sum += zz_dec(g.vals.get(i));
+                    }
+                }
+            }
+        }
+        if !delta_empty {
+            for (&k, op) in &self.delta {
+                if k >= a && k <= b {
+                    if let DeltaOp::Put(v, _) = op {
+                        sum += *v;
+                    }
+                }
+            }
+        }
+        sum
+    }
+
+    /// SUM(value) WHERE category == c: columnar decode-and-test scan.
+    pub fn sum_where_category(&mut self, c: u32) -> i64 {
+        let mut sum = 0i64;
+        let (mut cbuf, mut vbuf) = ([0u64; GRANULE_SIZE], [0u64; GRANULE_SIZE]);
+        let delta_empty = self.delta.is_empty();
+        let cq = c as u64;
+        for seg in &self.segments {
+            let clean = seg.deleted_count == 0 && delta_empty;
+            for (gi, g) in seg.granules.iter().enumerate() {
+                // granule-level category zone map via FOR metadata:
+                // categories in this granule span [base, base+mask]
+                if cq < g.cats.base || cq > g.cats.base.wrapping_add(g.cats.mask) {
+                    continue;
+                }
+                if clean {
+                    // decode the predicate column only; count matches with a
+                    // vectorizable pass, then choose gather vs full decode
+                    g.cats.unpack_range(0, g.len, &mut cbuf);
+                    let matches: usize =
+                        cbuf[..g.len].iter().map(|&c0| (c0 == cq) as usize).sum();
+                    if matches == 0 {
+                        continue;
+                    }
+                    if matches * 16 >= g.len {
+                        // dense: decode values too, masked SIMD sum
+                        g.vals.unpack_range(0, g.len, &mut vbuf);
+                        sum += cbuf[..g.len]
+                            .iter()
+                            .zip(&vbuf[..g.len])
+                            .map(|(&c0, &z)| if c0 == cq { zz_dec(z) } else { 0 })
+                            .sum::<i64>();
+                    } else {
+                        // selective: gather only matching values (O(1) get)
+                        for i in 0..g.len {
+                            if cbuf[i] == cq {
+                                sum += zz_dec(g.vals.get(i));
+                            }
+                        }
+                    }
+                } else {
+                    let base = gi << G_SHIFT;
+                    for i in 0..g.len {
+                        if g.cats.get(i) == cq
+                            && !seg.deleted.get(base + i)
+                            && (delta_empty || !self.delta.contains_key(&g.keys.get(i)))
+                        {
+                            sum += zz_dec(g.vals.get(i));
+                        }
+                    }
+                }
+            }
+        }
+        for op in self.delta.values() {
+            if let DeltaOp::Put(v, cat) = op {
+                if *cat == c {
+                    sum += *v;
+                }
+            }
+        }
+        sum
+    }
+
+    // ---------------- introspection ----------------
+    pub fn live_rows(&self) -> usize {
+        let seg_rows: usize = self
+            .segments
+            .iter()
+            .map(|s| s.n_rows - s.deleted_count)
+            .sum();
+        let mut delta_puts = 0usize;
+        let mut shadowed = 0usize;
+        let mut tmp = Stats::default();
+        for (&k, op) in &self.delta {
+            if matches!(op, DeltaOp::Put(..)) {
+                delta_puts += 1;
+            }
+            let fph = hash_key(k, FP_SEED);
+            if self
+                .segments
+                .iter()
+                .any(|s| s.find_live(k, fph, &mut tmp).is_some())
+            {
+                shadowed += 1;
+            }
+        }
+        seg_rows + delta_puts - shadowed
+    }
+
+    pub fn data_bytes(&self) -> usize {
+        self.segments.iter().map(|s| s.data_bytes()).sum()
+    }
+    pub fn index_overhead_bytes(&self) -> usize {
+        self.segments.iter().map(|s| s.index_bytes()).sum()
+    }
+    pub fn total_segment_rows(&self) -> usize {
+        self.segments.iter().map(|s| s.n_rows).sum()
+    }
+    pub fn segment_count(&self) -> usize {
+        self.segments.len()
+    }
+
+    pub fn print_compression_report(&self, label: &str) {
+        let rows = self.total_segment_rows().max(1);
+        let raw = rows * (8 + 8 + 4);
+        let (mut kb, mut vb, mut cb) = (0usize, 0usize, 0usize);
+        for s in &self.segments {
+            for g in &s.granules {
+                kb += g.keys.bytes();
+                vb += g.vals.bytes();
+                cb += g.cats.bytes();
+            }
+        }
+        let data = kb + vb + cb;
+        let idx = self.index_overhead_bytes();
+        println!("compression [{}]: {} rows", label, rows);
+        println!(
+            "  keys   : {:5.1} -> {:5.1} bits/row", 64.0, kb as f64 * 8.0 / rows as f64
+        );
+        println!(
+            "  values : {:5.1} -> {:5.1} bits/row", 64.0, vb as f64 * 8.0 / rows as f64
+        );
+        println!(
+            "  category: {:4.1} -> {:5.1} bits/row", 32.0, cb as f64 * 8.0 / rows as f64
+        );
+        println!(
+            "  table  : {:.2} MB raw -> {:.2} MB packed (+{:.2} MB index) = {:.2}x smaller",
+            raw as f64 / 1e6,
+            data as f64 / 1e6,
+            idx as f64 / 1e6,
+            raw as f64 / (data + idx) as f64
+        );
+    }
+}
+
+// ---------------------------------------------------------------- benchmark
+#[inline(always)]
+fn splitmix64(x: u64) -> u64 {
+    let mut z = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+fn scan_bench(n: u64, random_keys: bool) {
+    use std::hint::black_box;
+    use std::time::Instant;
+    let label = if random_keys { "random keys" } else { "sequential keys" };
+    println!("== scan benchmark: {} rows, {} ==", n, label);
+
+    let key_of = |i: u64| if random_keys { splitmix64(i) } else { i };
+    let rows: Vec<Row> = (0..n)
+        .map(|i| (key_of(i), (i as i64 % 500) - 250, (i % 16) as u32))
+        .collect();
+    let mut db = Db::new(usize::MAX);
+    let t = Instant::now();
+    db.bulk_load(rows);
+    let dt = t.elapsed();
+    println!(
+        "bulk_load (radix sort + pack + fingerprints + MPH): {:?} ({:.1} M rows/s)",
+        dt,
+        n as f64 / dt.as_secs_f64() / 1e6
+    );
+    db.print_compression_report(label);
+
+    let mut full_expect = 0i64;
+    let mut cat_expect = 0i64;
+    for i in 0..n {
+        let v = (i as i64 % 500) - 250;
+        full_expect += v;
+        if i % 16 == 5 {
+            cat_expect += v;
+        }
+    }
+
+    let iters = 10u32;
+    let t = Instant::now();
+    let mut got = 0;
+    for _ in 0..iters {
+        got = black_box(db.range_sum(0, u64::MAX));
+    }
+    let per = t.elapsed() / iters;
+    assert_eq!(got, full_expect);
+    let grs = n as f64 / per.as_secs_f64() / 1e9;
+    println!(
+        "full-table range SUM     : {:?}/scan = {:.2} G rows/s  -> 1B rows in {:.0} ms (verified)",
+        per, grs, 1.0 / grs * 1000.0
+    );
+
+    let t = Instant::now();
+    let mut gotc = 0;
+    for _ in 0..iters {
+        gotc = black_box(db.sum_where_category(5));
+    }
+    let per = t.elapsed() / iters;
+    assert_eq!(gotc, cat_expect);
+    let grs = n as f64 / per.as_secs_f64() / 1e9;
+    println!(
+        "SUM WHERE category=5     : {:?}/scan = {:.2} G rows/s  -> 1B rows in {:.0} ms (verified)",
+        per, grs, 1.0 / grs * 1000.0
+    );
+
+    if !random_keys {
+        let (a, b) = (n / 2, n / 2 + n / 10 - 1);
+        let mut sel_expect = 0i64;
+        for i in a..=b {
+            sel_expect += (i as i64 % 500) - 250;
+        }
+        let t = Instant::now();
+        let mut gots = 0;
+        for _ in 0..iters {
+            gots = black_box(db.range_sum(a, b));
+        }
+        let per = t.elapsed() / iters;
+        assert_eq!(gots, sel_expect);
+        println!(
+            "10% key-range SUM        : {:?}/scan (zone maps skip 90% of granules, verified)",
+            per
+        );
+    }
+    println!();
+}
+
+fn main() {
+    use std::collections::BTreeMap;
+    use std::hint::black_box;
+    use std::time::Instant;
+
+    if let Ok(s) = std::env::var("SCAN_ROWS") {
+        let n: u64 = s.parse().expect("SCAN_ROWS must be a number");
+        let random = std::env::var("SCAN_KEYS").map(|k| k == "rand").unwrap_or(false);
+        scan_bench(n, random);
+        return;
+    }
+
+    const N: u64 = 1_000_000;
+    let threads = std::thread::available_parallelism().map(|p| p.get()).unwrap_or(1);
+    println!("build threads: {}\n", threads);
+
+    let key_of = |i: u64| splitmix64(i);
+    let mut db = Db::new(64 * 1024);
+    let mut model: BTreeMap<u64, (i64, u32)> = BTreeMap::new();
+
+    let t = Instant::now();
+    for i in 0..N {
+        db.put(key_of(i), i as i64 * 3, (i % 16) as u32);
+    }
+    let dt = t.elapsed();
+    for i in 0..N {
+        model.insert(key_of(i), (i as i64 * 3, (i % 16) as u32));
+    }
+    println!(
+        "load {} rows: {:?} ({:.1} M writes/s incl. compression), {} segments",
+        N, dt, N as f64 / dt.as_secs_f64() / 1e6, db.segment_count()
+    );
+
+    let bench_gets = |db: &mut Db, label: &str, keys: &dyn Fn(u64) -> u64, expect: u64| {
+        let t = Instant::now();
+        let mut found = 0u64;
+        for i in 0..N {
+            if black_box(db.get(keys(i))).is_some() {
+                found += 1;
+            }
+        }
+        let dt = t.elapsed();
+        assert_eq!(found, expect);
+        println!(
+            "{}: {:.0} ns/lookup, {:.1} M lookups/s",
+            label,
+            dt.as_nanos() as f64 / N as f64,
+            N as f64 / dt.as_secs_f64() / 1e6
+        );
+    };
+    println!("\n-- scalar point lookups over {} segments (compressed data) --", db.segment_count());
+    bench_gets(&mut db, "1M hits  ", &|i| key_of(i), N);
+    bench_gets(&mut db, "1M misses", &|i| key_of(N + 1_000_000 + i), 0);
+
+    // churn
+    let t = Instant::now();
+    for i in 0..200_000u64 {
+        let k = key_of(i * 7 % N);
+        db.put(k, -(i as i64), 99);
+        model.insert(k, (-(i as i64), 99));
+    }
+    for i in 0..100_000u64 {
+        let k = key_of(i * 11 % N);
+        db.delete(k);
+        model.remove(&k);
+    }
+    db.flush();
+    println!("\n200k updates + 100k deletes + flush: {:?}", t.elapsed());
+    for i in (0..N).step_by(3) {
+        let k = key_of(i);
+        assert_eq!(db.get(k), model.get(&k).copied());
+    }
+    println!("spot-verified 333k keys against reference model \u{2714}");
+
+    // OLAP with live deletes + segments
+    let (a, b) = (u64::MAX / 4, u64::MAX / 2);
+    let expect: i64 = model.range(a..=b).map(|(_, (v, _))| *v).sum();
+    let t = Instant::now();
+    let mut got = 0;
+    for _ in 0..50 {
+        got = black_box(db.range_sum(a, b));
+    }
+    assert_eq!(got, expect);
+    println!(
+        "\nrange SUM over ~25% of keys ({} segments, live deletes): {:?}/query \u{2714}",
+        db.segment_count(),
+        t.elapsed() / 50
+    );
+
+    // k-way merge compaction
+    let t = Instant::now();
+    db.compact();
+    println!("\nk-way merge compaction -> 1 segment: {:?}", t.elapsed());
+    assert_eq!(db.total_segment_rows(), model.len());
+
+    println!("\n-- post-compaction (1 segment, compressed) --");
+    let live_keys: Vec<u64> = model.keys().copied().collect();
+    let nlive = live_keys.len();
+    let t = Instant::now();
+    let mut found = 0u64;
+    for i in 0..N as usize {
+        if black_box(db.get(live_keys[(i * 733) % nlive])).is_some() {
+            found += 1;
+        }
+    }
+    let dt = t.elapsed();
+    assert_eq!(found, N);
+    println!(
+        "scalar 1M hits  : {:.0} ns/lookup, {:.1} M lookups/s",
+        dt.as_nanos() as f64 / N as f64,
+        N as f64 / dt.as_secs_f64() / 1e6
+    );
+    bench_gets(&mut db, "scalar 1M misses", &|i| key_of(N + 9_000_000 + i), 0);
+
+    // batched multi_get with prefetch
+    const BATCH: usize = 1024;
+    let mut out = vec![None; BATCH];
+    let mut qbuf = vec![0u64; BATCH];
+    let t = Instant::now();
+    let mut found = 0u64;
+    let mut qi = 0usize;
+    for _ in 0..(N as usize / BATCH) {
+        for s in qbuf.iter_mut() {
+            *s = live_keys[(qi * 733) % nlive];
+            qi += 1;
+        }
+        db.multi_get(&qbuf, &mut out);
+        found += out.iter().filter(|o| o.is_some()).count() as u64;
+    }
+    let dt = t.elapsed();
+    let nq = (N as usize / BATCH * BATCH) as u64;
+    assert_eq!(found, nq);
+    println!(
+        "batched 1M hits (multi_get, prefetch): {:.0} ns/lookup, {:.1} M lookups/s",
+        dt.as_nanos() as f64 / nq as f64,
+        nq as f64 / dt.as_secs_f64() / 1e6
+    );
+
+    let t = Instant::now();
+    let mut got = 0;
+    for _ in 0..100 {
+        got = black_box(db.range_sum(a, b));
+    }
+    assert_eq!(got, expect);
+    println!("range SUM post-compaction: {:?}/query \u{2714}", t.elapsed() / 100);
+    let expect_cat: i64 = model.values().filter(|(_, c)| *c == 5).map(|(v, _)| *v).sum();
+    let t = Instant::now();
+    let mut got_cat = 0;
+    for _ in 0..100 {
+        got_cat = black_box(db.sum_where_category(5));
+    }
+    assert_eq!(got_cat, expect_cat);
+    println!("full-table SUM WHERE category=5: {:?}/query \u{2714}", t.elapsed() / 100);
+
+    println!();
+    db.print_compression_report("random 64-bit keys");
+
+    // clustered-key table: where FOR packing shines
+    let mut seq = Db::new(64 * 1024);
+    for i in 0..N {
+        seq.put(1_000_000_000 + i, (i as i64 % 500) - 250, (i % 16) as u32);
+    }
+    seq.compact();
+    println!();
+    seq.print_compression_report("sequential keys");
+    let mut tmp = [None];
+    seq.multi_get(&[1_000_000_123], &mut tmp);
+    assert_eq!(tmp[0], Some((123 % 500 - 250, (123 % 16) as u32)));
+
+    println!("\nAll checks passed.");
+}
+
+// ---------------------------------------------------------------- tests
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            splitmix64(self.0)
+        }
+    }
+
+    #[test]
+    fn packed_roundtrip_all_widths() {
+        let mut rng = Rng(3);
+        for w in 0..=64u32 {
+            let n = 300;
+            let base = rng.next() >> 1;
+            let vals: Vec<u64> = (0..n)
+                .map(|_| {
+                    let payload = if w == 0 {
+                        0
+                    } else if w == 64 {
+                        rng.next()
+                    } else {
+                        rng.next() & ((1u64 << w) - 1)
+                    };
+                    if w == 64 { payload } else { base.wrapping_add(payload) }
+                })
+                .collect();
+            let p = PackedU64::pack(&vals);
+            for (i, &v) in vals.iter().enumerate() {
+                assert_eq!(p.get(i), v, "w={} i={}", w, i);
+            }
+        }
+        // zigzag negatives
+        let vals: Vec<u64> = [-5i64, 0, 3, i64::MIN / 2, i64::MAX / 2]
+            .iter()
+            .map(|&v| zz_enc(v))
+            .collect();
+        let p = PackedU64::pack(&vals);
+        for (i, &z) in vals.iter().enumerate() {
+            assert_eq!(zz_dec(p.get(i)), zz_dec(z));
+        }
+    }
+
+    #[test]
+    fn packed_lower_bound_matches_raw() {
+        let mut rng = Rng(11);
+        for _ in 0..30 {
+            let mut vals: Vec<u64> = (0..400).map(|_| rng.next() % 100_000).collect();
+            vals.sort_unstable();
+            let p = PackedU64::pack(&vals);
+            for _ in 0..200 {
+                let t = rng.next() % 120_000;
+                assert_eq!(
+                    packed_lower_bound(&p, vals.len(), t),
+                    vals.partition_point(|&v| v < t)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn mph_is_minimal_and_perfect() {
+        let mut rng = Rng(42);
+        for &n in &[1usize, 2, 5, 100, 500, GRANULE_SIZE] {
+            let mut keys: Vec<u64> = (0..n).map(|_| rng.next()).collect();
+            keys.sort_unstable();
+            keys.dedup();
+            let mph = Mph::build(&keys);
+            let mut seen = vec![false; keys.len()];
+            for &k in &keys {
+                let p = mph.lookup(k);
+                assert!(p < keys.len());
+                assert!(!seen[p]);
+                seen[p] = true;
+            }
+            assert!(seen.iter().all(|&s| s));
+        }
+    }
+
+    #[test]
+    fn radix_sort_matches_std_sort() {
+        let mut rng = Rng(77);
+        for &n in &[0usize, 1, 5, 127, 128, 5000] {
+            let mut rows: Vec<Row> = (0..n)
+                .map(|i| (rng.next(), i as i64 - 42, (i % 7) as u32))
+                .collect();
+            let mut expect = rows.clone();
+            expect.sort_unstable_by_key(|r| r.0);
+            radix_sort_rows(&mut rows);
+            assert_eq!(rows, expect);
+        }
+    }
+
+    #[test]
+    fn crud_before_and_after_flush() {
+        let mut db = Db::new(1_000_000);
+        db.put(10, 100, 1);
+        db.put(20, -200, 2);
+        assert_eq!(db.get(10), Some((100, 1)));
+        db.put(10, 111, 1);
+        assert_eq!(db.get(10), Some((111, 1)));
+        db.delete(20);
+        assert_eq!(db.get(20), None);
+
+        db.flush();
+        assert_eq!(db.get(10), Some((111, 1)));
+        assert_eq!(db.get(20), None);
+        assert_eq!(db.get(30), None);
+
+        db.put(10, -999, 3);
+        db.flush();
+        assert_eq!(db.get(10), Some((-999, 3)));
+        assert_eq!(db.live_rows(), 1);
+
+        db.delete(10);
+        db.flush();
+        assert_eq!(db.get(10), None);
+        assert_eq!(db.live_rows(), 0);
+    }
+
+    #[test]
+    fn multi_get_matches_get() {
+        let mut db = Db::new(400);
+        let mut rng = Rng(21);
+        for _ in 0..3000 {
+            db.put(rng.next() % 10_000, (rng.next() % 100) as i64 - 50, (rng.next() % 4) as u32);
+        }
+        for _ in 0..300 {
+            db.delete(rng.next() % 10_000);
+        }
+        // mixed delta + multiple segments
+        let qk: Vec<u64> = (0..2048).map(|_| rng.next() % 12_000).collect();
+        let mut out = vec![None; qk.len()];
+        db.multi_get(&qk, &mut out);
+        for (i, &k) in qk.iter().enumerate() {
+            assert_eq!(out[i], db.get(k), "key {}", k);
+        }
+        db.compact();
+        db.multi_get(&qk, &mut out);
+        for (i, &k) in qk.iter().enumerate() {
+            assert_eq!(out[i], db.get(k), "post-compact key {}", k);
+        }
+    }
+
+    #[test]
+    fn range_sum_matches_reference_across_flushes() {
+        let mut db = Db::new(500);
+        let mut model: BTreeMap<u64, i64> = BTreeMap::new();
+        let mut rng = Rng(1234);
+        for _ in 0..5_000 {
+            let k = rng.next() % 100_000;
+            let v = (rng.next() % 1000) as i64 - 500;
+            db.put(k, v, 0);
+            model.insert(k, v);
+        }
+        for _ in 0..1_000 {
+            let k = rng.next() % 100_000;
+            db.delete(k);
+            model.remove(&k);
+        }
+        for phase in 0..3 {
+            for _ in 0..100 {
+                let a = rng.next() % 100_000;
+                let b = a + rng.next() % 50_000;
+                let expect: i64 = model.range(a..=b).map(|(_, v)| *v).sum();
+                assert_eq!(db.range_sum(a, b), expect, "phase {}", phase);
+            }
+            if phase == 0 {
+                db.flush();
+            } else if phase == 1 {
+                db.compact();
+            }
+        }
+    }
+
+    #[test]
+    fn category_sum_matches_reference() {
+        let mut db = Db::new(300);
+        let mut model: BTreeMap<u64, (i64, u32)> = BTreeMap::new();
+        let mut rng = Rng(55);
+        for _ in 0..4000 {
+            let k = rng.next() % 50_000;
+            let (v, c) = ((rng.next() % 999) as i64 - 400, (rng.next() % 5) as u32);
+            db.put(k, v, c);
+            model.insert(k, (v, c));
+        }
+        for _ in 0..500 {
+            let k = rng.next() % 50_000;
+            db.delete(k);
+            model.remove(&k);
+        }
+        for c in 0..6u32 {
+            let expect: i64 = model.values().filter(|(_, cc)| *cc == c).map(|(v, _)| *v).sum();
+            assert_eq!(db.sum_where_category(c), expect);
+        }
+        db.compact();
+        for c in 0..6u32 {
+            let expect: i64 = model.values().filter(|(_, cc)| *cc == c).map(|(v, _)| *v).sum();
+            assert_eq!(db.sum_where_category(c), expect);
+        }
+    }
+
+    #[test]
+    fn fuzz_against_reference_model() {
+        let mut db = Db::new(700);
+        let mut model: BTreeMap<u64, (i64, u32)> = BTreeMap::new();
+        let mut rng = Rng(0xDEAD_BEEF);
+        for step in 0..30_000u64 {
+            let k = rng.next() % 20_000;
+            match rng.next() % 10 {
+                0..=5 => {
+                    let (v, c) =
+                        ((rng.next() % 1_000_000) as i64 - 500_000, (rng.next() % 8) as u32);
+                    db.put(k, v, c);
+                    model.insert(k, (v, c));
+                }
+                6..=7 => {
+                    db.delete(k);
+                    model.remove(&k);
+                }
+                8 => {
+                    assert_eq!(db.get(k), model.get(&k).copied(), "step {}", step);
+                }
+                _ => {
+                    if step % 4000 == 0 {
+                        db.compact();
+                    } else if step % 900 == 0 {
+                        db.flush();
+                    }
+                }
+            }
+        }
+        db.compact();
+        for k in 0..20_000u64 {
+            assert_eq!(db.get(k), model.get(&k).copied(), "final key {}", k);
+        }
+        assert_eq!(db.live_rows(), model.len());
+    }
+
+    #[test]
+    fn zone_maps_and_fingerprints_actually_prune() {
+        let mut db = Db::new(1_000_000);
+        for i in 0..10_000u64 {
+            db.put(splitmix64(i), i as i64, 0);
+        }
+        db.flush();
+        for i in 0..5_000u64 {
+            assert_eq!(db.get(splitmix64(1_000_000 + i)), None);
+        }
+        assert!(db.stats.filter_negative + db.stats.zone_pruned_point >= 4_500);
+    }
+}
+
+#[cfg(test)]
+mod codec_tests {
+    use super::*;
+
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            splitmix64(self.0)
+        }
+    }
+
+    #[test]
+    fn magic_reciprocal_division_is_exact() {
+        for per in 1u64..=64 {
+            let recip = ((1u64 << 32) + per - 1) / per;
+            for i in 0u64..8192 {
+                assert_eq!((i.wrapping_mul(recip)) >> 32, i / per, "i={} per={}", i, per);
+            }
+        }
+    }
+
+    #[test]
+    fn unpack_range_matches_get_all_layouts() {
+        let mut rng = Rng(99);
+        for w in 0..=64u32 {
+            let n = 1024;
+            let vals: Vec<u64> = (0..n)
+                .map(|_| {
+                    if w == 0 {
+                        7777
+                    } else if w == 64 {
+                        rng.next()
+                    } else {
+                        1_000 + (rng.next() & ((1u64 << w) - 1))
+                    }
+                })
+                .collect();
+            let p = PackedU64::pack(&vals);
+            // get() roundtrip
+            for (i, &v) in vals.iter().enumerate() {
+                assert_eq!(p.get(i), v, "get w={} i={}", w, i);
+            }
+            // unpack over assorted subranges, incl. unaligned heads/tails
+            let mut buf = [0u64; GRANULE_SIZE];
+            for &(s, e) in &[(0usize, n), (1, n - 1), (3, 700), (511, 513), (37, 38), (5, 5)] {
+                p.unpack_range(s, e, &mut buf);
+                for i in s..e {
+                    assert_eq!(buf[i - s], vals[i], "unpack w={} s={} e={} i={}", w, s, e, i);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod learned_rank_tests {
+    use super::*;
+
+    #[test]
+    fn adversarial_key_distributions_lookup_exactly() {
+        // worst cases for interpolation prediction: heavy clustering, outliers
+        let cases: Vec<Vec<u64>> = vec![
+            (0..1024u64).collect(),                              // perfectly dense
+            (0..1023u64).chain([u64::MAX - 1]).collect(),        // one far outlier
+            [0u64].iter().copied().chain((1..1024).map(|i| u64::MAX / 2 + i)).collect(),
+            (0..512u64).chain((0..512).map(|i| u64::MAX - 512 + i)).collect(), // bimodal
+            (0..1024u64).map(|i| i * i * 31).collect(),          // superlinear
+            vec![42],                                            // singleton
+            vec![5, u64::MAX],                                   // two extremes
+        ];
+        for keys in cases {
+            let rows: Vec<Row> = keys.iter().map(|&k| (k, k as i64 ^ 7, 3)).collect();
+            let mut db = Db::new(usize::MAX);
+            db.bulk_load(rows);
+            for &k in &keys {
+                assert_eq!(db.get(k), Some((k as i64 ^ 7, 3)), "key {}", k);
+            }
+            // foreign keys must miss cleanly (clamped rows, verified keys)
+            for i in 0..2000u64 {
+                let probe = splitmix64(i).wrapping_mul(2) | 1;
+                if !keys.contains(&probe) {
+                    assert_eq!(db.get(probe), None, "probe {}", probe);
+                }
+            }
+        }
+    }
+}

@@ -1,0 +1,1 @@
+CREATE TABLE t (a Nullable(Nullable(Nullable(UInt64)))) ENGINE = Memory

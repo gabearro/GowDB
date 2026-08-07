@@ -1,0 +1,1 @@
+CREATE TABLE t (a FixedString(4294967295)) ENGINE = Memory

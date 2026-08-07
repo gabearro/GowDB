@@ -1,0 +1,42 @@
+[package]
+name = "granular"
+version = "0.3.0"
+edition = "2021"
+# 1.82 for `Option::is_none_or`, used in the granule/part fast paths.
+rust-version = "1.82"
+description = "Hybrid OLAP + OLTP database engine with a ClickHouse-flavoured SQL front end"
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+
+# Zero runtime dependencies, by design. Every codec, index, hash and file
+# format in here is hand-rolled so the storage footprint and the instruction
+# count on the hot path stay under our control.
+[dependencies]
+
+[lib]
+name = "granular"
+path = "src/lib.rs"
+
+[[bin]]
+name = "granular"
+path = "src/main.rs"
+
+[[bench]]
+name = "engine"
+path = "benches/engine.rs"
+harness = false
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+
+[profile.bench]
+inherits = "release"
+debug = true
+
+# `cargo test --release` still exercises the optimised codecs; cargo ignores
+# `panic = "abort"` for the test profile automatically.
+[profile.test]
+opt-level = 2

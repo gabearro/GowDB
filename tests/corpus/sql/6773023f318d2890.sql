@@ -1,0 +1,1 @@
+SELECT a::UInt64::String::Float64 FROM t

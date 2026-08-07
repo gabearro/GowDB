@@ -1,0 +1,1 @@
+SELECT a FROM t JOIN u USING (a) JOIN v USING (a) JOIN w USING (a)

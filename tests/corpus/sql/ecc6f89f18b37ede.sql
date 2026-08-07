@@ -1,0 +1,1 @@
+SELECT a:t64::String::Float64 FROM t

@@ -1,0 +1,1 @@
+SELECT a FROM t JOIN SING (a) JOIN w USING (a)

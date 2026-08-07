@@ -1,0 +1,1 @@
+SELECT a FROFROMM t JOIN u USING (a);SINtG (a)

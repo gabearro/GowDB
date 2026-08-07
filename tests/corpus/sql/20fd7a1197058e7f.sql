@@ -1,0 +1,1 @@
+CREATE TABLE t (a UInt64) ENGINE = MergeTree ORDER BY a
