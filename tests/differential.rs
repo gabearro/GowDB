@@ -33,6 +33,43 @@
 //! assigns (BUG 8). Each is pinned by its own test, so the restriction has to be
 //! deleted when the bug is.
 //!
+//! # Window functions
+//!
+//! A fifth of non-aggregate cases carry an `OVER` clause. `tests/window.rs`
+//! already varies the *frame* against sqlite on a fixed six-column, twelve-row
+//! table; what it cannot reach is the axis this file owns -- windows over a
+//! table that spans several parts, over a table past `GRANULE_SIZE` and
+//! `BLOCK_SIZE`, over a join, over a mutated table, and next to `DISTINCT`,
+//! `UNION` and `LIMIT`. A window operator that quietly assumed one block, or
+//! one part, would look perfect there and wrong here.
+//!
+//! The determinism rule is the load-bearing part. A window function's answer is
+//! only defined up to the ordering its `OVER` clause gives, so every generated
+//! window is one of two shapes:
+//!
+//!   * **superkey-ordered** -- the window's `ORDER BY` lists *every* visible
+//!     column, so the only rows that still tie are byte-identical and permuting
+//!     them cannot change the result multiset. Every function and frame is then
+//!     fair game.
+//!   * **tied** -- a single low-cardinality key, and the menu shrinks to the
+//!     functions defined over peer *groups* (`rank`, `dense_rank`,
+//!     `percent_rank`, `cume_dist`, and aggregates under a `RANGE` frame).
+//!
+//! `id` deliberately collides in this generator (see `gen_tables`), which is
+//! why the superkey is "every column" rather than "the key" -- the shape most
+//! window harnesses use is not available here and pretending otherwise would
+//! have compared the two *sort* implementations instead.
+//!
+//! # Decimal
+//!
+//! sqlite has no exact decimal type, so `Decimal64` is out of the intersection
+//! and always was. That exclusion is correct and it is still in force -- and it
+//! is precisely why the type shipped with `avg` fabricating values above 10^12:
+//! excluding it from the only external oracle left it with *no* oracle. The
+//! replacement is `decimal_*_matches_exact_integer_arithmetic` below, which
+//! diffs the engine against exact `i128` arithmetic on unit counts. See the
+//! `DECIMAL ORACLE` banner.
+//!
 //! # Determinism
 //!
 //! One seed reproduces one case exactly: schema, rows and query all come out of
@@ -143,6 +180,19 @@ const SENTINEL: &str = "<<granular-diff-boundary>>";
 //  9. `concat`.  SQLite's `concat()` skips NULL arguments, so
 //     `concat(NULL,'b')` is 'b'; granular propagates and returns NULL. Not in
 //     `gen_call`.
+//
+// 10. Window frame extensions.  Four of sqlite's window features are rejected
+//     by granular's parser, each cleanly and at parse time: `GROUPS` frames,
+//     `RANGE <n> PRECEDING/FOLLOWING` (value-based offsets, where the message
+//     names the `ROWS` alternative), `EXCLUDE {CURRENT ROW|GROUP|TIES|NO
+//     OTHERS}`, and `agg(..) FILTER (WHERE ..) OVER (..)`. Capability gaps, not
+//     wrong answers, so `gen_window`'s frame menu is `ROWS` plus the
+//     `UNBOUNDED`/`CURRENT ROW` spellings of `RANGE`.
+//
+//     Probed alongside them and *not* excluded, because they work and agree
+//     exactly: named windows (`WINDOW w AS (..)`), a window function in the
+//     outer `ORDER BY`, and an explicit NULL `lag` default. A window function
+//     in `WHERE` is refused by both engines, which is correct in both.
 // =========================================================================
 // BUGS THIS HARNESS FOUND -- real defects, each pinned by a test that asserts
 // the current *wrong* behaviour so it fails the day the engine is fixed. The
@@ -184,6 +234,99 @@ const SENTINEL: &str = "<<granular-diff-boundary>>";
 //          -> update_whose_predicate_reads_an_assigned_column_does_nothing
 //
 // Full write-ups with reproducers are in tests/README-testing.md.
+// =========================================================================
+// GENERATOR RESTRICTIONS -- everything that narrows what this oracle can see,
+// with the reason each was added and whether that reason still holds.
+//
+// This list exists because the generator has now been caught *routing around a
+// bug* five times: unique ids on `ORDER BY` tables (BUG 1), mutation predicates
+// disjoint from their assignments (BUG 8), keyed-only mutations (BUG 7), no
+// `Decimal` columns, and no `OVER` clauses. Each looked like a modest scoping
+// decision and each one hid a shipped defect. A restriction whose reason is
+// "the engine gets it wrong" is a bug report in disguise and belongs in the
+// BUGS list above, not here; a restriction whose reason is "the two dialects
+// genuinely differ" belongs in KNOWN DIVERGENCES. What is left below is
+// everything else -- scope, cost and determinism -- and it is the honest
+// statement of what a clean run does *not* prove.
+//
+//  R1. Two tables, `t0` and `t1`, never three. A three-way join is a different
+//      plan shape (the join *order* becomes a choice), and nothing else here
+//      would change. Cost, not correctness. STILL HOLDS, but a three-table
+//      case is the single largest piece of coverage still missing.
+//  R2. No subqueries, no CTEs, no `EXISTS`/scalar-subquery, no `CASE` over a
+//      correlated reference. The binder's subquery support is not in the
+//      dialect intersection this file was scoped to. STILL HOLDS; it is a
+//      scope decision and the largest one.
+//  R3. No `NULL`s in a non-nullable column, and a mutation never assigns an
+//      expression to a non-nullable column (`gen_mutations`). granular rejects
+//      the store, sqlite accepts it -- a schema difference, not a bug.
+//      STILL HOLDS and always will.
+//  R4. Aggregate arguments are always a *bare column*, never an expression
+//      (`gen_agg`). Two reasons, and only one still holds: `sum(<4-factor
+//      product>)` over 8200 rows overflows i64, where granular accumulates in
+//      i128 and sqlite promotes to float (STILL HOLDS, and is the same
+//      unsettled overflow policy as R5); and it kept `HAVING` comparands
+//      same-category, which `gen_agg` now handles by returning the result type
+//      (NO LONGER LOAD-BEARING). `sum(a + b)` at the current pool sizes is safe
+//      and should be added.
+//  R5. Integers come from a pool bounded well inside i64 (`int_pool`). The
+//      engine wraps on integer overflow and sqlite promotes to float, so a
+//      wider pool diffs an *unsettled policy* rather than an implementation.
+//      STILL HOLDS pending that decision -- `GRANULAR_DIFF_WIDE_INTS=1` widens
+//      the pool to the i64 bounds today so the divergence can be looked at, and
+//      `int_pool` says exactly what to delete when the policy lands.
+//  R6. Reals are quarters and small powers of ten (`REALS`), so every sum is
+//      exact in binary64. Belt and braces for KNOWN DIVERGENCE #5: measured,
+//      sqlite >= 3.44 compensates too and the pool is not load-bearing on this
+//      machine. STILL HOLDS as insurance against an older oracle; harmless.
+//  R7. Text is lowercase ASCII (`TEXTS`), because sqlite's `LIKE` is
+//      case-insensitive (KNOWN DIVERGENCE #3). That makes the difference
+//      unobservable rather than papered over -- but it also means **no test
+//      here has ever fed the engine a non-ASCII string**. UTF-8 handling in
+//      `substring`/`length`/`upper` is entirely unexercised by this file, and
+//      the reason (LIKE) does not cover it: a non-ASCII pool with LIKE
+//      suppressed would be strictly more coverage. THE REASON NO LONGER COVERS
+//      THE RESTRICTION.
+//  R8. A join is only generated when both tables are under `JOINABLE_ROWS`
+//      (64), so the big-table shapes and the join shapes never meet. Cost: a
+//      cross join of two 8000-row tables is 64M rows. STILL HOLDS.
+//  R9. Only `UNION`/`UNION ALL`; `EXCEPT`/`INTERSECT` are a stated capability
+//      gap (KNOWN DIVERGENCE #7). Pinned; delete when they land.
+// R10. A set-operation branch is a *clone* of the first with a different
+//      `WHERE`, so the two branches always have identical arity, types and
+//      expressions. Branches that differ structurally (different tables,
+//      different expressions of the same type) are not generated. Convenience,
+//      not correctness. STILL HOLDS and is worth removing.
+// R11. `ORDER BY` is always *total* over the output ordinals, or absent. A
+//      partial order would make `LIMIT` slice an undefined sequence. STILL
+//      HOLDS and always will -- but it also means a **partial** `ORDER BY`, the
+//      shape real queries actually use, is never generated. `LIMIT` over a
+//      partial order could still be compared as a multiset of the first *k*
+//      groups; nobody has written that.
+// R12. Mutations run on keyed tables only, so a mutation case gives up the
+//      colliding-`id` domain every other case uses (`TableDef::keyed`). The
+//      reason is now the *unique key*, not BUG 7 (fixed): `DELETE`/`UPDATE`
+//      need a single-column primary key. STILL HOLDS until an unkeyed
+//      `DELETE ... WHERE` is supported end to end.
+// R13. Mutations never assign `id` in the generator (they are proven to work by
+//      `an_update_predicate_binds_against_the_table_not_the_assignments`).
+//      Moving a row's key is a delete plus an insert under a new key; folding
+//      it into the general generator would make every `keyed` case's id
+//      domain non-deterministic to model. STILL HOLDS, weakly.
+// R14. A window function is only ever a whole select item, never an operand
+//      (`row_number() OVER (...) + 1` is not generated) and never in `WHERE`,
+//      `GROUP BY` or `HAVING` -- the last three are illegal in both dialects,
+//      the first is legal in both and simply not generated. Scope.
+// R15. A window case never also has `GROUP BY`: a window over an aggregated
+//      result is legal in both engines and is not generated. Scope.
+// R16. No `Decimal` columns, because sqlite has no exact decimal type -- a
+//      REAL diff would agree with a wrong answer to fifteen digits. STILL
+//      HOLDS against *this* oracle, and the gap is filled by the `i128`
+//      property oracle under the DECIMAL ORACLE banner rather than left open.
+// R17. No `Date`/`DateTime`/`UInt`/`Bool` columns. `Bool` and `UInt` have no
+//      sqlite spelling; the date types have one but the two engines' date
+//      *functions* barely overlap. STILL HOLDS for the functions; a plain
+//      `Date` column compared and sorted as an integer would work today.
 // =========================================================================
 
 /// Relative tolerance for float comparison. Deliberately tight: the generator
@@ -536,6 +679,32 @@ enum E {
     Call(&'static str, Vec<E>),
     /// `count(*)` is `Agg("count", None, false)`; the flag is `DISTINCT`.
     Agg(&'static str, Option<Box<E>>, bool),
+    /// `f(args) OVER (PARTITION BY .. ORDER BY .. <frame>)`. Boxed on purpose:
+    /// `Win` measures 112 bytes and `E` measures 48, so inlining it would have
+    /// made every `Lit`, every `Col` and every node of every expression tree
+    /// 112 bytes wide. The shrinker clones the whole `Case` once per candidate
+    /// and generates candidates in the low hundreds, so that is the one size in
+    /// this file that is actually on a hot path.
+    Over(Box<Win>),
+}
+
+/// A window call. Everything about the `OVER` clause that varies; the
+/// determinism argument that makes it comparable at all is in `gen_window`.
+#[derive(Clone, Debug)]
+struct Win {
+    name: &'static str,
+    /// Empty when `star` is set (`count(*)`).
+    args: Vec<E>,
+    star: bool,
+    part: Vec<E>,
+    /// `(expr, ascending, nulls first)`, always spelled out: the two engines'
+    /// *defaults* for NULL placement are not part of the intersection this file
+    /// is allowed to assume, and an explicit clause costs nothing.
+    order: Vec<(E, bool, bool)>,
+    /// `""` is the default frame. Only ever set on a function whose answer a
+    /// frame can change -- `row_number`/`rank`/`lag` ignore it, and emitting one
+    /// there would test the two parsers rather than the two evaluators.
+    frame: &'static str,
 }
 
 impl E {
@@ -635,6 +804,50 @@ impl E {
                 }
                 out.push(')');
             }
+            E::Over(w) => {
+                let _ = write!(out, "{}(", w.name);
+                if w.star {
+                    out.push('*');
+                }
+                for (i, a) in w.args.iter().enumerate() {
+                    if i > 0 {
+                        out.push_str(", ");
+                    }
+                    a.render(d, tables, out);
+                }
+                out.push_str(") OVER (");
+                let mut sep = "";
+                if !w.part.is_empty() {
+                    out.push_str("PARTITION BY ");
+                    for (i, p) in w.part.iter().enumerate() {
+                        if i > 0 {
+                            out.push_str(", ");
+                        }
+                        p.render(d, tables, out);
+                    }
+                    sep = " ";
+                }
+                if !w.order.is_empty() {
+                    let _ = write!(out, "{sep}ORDER BY ");
+                    for (i, (e, asc, nf)) in w.order.iter().enumerate() {
+                        if i > 0 {
+                            out.push_str(", ");
+                        }
+                        e.render(d, tables, out);
+                        let _ = write!(
+                            out,
+                            " {} NULLS {}",
+                            if *asc { "ASC" } else { "DESC" },
+                            if *nf { "FIRST" } else { "LAST" }
+                        );
+                    }
+                    sep = " ";
+                }
+                if !w.frame.is_empty() {
+                    let _ = write!(out, "{sep}{}", w.frame);
+                }
+                out.push(')');
+            }
         }
     }
 
@@ -694,6 +907,19 @@ impl E {
             }
             E::Agg(_, Some(a), _) => a.walk(f),
             E::Agg(_, None, _) => {}
+            // The PARTITION BY and ORDER BY operands have to be walked, not
+            // just the arguments: the column-dropping reduction decides a
+            // column is unreferenced from this walk, and a window whose
+            // ORDER BY was the only mention of it would then be rendered
+            // against a column index that no longer exists.
+            E::Over(w) => {
+                for x in w.args.iter().chain(&w.part) {
+                    x.walk(f);
+                }
+                for (x, _, _) in &w.order {
+                    x.walk(f);
+                }
+            }
         }
     }
 
@@ -740,6 +966,14 @@ impl E {
             }
             E::Agg(_, Some(a), _) => a.shift_cols(slot, removed),
             E::Agg(_, None, _) => {}
+            E::Over(w) => {
+                for x in w.args.iter_mut().chain(&mut w.part) {
+                    x.shift_cols(slot, removed);
+                }
+                for (x, _, _) in &mut w.order {
+                    x.shift_cols(slot, removed);
+                }
+            }
         }
     }
 }
@@ -1081,7 +1315,70 @@ impl Case {
 
 // ------------------------------------------------------------------ generator
 
-const INTS: [i64; 12] = [0, 1, -1, 2, 3, -3, 7, 10, -10, 42, -9999, 9999];
+/// The default integer pool. Small values plus two that need more than sixteen
+/// bits, because this engine's whole storage claim is bit-width selection
+/// (`PackedColumn`) and zone maps, and a column whose values all fit fourteen
+/// bits never leaves the narrowest lane.
+///
+/// The ceiling is not arbitrary. The grammar's deepest arithmetic is four
+/// nested factors (`gen_scalar(Ty::Int, 2)` -> `Bin(*, gen_scalar(1),
+/// gen_int_nonbool(1))`, each of which is another `Bin(*, leaf, leaf)`), so a
+/// uniform pool bound `m` can produce `m^4` and stays inside `i64::MAX` while
+/// `m <= 55108`. 32749 leaves a factor of eight of headroom and 9999 -- the
+/// previous ceiling -- left a factor of nine hundred, which bought nothing.
+const INTS: [i64; 14] = [0, 1, -1, 2, 3, -3, 7, 10, -10, 42, -9999, 9999, -32749, 32749];
+
+/// `GRANULAR_DIFF_WIDE_INTS=1`. Reaches the i64 bounds, where the engine's
+/// integer arithmetic **wraps** (`wrapping_add`/`wrapping_mul` in
+/// `exec::functions::scalar`, and `SumAcc::finish` saturates) and sqlite
+/// promotes the result to a float instead. That is an unsettled *policy*
+/// disagreement, not an implementation bug, so it is off by default.
+///
+/// Measured, 300 cases at the default seed: **one** mismatch, and it is the
+/// policy and nothing else --
+/// `SELECT (x0.a1 >= x1.b1) - x0.a0` with `a0 = -9223372036854775808` gives
+/// -9223372036854775808 in granular (wrapped) and 9.223372036854776e18 in
+/// sqlite (promoted). So the flag is *usable* today rather than a wall of
+/// noise: one failure per ~300 cases is a bisectable rate, and every other
+/// wide-integer path -- storage lanes, zone maps, sort keys, hash join,
+/// `min`/`max` -- agrees. Only arithmetic diverges.
+///
+/// WHEN THE OVERFLOW POLICY LANDS: if the engine starts erroring on overflow,
+/// delete this pool and this flag, fold these values into `INTS`, and teach
+/// `compare` that "granular errored, sqlite answered a float past 2^53" is an
+/// agreement rather than a `OnlyOneRan`. If the engine keeps wrapping, this
+/// stays a flag and the wrap belongs in KNOWN DIVERGENCES with a pinning test.
+const WIDE_INTS: [i64; 16] = [
+    0,
+    1,
+    -1,
+    2,
+    -3,
+    9999,
+    -32749,
+    2147483647,
+    -2147483648,
+    4294967296,
+    1000000007,
+    4611686018427387904,
+    -4611686018427387904,
+    9223372036854775807,
+    -9223372036854775808,
+    9007199254740993, // 2^53+1: the first integer an f64 cannot represent
+];
+
+/// Which pool `gen_value` draws from. Resolved once -- the alternative is a
+/// `std::env::var` per generated cell, and a 8200-row table is 30k cells.
+fn int_pool() -> &'static [i64] {
+    static POOL: std::sync::OnceLock<&'static [i64]> = std::sync::OnceLock::new();
+    POOL.get_or_init(|| {
+        if std::env::var("GRANULAR_DIFF_WIDE_INTS").is_ok() {
+            &WIDE_INTS
+        } else {
+            &INTS
+        }
+    })
+}
 /// Quarters and small powers of ten: every one is exact in binary64 and so is
 /// every sum of them, which is what lets `FLOAT_REL_TOL` stay at 1e-12 instead
 /// of hiding a real disagreement behind slack. See KNOWN DIVERGENCES #5.
@@ -1097,11 +1394,28 @@ fn gen_value(rng: &mut Rng, ty: Ty, nullable: bool) -> Cell {
         return Cell::Null;
     }
     match ty {
-        Ty::Int => Cell::Int(*rng.pick(&INTS)),
+        Ty::Int => Cell::Int(*rng.pick(int_pool())),
         Ty::Real => Cell::Real(*rng.pick(&REALS)),
         Ty::Text => Cell::Text((*rng.pick(&TEXTS)).to_string()),
     }
 }
+
+/// Share of non-aggregate cases that carry an `OVER` clause. A window case is
+/// the most expensive kind the generator makes -- it forces a sort in both
+/// engines and its `ORDER BY` names every column, so the script is longer -- and
+/// `tests/window.rs` already owns the frame axis. A fifth is enough to keep the
+/// *combinations* this file exists for (windows over parts, joins, mutations and
+/// set operations) arriving several times per default run.
+///
+/// Measured A/B interleaved, seven rounds in each of two sessions, on the
+/// 400-case default run: **`WINDOW_PCT = 0` (the previous generator) 2.096-3.067s
+/// and this generator 2.045-3.046s**. The two distributions overlap completely,
+/// because the run is dominated by `sqlite3` process spawns and not by either
+/// engine's sort -- so the fifth is chosen for coverage balance and not for the
+/// clock. The whole file went 2.98s -> 3.23s (best-of-5, one session, both
+/// binaries against the same lib), and that quarter-second is the new *tests*
+/// below, not this constant.
+const WINDOW_PCT: u64 = 20;
 
 /// Above this, a case stops being joinable: a cross or many-to-many join of two
 /// thousand-row tables is a million-row result, which tells us nothing a
@@ -1764,8 +2078,21 @@ fn gen_query(rng: &mut Rng, tables: &[TableDef]) -> Query {
             ));
         }
     } else {
+        // A window function is generated as a whole select item and never as an
+        // operand (RESTRICTION R14): it is the one construct here whose answer
+        // depends on other rows of the same result, and keeping it at the top
+        // level is what lets `gen_window` state the determinism argument once.
+        //
+        // Two windows in one query is deliberately common. Different `OVER`
+        // clauses in one projection mean two window sorts over the same input,
+        // which is where a shared-buffer window operator gets it wrong.
+        let windowed = rng.pct(WINDOW_PCT);
         let n = rng.range(1, 4);
-        for _ in 0..n {
+        for i in 0..n {
+            if windowed && (i == 0 || rng.pct(35)) {
+                items.push(gen_window(rng, &sc));
+                continue;
+            }
             let ty = *rng.pick(&[Ty::Int, Ty::Int, Ty::Real, Ty::Text]);
             items.push(gen_scalar(rng, &sc, ty, 2));
         }
@@ -1847,6 +2174,195 @@ fn gen_agg(rng: &mut Rng, sc: &Scope) -> (E, Ty) {
     // where it changes the answer.
     let distinct = matches!(name, "count" | "sum" | "avg") && rng.pct(25);
     (E::Agg(name, Some(arg.b()), distinct), result)
+}
+
+// ------------------------------------------------------------------ windows
+
+/// Frames whose bounds count *rows*. Only ever paired with a superkey ORDER BY:
+/// a row-counting bound over a tied order picks an arbitrary member of the peer
+/// group, and comparing that tests the two sorts rather than the two window
+/// implementations.
+///
+/// The last three are the ones that break frame arithmetic. Two of them can
+/// select *nothing* -- an aggregate over an empty frame is NULL (except `count`,
+/// which is 0), and it happens on the first or last row of a partition, which
+/// is also where an off-by-one in the bound lives. The third runs off the end.
+const ROWS_FRAMES: [&str; 8] = [
+    "ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW",
+    "ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING",
+    "ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING",
+    "ROWS BETWEEN 2 PRECEDING AND CURRENT ROW",
+    "ROWS UNBOUNDED PRECEDING",
+    "ROWS BETWEEN 1 FOLLOWING AND 3 FOLLOWING",
+    "ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING",
+    "ROWS BETWEEN CURRENT ROW AND 2 FOLLOWING",
+];
+
+/// Frames whose bounds are peer *groups*, which is the whole reason `RANGE`
+/// exists and the only frame kind a tied ORDER BY can be compared under.
+/// `RANGE ... CURRENT ROW` means "through the last row tied with me"; reading it
+/// as `ROWS` is the classic implementation mistake and only a tied case sees it.
+const RANGE_FRAMES: [&str; 4] = [
+    "RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW",
+    "RANGE BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING",
+    "RANGE BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING",
+    "RANGE BETWEEN CURRENT ROW AND CURRENT ROW",
+];
+
+/// An ORDER BY that no two *distinguishable* rows tie on: every visible column,
+/// in a random order, with a randomly-directed prefix.
+///
+/// `id` collides on purpose in this generator (`gen_tables`), so the usual
+/// "append the unique key" trick is unavailable. Listing every column is the
+/// superkey that is available, and it is enough: rows that still tie after it
+/// are byte-identical in every column the query can read, so whichever order the
+/// two engines put them in, the window sees the same *sequence of values* and
+/// emits the same multiset of output rows.
+fn win_order_total(rng: &mut Rng, sc: &Scope) -> Vec<(E, bool, bool)> {
+    let mut cols: Vec<E> = sc.cols.iter().map(|(s, i, _)| E::Col(*s, *i)).collect();
+    let prefix = rng.range(0, cols.len());
+    for i in 0..prefix {
+        let j = i + rng.below(cols.len() - i);
+        cols.swap(i, j);
+    }
+    cols.into_iter()
+        .enumerate()
+        .map(|(i, e)| {
+            if i < prefix {
+                (e, rng.pct(50), rng.pct(50))
+            } else {
+                (e, true, true)
+            }
+        })
+        .collect()
+}
+
+/// One deliberately low-cardinality key, or none at all. No ORDER BY makes the
+/// whole partition a single peer group, which is the frame every aggregate then
+/// sees and the cheapest way to reach the "one enormous peer group" shape.
+fn win_order_tied(rng: &mut Rng, sc: &Scope) -> Vec<(E, bool, bool)> {
+    if rng.pct(20) {
+        return Vec::new();
+    }
+    // `k` is drawn from a domain of 4 (or 97 on a big table), so ties are the
+    // norm; text ties even harder, and a real key brings -0.0 into the peer
+    // comparison, where "equal" and "identical" differ.
+    let ty = *rng.pick(&[Ty::Int, Ty::Int, Ty::Text, Ty::Real]);
+    let e = sc
+        .any_of(rng, ty)
+        .or_else(|| sc.any_of(rng, Ty::Int))
+        .unwrap_or(E::Lit(Cell::Int(0)));
+    vec![(e, rng.pct(50), rng.pct(50))]
+}
+
+/// One window call: `(name, args, star, whether a frame changes its answer)`.
+///
+/// `tied` restricts the menu to functions defined over peer *groups*. Under a
+/// tied ORDER BY, `row_number`, `lag`, `first_value` and friends all read a row
+/// *position*, so their answer is whatever the sort happened to do -- that is
+/// the tied half's price and the reason `rank` vs `dense_rank`, which is the
+/// pair that actually diverges on ties, is on both menus.
+fn gen_win_call(rng: &mut Rng, sc: &Scope, tied: bool) -> (&'static str, Vec<E>, bool, bool) {
+    let col = |rng: &mut Rng, ty: Ty| {
+        sc.any_of(rng, ty).unwrap_or_else(|| E::Lit(gen_value(rng, ty, false)))
+    };
+    if rng.pct(if tied { 55 } else { 40 }) {
+        if rng.pct(20) {
+            // `count(*)` is the one aggregate that answers 0 rather than NULL
+            // over an empty frame, which is exactly what a frame that selects
+            // nothing has to prove.
+            return ("count", Vec::new(), true, true);
+        }
+        let name = *rng.pick(&["count", "sum", "avg", "min", "max"]);
+        let ty = if name == "sum" || name == "avg" {
+            *rng.pick(&[Ty::Int, Ty::Real])
+        } else {
+            *rng.pick(&[Ty::Int, Ty::Real, Ty::Text])
+        };
+        return (name, vec![col(rng, ty)], false, true);
+    }
+    if tied {
+        // `percent_rank` and `cume_dist` divide, so they land within
+        // FLOAT_REL_TOL rather than exactly -- and they are peer-defined, so a
+        // tie cannot make them ambiguous.
+        return (
+            *rng.pick(&["rank", "dense_rank", "percent_rank", "cume_dist"]),
+            Vec::new(),
+            false,
+            false,
+        );
+    }
+    // One arm per function rather than one arm per family: `first_value`,
+    // `last_value` and `nth_value` used to share an arm and a three-way
+    // `pick`, which put each of them at 1/30 of a positional draw -- and
+    // `generated_windows_reach_both_engines_and_agree` duly caught 1200 seeds
+    // producing not one `last_value`.
+    match rng.below(11) {
+        0 | 1 => ("row_number", Vec::new(), false, false),
+        2 => ("rank", Vec::new(), false, false),
+        3 => ("dense_rank", Vec::new(), false, false),
+        4 => (*rng.pick(&["percent_rank", "cume_dist"]), Vec::new(), false, false),
+        5 => ("ntile", vec![E::Lit(Cell::Int(rng.range(1, 4) as i64))], false, false),
+        6 | 7 => {
+            // The offset and the default are where an off-by-one lives. The
+            // default must carry the argument's own type: a NULL default and a
+            // typed one take different paths, and a *mistyped* one would be
+            // coerced differently by the two engines rather than compared.
+            let name = if rng.pct(50) { "lag" } else { "lead" };
+            let ty = *rng.pick(&[Ty::Int, Ty::Real, Ty::Text]);
+            let mut args = vec![col(rng, ty)];
+            match rng.below(3) {
+                0 => {}
+                1 => args.push(E::Lit(Cell::Int(rng.range(0, 3) as i64))),
+                _ => {
+                    args.push(E::Lit(Cell::Int(rng.range(1, 3) as i64)));
+                    args.push(E::Lit(gen_value(rng, ty, false)));
+                }
+            }
+            (name, args, false, false)
+        }
+        n => {
+            let name = ["first_value", "last_value", "nth_value"][n - 8];
+            let ty = *rng.pick(&[Ty::Int, Ty::Real, Ty::Text]);
+            let mut args = vec![col(rng, ty)];
+            if name == "nth_value" {
+                args.push(E::Lit(Cell::Int(rng.range(1, 3) as i64)));
+            }
+            (name, args, false, true)
+        }
+    }
+}
+
+/// A whole select item of the form `f(..) OVER (..)`.
+///
+/// The determinism argument is the point of this function and is spelled out on
+/// `win_order_total`. Everything else -- which function, which frame, whether
+/// there is a PARTITION BY -- is free choice.
+fn gen_window(rng: &mut Rng, sc: &Scope) -> E {
+    // 60/40 in favour of the superkey shape, because it is the half that can
+    // exercise every function; the tied half is narrower but it is the only one
+    // that can tell `rank` from `dense_rank` or `RANGE` from `ROWS`.
+    let tied = rng.pct(40);
+    let order = if tied { win_order_tied(rng, sc) } else { win_order_total(rng, sc) };
+    let mut part = Vec::with_capacity(2);
+    for _ in 0..rng.below(3) {
+        let ty = *rng.pick(&[Ty::Int, Ty::Int, Ty::Text, Ty::Real]);
+        if let Some(c) = sc.any_of(rng, ty) {
+            part.push(c);
+        }
+    }
+    let (name, args, star, framed) = gen_win_call(rng, sc, tied);
+    let frame = if order.is_empty() || !framed || rng.pct(20) {
+        // A frame without an ORDER BY is legal and degenerate (every row is a
+        // peer of every other), and the two parsers do not agree on which
+        // spellings they accept there. Not worth the ambiguity.
+        ""
+    } else if tied || rng.pct(25) {
+        *rng.pick(&RANGE_FRAMES)
+    } else {
+        *rng.pick(&ROWS_FRAMES)
+    };
+    E::Over(Box::new(Win { name, args, star, part, order, frame }))
 }
 
 /// A random ordering prefix followed by every remaining output ordinal, so the
@@ -2315,6 +2831,43 @@ fn reductions(case: &Case) -> Vec<Case> {
             }
         }
     }
+    // Windows: drop the frame, then the PARTITION BY. Both are strictly
+    // simplifying and both keep the case well defined.
+    //
+    // The window's own ORDER BY is never shortened, which is the one place this
+    // shrinker deliberately leaves a reduction on the table. It is what makes
+    // the case comparable at all (see `win_order_total`); a candidate with a
+    // shorter key would "still diverge" for the trivial reason that the two
+    // engines are free to order tied rows differently, and the shrinker would
+    // walk straight from a real bug into that.
+    for i in 0..q.items.len() {
+        let E::Over(w) = &q.items[i] else { continue };
+        for stage in 0..2 {
+            if (stage == 0 && w.frame.is_empty()) || (stage == 1 && w.part.is_empty()) {
+                continue;
+            }
+            let mut c = case.clone();
+            // Both branches, not just the head. A set-operation tail is a clone
+            // of the first branch, so its item `i` is the same window; changing
+            // one and not the other leaves a reproducer whose two branches read
+            // differently for no reason, and -- worse -- one that could stop
+            // parsing on one side and be kept by the shrinker as a "divergence".
+            let apply = |q: &mut Query| {
+                if let Some(E::Over(w)) = q.items.get_mut(i) {
+                    if stage == 0 {
+                        w.frame = "";
+                    } else {
+                        w.part.clear();
+                    }
+                }
+            };
+            apply(&mut c.query);
+            if let Some((_, tail)) = &mut c.query.set_tail {
+                apply(tail);
+            }
+            out.push(c);
+        }
+    }
     // Simplify one expression in place.
     for (i, e) in q.items.iter().enumerate() {
         for s in simplifications(e) {
@@ -2600,6 +3153,18 @@ fn simplifications(e: &E) -> Vec<E> {
             }
         }
         E::Agg(_, None, _) => {}
+        // Only the arguments, and only in place: the arity is part of the
+        // function's signature, and the ORDER BY is load-bearing for the
+        // comparison rather than for the bug (see `reductions`).
+        E::Over(w) => {
+            for (i, a) in w.args.iter().enumerate() {
+                for s in simplifications(a) {
+                    let mut v = (**w).clone();
+                    v.args[i] = s;
+                    out.push(E::Over(Box::new(v)));
+                }
+            }
+        }
     }
     out
 }
@@ -2712,6 +3277,13 @@ struct Coverage {
     max_rows: usize,
     deletes: usize,
     updates: usize,
+    windows: usize,
+    /// Windows carrying an explicit frame, and windows whose ORDER BY is
+    /// deliberately *not* a superkey. Counted separately because they are the
+    /// two halves that break frame implementations, and a generator change that
+    /// quietly stopped emitting either would otherwise look like a clean run.
+    window_frames: usize,
+    window_tied: usize,
 }
 
 impl Coverage {
@@ -2733,7 +3305,19 @@ impl Coverage {
         self.limit += c.query.limit.is_some() as usize;
         self.set_ops += c.query.set_tail.is_some() as usize;
         let mut called = false;
-        c.query.for_each_expr(&mut |e| e.walk(&mut |x| called |= matches!(x, E::Call(..))));
+        c.query.for_each_expr(&mut |e| {
+            e.walk(&mut |x| {
+                called |= matches!(x, E::Call(..));
+                if let E::Over(w) = x {
+                    self.windows += 1;
+                    self.window_frames += !w.frame.is_empty() as usize;
+                    // Every generated schema has at least two columns, so a
+                    // superkey ORDER BY is never shorter than two -- which makes
+                    // the length the cheapest test for which half this is.
+                    self.window_tied += (w.order.len() < 2) as usize;
+                }
+            })
+        });
         self.calls += called as usize;
         for m in &c.mutations {
             if m.is_delete() {
@@ -2856,7 +3440,8 @@ fn differential_against_sqlite() {
     eprintln!(
         "differential: {checked} cases against sqlite3, {both_refused} rejected by both engines, \
          {} mismatches\n  coverage: {} joins ({} USING), {} SELECT *, {} aggregate, {} DISTINCT, \
-         {} LIMIT, {} UNION, {} with scalar calls\n  mutation: {} DELETE, {} UPDATE\
+         {} LIMIT, {} UNION, {} with scalar calls\n  window:   {} OVER clauses \
+         ({} with an explicit frame, {} over a tied ORDER BY)\n  mutation: {} DELETE, {} UPDATE\
          \n  storage:  {} rows loaded, widest table {}, \
          {} tables past GRANULE_SIZE, {} past BLOCK_SIZE, {} multi-INSERT, {} OPTIMIZEd",
         failures.len(),
@@ -2868,6 +3453,9 @@ fn differential_against_sqlite() {
         cov.limit,
         cov.set_ops,
         cov.calls,
+        cov.windows,
+        cov.window_frames,
+        cov.window_tied,
         cov.deletes,
         cov.updates,
         cov.rows_loaded,
@@ -3185,6 +3773,39 @@ fn known_divergences_still_reproduce() {
     // #9 -- SQLite's concat() drops NULL arguments; granular propagates.
     let (g, s) = probe("SELECT concat(CAST(NULL AS String), 'b')", "SELECT concat(NULL, 'b')");
     assert_ne!(g, s, "concat() NULL handling now agrees ({g} vs {s})");
+
+    // #10 -- window frame extensions sqlite has and granular does not. Each is
+    // refused at parse or bind time, which is why they are absent from
+    // `gen_window`'s frame menu rather than filtered out of its results. When
+    // one lands, this fails and the menu gains an entry.
+    let mut sess = Session::in_memory();
+    sess.execute("CREATE TABLE w (id Int64, k Int64) ENGINE = MergeTree ORDER BY id").unwrap();
+    for (what, over) in [
+        ("GROUPS frames", "ORDER BY id GROUPS BETWEEN 1 PRECEDING AND 1 FOLLOWING"),
+        ("RANGE with a numeric offset", "ORDER BY id RANGE BETWEEN 1 PRECEDING AND 1 FOLLOWING"),
+        (
+            "EXCLUDE",
+            "ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW EXCLUDE CURRENT ROW",
+        ),
+    ] {
+        let e = sess.query(&format!("SELECT sum(k) OVER ({over}) FROM w")).err();
+        assert!(
+            e.is_some(),
+            "{what} now parses -- add it to `gen_window`'s frame menu (ROWS_FRAMES / RANGE_FRAMES)"
+        );
+    }
+    assert!(
+        sess.query("SELECT count(*) FILTER (WHERE k > 1) OVER (ORDER BY id) FROM w").is_err(),
+        "aggregate FILTER now parses -- it is in the intersection and belongs in gen_win_call"
+    );
+    // ...and the three that *do* work, asserted so the note above stays honest.
+    for sql in [
+        "SELECT sum(k) OVER v FROM w WINDOW v AS (ORDER BY id)",
+        "SELECT id FROM w ORDER BY row_number() OVER (ORDER BY id DESC)",
+        "SELECT lag(k, 1, NULL) OVER (ORDER BY id) FROM w",
+    ] {
+        assert!(sess.query(sql).is_ok(), "`{sql}` stopped working");
+    }
 }
 
 /// KNOWN DIVERGENCE #5, measured rather than assumed.
@@ -3807,5 +4428,1120 @@ fn both_mutation_spellings_agree_with_sqlite_and_with_each_other() {
             .map(|r| r.iter().map(cell_of_value).collect())
             .collect();
         assert_eq!(fmt_rows(&got), fmt_rows(&g), "{what}: the two spellings diverged");
+    }
+}
+
+// =========================================================================
+// DECIMAL ORACLE
+//
+// `Decimal64` is out of the sqlite intersection and always was: sqlite has no
+// exact decimal type, so the only comparison available is against a REAL, and a
+// REAL comparison agrees with a wrong answer to fifteen digits. Excluding it was
+// right. Leaving it at that was not -- the exclusion meant the type had *no*
+// oracle at all, and it shipped with `avg`, `median` and `quantile` answering
+// 999999999999.999999 for any column past 10^12, which is the saturation clamp
+// of an 18-digit lane widened to scale 6. Every test the project had passed.
+//
+// So the oracle is built here out of `i128` instead. A `Decimal64(s)` lane *is*
+// an integer -- a count of `10^-s` units -- so every operation has an exact
+// integer definition, and `i128` holds every intermediate with room to spare:
+//
+//   a + b, a - b   out = max(sa,sb); rescale both, add unit counts
+//   a * b          out = sa+sb (rejected at bind time past 18); units multiply
+//   a / b          out = max(sa,6); round_half_away(ua * 10^(sb+out-sa), ub)
+//   a <=> b        rescale to a common scale, compare unit counts
+//   sum            sum of unit counts, at the argument's own scale
+//   min/max        the extreme unit count, at the argument's own scale
+//   avg            out = max(s,6); round_half_away(sum * 10^(out-s), n)
+//   quantile(p)    out = max(s,6); linear interpolation between the two
+//                  neighbouring order statistics, at `out`
+//
+// The contract the engine states is **exact or refuse**: an answer that does not
+// fit eighteen significant digits is an error, never a clamped value. This
+// oracle asserts exactly that, which is what would have caught the clamp on its
+// first run.
+//
+// Two notes on why the tests look the way they do:
+//
+//   * Rows are inserted as **string** literals. A bare `1.25` in this dialect is
+//     a `Float64` (`SELECT 12345678901234.5678` renders ...568), so a numeric
+//     literal would round at 2^53 units and the oracle would be measuring f64.
+//     Pinned by `a_bare_decimal_literal_is_still_a_float`.
+//   * Quantile levels are `0.25`, `0.5` and `0.75` only. Those are exact in
+//     binary, so `p*(n-1)` and its fraction are exact for every `n`, and the
+//     interpolation weight the engine derives from the fraction is an exact
+//     integer -- which lets the expectation stay in `i128` end to end instead
+//     of reproducing a floating-point rounding step.
+// =========================================================================
+
+/// Largest unit count a `Decimal64` lane can hold: `10^18 - 1`.
+/// Re-derived here rather than imported, so the oracle states the limit
+/// independently of the code it is checking.
+const DEC_MAX: i128 = 1_000_000_000_000_000_000 - 1;
+
+fn pow10i(k: u8) -> i128 {
+    let mut v = 1i128;
+    for _ in 0..k {
+        v *= 10;
+    }
+    v
+}
+
+/// `num / den` rounded half **away from zero** -- the rule this engine documents
+/// for every decimal narrowing, and the one the SQL Server `decimal` division it
+/// follows uses. Written from that statement, not copied from `agg.rs`: an
+/// oracle that shares an implementation with its subject checks nothing.
+fn dec_div_round(num: i128, den: i128) -> i128 {
+    let (q, rem) = (num / den, num % den);
+    if rem.unsigned_abs() * 2 >= den.unsigned_abs() {
+        q + if (num < 0) != (den < 0) { -1 } else { 1 }
+    } else {
+        q
+    }
+}
+
+/// A unit count rendered as the decimal literal that produces it.
+fn dec_lit(units: i128, scale: u8) -> String {
+    let (sign, m) = if units < 0 { ("-", -units) } else { ("", units) };
+    let p = pow10i(scale);
+    if scale == 0 {
+        format!("{sign}{m}")
+    } else {
+        format!("{sign}{}.{:0w$}", m / p, m % p, w = scale as usize)
+    }
+}
+
+/// A unit count with a uniformly-chosen *digit width*. Drawing uniformly over
+/// the whole range instead would put nine cases in ten in the top decade and
+/// never test a one-unit value, and the interesting failures are at both ends:
+/// one unit is where a rescale rounds to nothing, eighteen digits is where the
+/// lane runs out.
+fn dec_operand(rng: &mut Rng) -> i128 {
+    let digits = rng.range(0, 18) as u8;
+    if digits == 0 {
+        // Zero earns its place: it is the divisor that yields NULL and the
+        // factor whose product never overflows.
+        return 0;
+    }
+    let hi = pow10i(digits);
+    let m = hi / 10 + (rng.next() % (hi - hi / 10) as u64) as i128;
+    if rng.pct(45) {
+        -m
+    } else {
+        m
+    }
+}
+
+/// The unit count and scale behind a `Decimal` result, or a description of
+/// whatever else came back. Every other shape is a failure: a decimal that
+/// arrived as a `Float` has already lost the digits this type exists to keep.
+fn dec_of(v: &Value) -> Result<(i128, u8), String> {
+    match v {
+        Value::Decimal(u, s) => Ok((*u as i128, *s)),
+        other => Err(format!("{other:?}")),
+    }
+}
+
+/// Every value of a one-column query, or the engine's error text.
+fn dec_col(sess: &mut Session, sql: &str) -> Result<Vec<Value>, String> {
+    sess.query(sql).map_err(|e| e.to_string()).map(|rs| {
+        rs.to_values()
+            .into_iter()
+            .map(|mut r| r.swap_remove(0))
+            .collect()
+    })
+}
+
+/// A loaded two-column decimal table plus the exact unit counts behind it.
+struct DecTable {
+    sess: Session,
+    sa: u8,
+    sb: u8,
+    rows: Vec<(i128, i128)>,
+}
+
+impl DecTable {
+    fn load(rng: &mut Rng, sa: u8, sb: u8, n: usize) -> DecTable {
+        let rows: Vec<(i128, i128)> =
+            (0..n).map(|_| (dec_operand(rng), dec_operand(rng))).collect();
+        DecTable::of(sa, sb, rows)
+    }
+
+    fn of(sa: u8, sb: u8, rows: Vec<(i128, i128)>) -> DecTable {
+        let mut sess = Session::in_memory();
+        sess.execute(&format!(
+            "CREATE TABLE d (id Int64, a Decimal(18, {sa}), b Decimal(18, {sb})) \
+             ENGINE = MergeTree ORDER BY id"
+        ))
+        .expect("decimal DDL");
+        // One buffer for the whole statement; the shape `Case::setup` uses.
+        let mut stmt = String::with_capacity(rows.len() * 48 + 24);
+        stmt.push_str("INSERT INTO d VALUES ");
+        for (i, (a, b)) in rows.iter().enumerate() {
+            let _ = write!(
+                stmt,
+                "{}({i}, '{}', '{}')",
+                if i == 0 { "" } else { ", " },
+                dec_lit(*a, sa),
+                dec_lit(*b, sb)
+            );
+        }
+        sess.execute(&stmt).expect("decimal INSERT");
+        DecTable { sess, sa, sb, rows }
+    }
+
+    /// Reading the columns back must reproduce the unit counts exactly, or
+    /// nothing else this oracle says means anything.
+    fn assert_round_trip(&mut self) {
+        for (name, scale, pick) in [
+            ("a", self.sa, 0usize),
+            ("b", self.sb, 1usize),
+        ] {
+            let got = dec_col(&mut self.sess, &format!("SELECT {name} FROM d ORDER BY id"))
+                .unwrap_or_else(|e| panic!("reading {name} back: {e}"));
+            assert_eq!(got.len(), self.rows.len());
+            for (i, v) in got.iter().enumerate() {
+                let want = if pick == 0 { self.rows[i].0 } else { self.rows[i].1 };
+                let (u, s) = dec_of(v).unwrap_or_else(|w| {
+                    panic!("{name} came back as {w}, not a Decimal -- scale {scale}")
+                });
+                assert_eq!(
+                    (u, s),
+                    (want, scale),
+                    "row {i}: stored '{}' at scale {scale}, read back {u} at scale {s}",
+                    dec_lit(want, scale)
+                );
+            }
+        }
+    }
+
+    /// Check one projection against a per-row expectation.
+    ///
+    /// `want(a, b)` returns `Some(Some(units))` for an exact answer, `Some(None)`
+    /// for a NULL, and `None` when the exact answer does not fit -- where the
+    /// engine's stated contract is to refuse. The whole column is asked for
+    /// first, because block-at-a-time is the path that actually runs; only when
+    /// that errors does the check fall back to one row at a time, which is what
+    /// tells a legitimate refusal from a refusal that swallowed good rows.
+    /// Returns `(representable rows, rows whose exact answer does not fit)`, so
+    /// the caller can prove the grid actually reached both. A property test
+    /// whose every row happens to fit is only checking the easy half, and it
+    /// would look exactly like one that checks both.
+    fn check(
+        &mut self,
+        expr: &str,
+        out_scale: u8,
+        want: impl Fn(i128, i128) -> Option<Option<i128>>,
+    ) -> (usize, usize) {
+        let exp: Vec<Option<Option<i128>>> =
+            self.rows.iter().map(|(a, b)| want(*a, *b)).collect();
+        let over = exp.iter().filter(|e| e.is_none()).count();
+        let tally = (exp.len() - over, over);
+        let all_fit = over == 0;
+        let whole = dec_col(&mut self.sess, &format!("SELECT {expr} FROM d ORDER BY id"));
+        match (&whole, all_fit) {
+            (Ok(vals), true) => {
+                for (i, v) in vals.iter().enumerate() {
+                    self.assert_cell(expr, i, out_scale, v, exp[i].unwrap());
+                }
+                return tally;
+            }
+            (Ok(_), false) => {
+                let k = exp.iter().position(|e| e.is_none()).unwrap();
+                panic!(
+                    "`{expr}` answered for the whole column, but row {k} \
+                     (a = '{}', b = '{}') has no representable result -- the \
+                     contract is exact or refuse, and a clamped answer is neither",
+                    dec_lit(self.rows[k].0, self.sa),
+                    dec_lit(self.rows[k].1, self.sb),
+                );
+            }
+            (Err(e), true) => panic!(
+                "`{expr}` refused a column whose every row fits Decimal64({out_scale}): {e}"
+            ),
+            (Err(_), false) => {}
+        }
+        // The column errored and at least one row deserved it. Every *other*
+        // row must still be exact, which is the assertion that stops an engine
+        // from failing a whole block because one lane overflowed.
+        // `WHERE id = i` so only that row reaches the arithmetic; the filter is
+        // pushed under the projection, which is what makes the isolation real.
+        for (i, want_i) in exp.iter().enumerate() {
+            let sql = format!("SELECT {expr} FROM d WHERE id = {i}");
+            match (dec_col(&mut self.sess, &sql), *want_i) {
+                (Ok(vals), Some(w)) => {
+                    assert_eq!(vals.len(), 1, "`{sql}` returned {} rows", vals.len());
+                    self.assert_cell(expr, i, out_scale, &vals[0], w);
+                }
+                (Ok(vals), None) => panic!(
+                    "`{sql}` answered {:?}, but the exact result needs more than \
+                     eighteen significant digits",
+                    vals.first()
+                ),
+                (Err(e), Some(_)) => panic!("`{sql}` refused a representable row: {e}"),
+                (Err(_), None) => {}
+            }
+        }
+        tally
+    }
+
+    fn assert_cell(&self, expr: &str, i: usize, out_scale: u8, got: &Value, want: Option<i128>) {
+        let (a, b) = self.rows[i];
+        let ctx = format!(
+            "`{expr}` row {i}: a = '{}' (scale {}), b = '{}' (scale {})",
+            dec_lit(a, self.sa),
+            self.sa,
+            dec_lit(b, self.sb),
+            self.sb
+        );
+        match want {
+            // The only NULL this grid produces is `x / 0`, which both this
+            // engine and the standard define as NULL rather than an error.
+            None => assert!(
+                matches!(got, Value::Null),
+                "{ctx}: expected NULL (division by zero), got {got:?}"
+            ),
+            Some(units) => {
+                let (u, s) = dec_of(got).unwrap_or_else(|w| panic!("{ctx}: got {w}"));
+                assert_eq!(
+                    (u, s),
+                    (units, out_scale),
+                    "{ctx}: got {} at scale {s}, want {} at scale {out_scale}",
+                    dec_lit(u, s),
+                    dec_lit(units, out_scale)
+                );
+            }
+        }
+    }
+}
+
+/// Rescale `u` from `from` to `to`, or `None` when the result leaves the lane.
+fn dec_rescale(u: i128, from: u8, to: u8) -> Option<i128> {
+    let v = if to >= from {
+        u.checked_mul(pow10i(to - from))?
+    } else {
+        dec_div_round(u, pow10i(from - to))
+    };
+    (v.abs() <= DEC_MAX).then_some(v)
+}
+
+/// `+`, `-`, `*`, `/` and the comparisons, against exact `i128` arithmetic on
+/// unit counts, at magnitudes from one unit to the full eighteen digits.
+///
+/// This is the test that would have caught the clamped `avg` on its first run,
+/// and it is the only thing standing behind `Decimal64` now that the sqlite
+/// oracle is (correctly) blind to it.
+#[test]
+fn decimal_arithmetic_matches_exact_integer_arithmetic() {
+    let mut rng = Rng::new(0x0DEC_1A11_u64);
+    // Rows whose exact answer fits the lane, and rows whose does not. Both are
+    // counted and both are required below: a grid on which everything fits only
+    // checks the easy half, and it would read exactly like one that checks both.
+    let (mut fit, mut over) = (0usize, 0usize);
+    // Equal scales, then two mixed pairs: rescaling one side to meet the other
+    // is a step that only exists in the mixed case, and it is where an operand
+    // can leave the lane before the operation has run at all.
+    for (sa, sb) in [(0u8, 0u8), (2, 2), (6, 6), (9, 9), (2, 5), (0, 9)] {
+        let mut t = DecTable::load(&mut rng, sa, sb, 24);
+        t.assert_round_trip();
+        let mut tally = |(f, o): (usize, usize)| {
+            fit += f;
+            over += o;
+        };
+
+        let out = sa.max(sb);
+        for (expr, sign) in [("a + b", 1i128), ("a - b", -1)] {
+            tally(t.check(expr, out, |a, b| {
+                let (x, y) = (dec_rescale(a, sa, out)?, dec_rescale(b, sb, out)?);
+                let v = x + sign * y;
+                (v.abs() <= DEC_MAX).then_some(Some(v))
+            }));
+        }
+
+        // `*` keeps both lanes where they are: the product of two unit counts is
+        // already denominated in 10^-(sa+sb).
+        if sa + sb <= 18 {
+            tally(t.check("a * b", sa + sb, |a, b| {
+                let v = a * b;
+                (v.abs() <= DEC_MAX).then_some(Some(v))
+            }));
+        }
+
+        // `/` widens to at least six fractional digits, so the quotient of two
+        // in-range operands is routinely out of range -- which is exactly the
+        // shape `avg` got wrong, reached from the expression side.
+        let dout = sa.max(6);
+        tally(t.check("a / b", dout, |a, b| {
+            if b == 0 {
+                return Some(None);
+            }
+            let n = a.checked_mul(pow10i(sb + dout - sa))?;
+            let v = dec_div_round(n, b);
+            (v.abs() <= DEC_MAX).then_some(Some(v))
+        }));
+
+        // Comparison is the operation with no result magnitude to overflow, so
+        // it must never refuse -- unless bringing the operands to a common scale
+        // does, which is the mixed-scale case above.
+        for (op, ord) in [("<", -1i32), ("=", 0), (">", 1)] {
+            let sql = format!("SELECT a {op} b FROM d ORDER BY id");
+            let got = match dec_col(&mut t.sess, &sql) {
+                Ok(v) => v,
+                Err(e) => {
+                    assert!(
+                        t.rows.iter().any(|(a, b)| dec_rescale(*a, sa, out).is_none()
+                            || dec_rescale(*b, sb, out).is_none()),
+                        "`{sql}` refused a column every row of which is comparable: {e}"
+                    );
+                    continue;
+                }
+            };
+            for (i, v) in got.iter().enumerate() {
+                let (a, b) = t.rows[i];
+                let (Some(x), Some(y)) = (dec_rescale(a, sa, out), dec_rescale(b, sb, out)) else {
+                    continue;
+                };
+                let want = match ord {
+                    -1 => x < y,
+                    0 => x == y,
+                    _ => x > y,
+                };
+                // `cell_of_value` folds Bool to 0/1, which is the same shape the
+                // sqlite side of this file compares against.
+                assert!(
+                    matches!(cell_of_value(v), Cell::Int(g) if g == want as i64),
+                    "`a {op} b` row {i}: '{}' vs '{}' gave {v:?}, want {want}",
+                    dec_lit(a, sa),
+                    dec_lit(b, sb)
+                );
+            }
+        }
+    }
+    // Both halves of the contract were actually reached: rows the engine had to
+    // answer exactly, and rows it had to refuse. Without this the grid could
+    // drift to comfortable magnitudes and still read as a passing property test.
+    assert!(
+        fit > 200 && over > 20,
+        "the decimal grid produced {fit} representable and {over} \
+         non-representable results -- it is only exercising one half of \
+         `exact or refuse`"
+    );
+}
+
+/// `sum`, `min`, `max`, `count`, `avg`, `median` and `quantile`, against exact
+/// `i128` arithmetic.
+///
+/// `avg` and the interpolating quantiles widen to `max(s, 6)`, so a
+/// `Decimal64(2)` column holding a perfectly ordinary 10^12 has an average that
+/// does not fit -- which is why this half exists and why it runs at magnitudes
+/// straddling that boundary rather than at comfortable ones.
+#[test]
+fn decimal_aggregates_match_exact_integer_arithmetic() {
+    let mut rng = Rng::new(0xA66_DEC_u64.wrapping_mul(0x9E37_79B9));
+    for s in [0u8, 2, 6, 9] {
+        for round in 0..6 {
+            // Six rows, so `p*(n-1)` lands on a non-integer rank for every
+            // level below and the interpolation is actually exercised.
+            //
+            // Round 0 pins the fabrication boundary rather than leaving it to
+            // the draw. `avg` and the interpolating quantiles widen to
+            // `max(s,6)` *before* dividing, so what has to fit is
+            // `total * 10^(6-s)`, not the mean: a `Decimal64(2)` column of
+            // 1000000000000.00 is six ordinary values whose average is the one
+            // that used to come back as 999999999999.999999. The exponent is
+            // capped at 17 so the *stored* column is still in range -- past
+            // scale 6 there is no widening left to overflow, and the round
+            // degenerates into an ordinary large-magnitude case.
+            let mut t = if round == 0 {
+                let mag = pow10i((12 + s).min(17));
+                DecTable::of(s, s, (0..6).map(|i| (mag * (i as i128 + 1), mag)).collect())
+            } else {
+                DecTable::load(&mut rng, s, s, 6)
+            };
+            t.assert_round_trip();
+
+            let units: Vec<i128> = t.rows.iter().map(|(a, _)| *a).collect();
+            let n = units.len() as i128;
+            let total: i128 = units.iter().sum();
+            let mut sorted = units.clone();
+            sorted.sort_unstable();
+
+            // `sum`, `min` and `max` stay at the argument's own scale, so an
+            // in-range column can only overflow through the total.
+            let exact = |sess: &mut Session, sql: &str, want: Option<i128>, out: u8| {
+                match (dec_col(sess, sql), want) {
+                    (Ok(v), Some(u)) => {
+                        let (g, gs) = dec_of(&v[0]).unwrap_or_else(|w| panic!("`{sql}`: got {w}"));
+                        assert_eq!(
+                            (g, gs),
+                            (u, out),
+                            "`{sql}`: got {} at scale {gs}, want {} at scale {out}",
+                            dec_lit(g, gs),
+                            dec_lit(u, out)
+                        );
+                    }
+                    (Ok(v), None) => panic!(
+                        "`{sql}` answered {:?}; the exact result needs more than \
+                         eighteen significant digits and the contract is to refuse",
+                        v.first()
+                    ),
+                    (Err(e), Some(u)) => {
+                        panic!("`{sql}` refused, but {} is representable: {e}", dec_lit(u, out))
+                    }
+                    (Err(_), None) => {}
+                }
+            };
+            exact(
+                &mut t.sess,
+                "SELECT sum(a) FROM d",
+                (total.abs() <= DEC_MAX).then_some(total),
+                s,
+            );
+            exact(&mut t.sess, "SELECT min(a) FROM d", Some(sorted[0]), s);
+            exact(&mut t.sess, "SELECT max(a) FROM d", Some(sorted[5]), s);
+            assert_eq!(
+                t.sess.query("SELECT count(a) FROM d").unwrap().scalar().unwrap().as_u64(),
+                Some(6),
+                "count is scale-blind and cannot overflow"
+            );
+
+            // `avg` widens to max(s,6) *before* dividing, so the numerator is
+            // `total * 10^(os-s)` and it is that product, not the mean, that
+            // decides whether the answer exists.
+            let os = s.max(6);
+            let avg = total
+                .checked_mul(pow10i(os - s))
+                .map(|num| dec_div_round(num, n))
+                .filter(|v| v.abs() <= DEC_MAX);
+            exact(&mut t.sess, "SELECT avg(a) FROM d", avg, os);
+
+            // `quantileExact(p)` hands back an element it observed, so it keeps
+            // the argument's scale and always fits.
+            for (p, rank) in [(0.25f64, 1usize), (0.5, 3), (0.75, 4)] {
+                exact(
+                    &mut t.sess,
+                    &format!("SELECT quantileExact({p})(a) FROM d"),
+                    Some(sorted[rank]),
+                    s,
+                );
+            }
+            // The interpolating forms divide, so they widen like `avg`. `p` is a
+            // dyadic rational and `n-1` is 5, so `pos` and its fraction are
+            // exact in binary and the whole expectation stays in `i128`.
+            let interp = |p: f64| -> Option<i128> {
+                let pos = p * (n - 1) as f64;
+                let lo = pos.floor() as usize;
+                let frac = pos - pos.floor();
+                let hi = (lo + 1).min(5);
+                let mul = pow10i(os - s);
+                let (a, b) = (sorted[lo] * mul, sorted[hi] * mul);
+                // The engine carries the weight at nine digits; `frac` is 0,
+                // .25, .5 or .75 here, so this is exact rather than a model of
+                // its rounding.
+                let one = pow10i(9);
+                let w = (frac * one as f64) as i128;
+                let v = dec_div_round(a * one + (b - a) * w, one);
+                (v.abs() <= DEC_MAX).then_some(v)
+            };
+            for p in [0.25f64, 0.5, 0.75] {
+                exact(&mut t.sess, &format!("SELECT quantile({p})(a) FROM d"), interp(p), os);
+            }
+            exact(&mut t.sess, "SELECT median(a) FROM d", interp(0.5), os);
+        }
+    }
+}
+
+/// Why the decimal oracle inserts **strings**.
+///
+/// A bare `1.25` is a `Float64` in this dialect, not a decimal literal, so
+/// `INSERT INTO d VALUES (1, 99999999999999.9999)` stores whatever f64 rounding
+/// left behind -- and a property test written the obvious way would have been
+/// measuring binary64 while believing it was measuring `Decimal64`.
+///
+/// This is pinned rather than merely commented because it is a *pending* change
+/// (exact decimal literals), and the day it lands this test fails and the
+/// oracle above can drop the quoting.
+#[test]
+fn a_bare_decimal_literal_is_still_a_float() {
+    let mut s = Session::in_memory();
+    let v = s.query("SELECT 12345678901234.5678").unwrap().scalar().unwrap();
+    assert!(
+        matches!(v, Value::Float(_)),
+        "decimal literals are exact now ({v:?}) -- the decimal oracle can insert \
+         them unquoted, and KNOWN DIVERGENCE-style quoting can go"
+    );
+    // The string route is exact, which is what the oracle relies on.
+    s.execute("CREATE TABLE d (id Int64, a Decimal(18, 4)) ENGINE = MergeTree ORDER BY id")
+        .unwrap();
+    s.execute("INSERT INTO d VALUES (1, '99999999999999.9998')").unwrap();
+    let got = s.query("SELECT a FROM d").unwrap().scalar().unwrap();
+    assert_eq!(
+        dec_of(&got),
+        Ok((999_999_999_999_999_998, 4)),
+        "the string route into a Decimal column is not exact either"
+    );
+}
+
+// =========================================================================
+// WINDOW COVERAGE, END TO END
+//
+// The single defect this project keeps repeating is a capability that is
+// complete in `src/` and never reachable from `Session`. This harness has the
+// same failure mode one level up: `gen_window` can be perfect and still never
+// be *called*, and a run that emits no `OVER` clause looks exactly like a run
+// that found nothing. So the generated window shapes are asserted to arrive at
+// the public API, and to agree with sqlite when they do.
+// =========================================================================
+
+/// The generator must actually emit windows, and they must survive the whole
+/// pipeline -- render, `Session::execute`, `Session::query`, sqlite, compare.
+///
+/// This is the test that fails if `WINDOW_PCT` is turned to zero, if
+/// `gen_window` stops being reached from `gen_query`, or if `E::Over` renders
+/// something one of the two engines will not parse.
+#[test]
+fn generated_windows_reach_both_engines_and_agree() {
+    if skip_without_sqlite() {
+        return;
+    }
+    // Menu completeness is asked of `gen_window` directly rather than of whole
+    // cases. Reaching the rarest entry (`nth_value`: the positional half, one
+    // arm in eleven) through `gen_case_at` needs ~2500 seeds, and generating
+    // 2500 cases -- several of them 8000 rows -- costs 0.4s to answer a
+    // question about one function. Against a fixed scope it is 20k draws in
+    // under a millisecond.
+    let sc = Scope {
+        cols: vec![(0, 0, Ty::Int), (0, 1, Ty::Int), (0, 2, Ty::Real), (0, 3, Ty::Text)],
+        bare: Vec::new(),
+    };
+    let mut names: HashMap<&'static str, usize> = HashMap::new();
+    let (mut frames, mut tied) = (0usize, 0usize);
+    let mut rng = Rng::new(0x01D0_5EED);
+    for _ in 0..20_000 {
+        let E::Over(w) = gen_window(&mut rng, &sc) else { unreachable!() };
+        *names.entry(w.name).or_default() += 1;
+        frames += !w.frame.is_empty() as usize;
+        tied += (w.order.len() < 2) as usize;
+    }
+    for f in [
+        "row_number", "rank", "dense_rank", "percent_rank", "cume_dist", "ntile", "lag", "lead",
+        "first_value", "last_value", "nth_value", "count", "sum", "avg", "min", "max",
+    ] {
+        assert!(
+            names.get(f).copied().unwrap_or(0) > 20,
+            "`{f}` was generated {} times in 20000 draws; the menu is a lie",
+            names.get(f).copied().unwrap_or(0)
+        );
+    }
+    assert!(frames > 2000 && tied > 2000, "{frames} framed, {tied} tied of 20000");
+
+    // Reachability is the separate question, and the one this project keeps
+    // getting wrong: a generator that is perfect and never called. 600 seeds is
+    // enough to answer it and cheap enough to keep in the default run.
+    let windowed: Vec<Case> = (0..600u64)
+        .map(gen_case_at)
+        .filter(|c| {
+            let mut has = false;
+            c.query
+                .for_each_expr(&mut |e| e.walk(&mut |x| has |= matches!(x, E::Over(_))));
+            has
+        })
+        .collect();
+    assert!(
+        windowed.len() > 30,
+        "only {} of 600 seeds produced an OVER clause -- window coverage is \
+         effectively off",
+        windowed.len()
+    );
+
+    // Now run them: both engines, the real drivers, the real comparator. Via
+    // `sqlite_batch`, for the same reason the main loop does -- one process per
+    // case turned this test into the slowest thing in the file at 5.6s, against
+    // 0.6s batched.
+    let mut checked = 0usize;
+    let mut failures = Vec::new();
+    for chunk in windowed.chunks(BATCH) {
+        let batched = sqlite_batch(chunk);
+        for (j, case) in chunk.iter().enumerate() {
+            let g = run_granular(case);
+            let s = match &batched {
+                Some(all) => Ok(all[j].clone()),
+                None => sqlite_one(case),
+            };
+            if matches!((&g, &s), (Err(_), Err(_))) {
+                continue;
+            }
+            checked += 1;
+            if let Some(d) = compare(case, g, s) {
+                failures.push(report(case, &d));
+            }
+        }
+        if failures.len() >= 4 {
+            break;
+        }
+    }
+    assert!(checked > 25, "only {checked} window cases actually ran in both engines");
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// The shape `tests/window.rs` cannot reach, and the reason windows belong in
+/// *this* file as well: a window over a table that spans several parts and runs
+/// past `GRANULE_SIZE` and `BLOCK_SIZE`.
+///
+/// A window operator that quietly assumed one block, one part, or that the scan
+/// hands it rows already in the window's order, is correct on twelve rows and
+/// wrong here. The frames are chosen to straddle the block boundary: a
+/// `1 PRECEDING`/`1 FOLLOWING` frame at row 8192 needs the row before and the
+/// row after it, which live in different blocks.
+#[test]
+fn windows_over_a_multi_part_table_agree_with_sqlite() {
+    if skip_without_sqlite() {
+        return;
+    }
+    const N: i64 = 8200;
+    let table = TableDef {
+        name: "t0".into(),
+        cols: vec![
+            ColDef { name: "id".into(), ty: Ty::Int, nullable: false },
+            ColDef { name: "k".into(), ty: Ty::Int, nullable: true },
+        ],
+        // `id` is unique and `k` collides hard, so the same table serves the
+        // superkey shape (order by id) and the tied shape (order by k).
+        rows: (0..N)
+            .map(|i| {
+                vec![
+                    Cell::Int(i),
+                    if i % 97 == 0 { Cell::Null } else { Cell::Int(i % 7) },
+                ]
+            })
+            .collect(),
+        sort: SortKey::Id,
+        // Three parts plus a delta, so the scan has to merge representations.
+        chunk: 3000,
+        optimize: false,
+        keyed: false,
+    };
+    let idk = || {
+        vec![(E::Col(0, 0), true, true), (E::Col(0, 1), true, true)]
+    };
+    let specs: Vec<Win> = vec![
+        Win {
+            name: "row_number",
+            args: vec![],
+            star: false,
+            part: vec![],
+            order: idk(),
+            frame: "",
+        },
+        Win {
+            name: "sum",
+            args: vec![E::Col(0, 1)],
+            star: false,
+            part: vec![],
+            order: idk(),
+            frame: "ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING",
+        },
+        Win {
+            name: "count",
+            args: vec![],
+            star: true,
+            part: vec![E::Col(0, 1)],
+            order: idk(),
+            frame: "ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW",
+        },
+        Win {
+            name: "lag",
+            args: vec![E::Col(0, 1), E::Lit(Cell::Int(2)), E::Lit(Cell::Int(-1))],
+            star: false,
+            part: vec![],
+            order: idk(),
+            frame: "",
+        },
+        // Tied: `k` has seven values plus NULL over 8200 rows, so every peer
+        // group is ~1000 rows wide and spans block boundaries by itself.
+        Win {
+            name: "dense_rank",
+            args: vec![],
+            star: false,
+            part: vec![],
+            order: vec![(E::Col(0, 1), true, false)],
+            frame: "",
+        },
+        Win {
+            name: "sum",
+            args: vec![E::Col(0, 0)],
+            star: false,
+            part: vec![],
+            order: vec![(E::Col(0, 1), false, true)],
+            frame: "RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW",
+        },
+    ];
+    for w in specs {
+        let case = Case {
+            seed: 0,
+            tables: vec![table.clone()],
+            mutations: Vec::new(),
+            query: Query {
+                from: From::One(0),
+                star: false,
+                distinct: false,
+                items: vec![E::Col(0, 0), E::Over(Box::new(w.clone()))],
+                filter: None,
+                group_by: Vec::new(),
+                having: None,
+                set_tail: None,
+                order: vec![(1, true, true), (2, true, true)],
+                limit: None,
+                offset: 0,
+            },
+        };
+        let mut sql = String::new();
+        E::Over(Box::new(w)).render(Dialect::Granular, &case.tables, &mut sql);
+        let g = run_granular(&case).unwrap_or_else(|e| panic!("granular refused `{sql}`: {e}"));
+        let s = sqlite_one(&case).unwrap_or_else(|e| panic!("sqlite refused `{sql}`: {e}"));
+        assert_eq!(g.len(), N as usize, "`{sql}` returned {} rows", g.len());
+        assert!(
+            compare(&case, Ok(g), Ok(s)).is_none(),
+            "`{sql}` over a {N}-row, four-part table disagreed with sqlite:\n{}",
+            report(&case, &compare(&case, run_granular(&case), sqlite_one(&case)).unwrap())
+        );
+    }
+}
+
+/// The determinism argument the window generator rests on, checked rather than
+/// asserted in a comment.
+///
+/// A superkey `ORDER BY` must name every visible column; a tied one must name at
+/// most one, and must only carry functions defined over peer groups. If either
+/// invariant slips, the harness starts reporting the two *sorts* disagreeing
+/// about tied rows as an engine bug -- the failure mode that would make every
+/// window mismatch worthless.
+#[test]
+fn generated_windows_are_either_superkey_ordered_or_peer_defined() {
+    const PEER_SAFE: [&str; 9] = [
+        "rank", "dense_rank", "percent_rank", "cume_dist", "count", "sum", "avg", "min", "max",
+    ];
+    let mut superkey = 0usize;
+    let mut peers = 0usize;
+    // Whole cases, not a synthetic scope: the invariant is about what
+    // `Scope::of` hands `gen_window` for a *particular* FROM, and a join's scope
+    // is the shape most likely to break it.
+    for seed in 0..1200u64 {
+        let c = gen_case_at(seed);
+        let ncols: usize = match &c.query.from {
+            From::One(s) => c.tables[*s].cols.len(),
+            From::Join(..) => c.tables[0].cols.len() + c.tables[1].cols.len(),
+        };
+        c.query.for_each_expr(&mut |e| {
+            e.walk(&mut |x| {
+                let E::Over(w) = x else { return };
+                if w.order.len() == ncols {
+                    superkey += 1;
+                    return;
+                }
+                assert!(
+                    w.order.len() <= 1,
+                    "seed {seed}: window ORDER BY has {} of {ncols} columns -- \
+                     neither a superkey nor a single tied key, so its answer is \
+                     not defined in either engine",
+                    w.order.len()
+                );
+                assert!(
+                    PEER_SAFE.contains(&w.name),
+                    "seed {seed}: `{}` reads a row position but its window ORDER \
+                     BY ties",
+                    w.name
+                );
+                assert!(
+                    !w.frame.starts_with("ROWS"),
+                    "seed {seed}: `{}` under a tied ORDER BY, which counts rows \
+                     across an arbitrary slice of a peer group",
+                    w.frame
+                );
+                peers += 1;
+            })
+        });
+    }
+    assert!(superkey > 50 && peers > 40, "{superkey} superkey, {peers} tied windows");
+}
+
+/// The shapes the generator reaches rarely or not at all, written out by hand.
+///
+/// A random generator is a poor way to reach an *empty* table, a *one-row*
+/// partition, `ntile(9)` over seven rows, or a frame that starts past the end --
+/// each needs several independent draws to line up. They are also where frame
+/// arithmetic breaks. Two of these are here because they were identified as
+/// risks while writing `gen_window` and could equally have been excluded from
+/// it: `PARTITION BY <float>` over a column holding both `0.0` and `-0.0`
+/// (equal values, different bits -- a partition key compared bitwise would split
+/// them), and `PARTITION BY <nullable>` where every NULL must land in one
+/// partition rather than each in its own.
+#[test]
+fn hand_written_window_edge_cases_agree_with_sqlite() {
+    if skip_without_sqlite() {
+        return;
+    }
+    const G_DDL: [&str; 4] = [
+        "CREATE TABLE t (id Int64, k Nullable(Int64), f Float64, s Nullable(String)) \
+         ENGINE = MergeTree ORDER BY id",
+        "INSERT INTO t VALUES (0,1,0.0,'a'),(1,1,-0.0,'a'),(2,NULL,0.5,NULL),(3,2,-0.5,'b')",
+        "INSERT INTO t VALUES (4,2,0.0,''),(5,NULL,1.0,'a'),(6,3,-0.0,'b')",
+        "CREATE TABLE u (id Int64, kk Int64) ENGINE = MergeTree ORDER BY id",
+    ];
+    const S_DDL: [&str; 4] = [
+        "CREATE TABLE t (id INTEGER, k INTEGER, f REAL, s TEXT)",
+        "INSERT INTO t VALUES (0,1,0.0,'a'),(1,1,-0.0,'a'),(2,NULL,0.5,NULL),(3,2,-0.5,'b')",
+        "INSERT INTO t VALUES (4,2,0.0,''),(5,NULL,1.0,'a'),(6,3,-0.0,'b')",
+        "CREATE TABLE u (id INTEGER, kk INTEGER)",
+    ];
+    const U_ROWS: &str = "INSERT INTO u VALUES (1,10),(3,30),(9,90)";
+
+    // Every query below is spelled identically in both dialects and ends in a
+    // total ORDER BY with explicit NULL placement, so the comparison is ordered
+    // and the two engines' *defaults* are never load-bearing.
+    const QUERIES: [&str; 20] = [
+        // NULL as a partition key: every NULL in one partition, not one each.
+        "SELECT id, row_number() OVER (PARTITION BY k ORDER BY id) FROM t ORDER BY 1 ASC NULLS FIRST",
+        // 0.0 and -0.0 are the same value and different bits.
+        "SELECT id, count(*) OVER (PARTITION BY f ORDER BY id) FROM t ORDER BY 1 ASC NULLS FIRST",
+        // More buckets than rows: the tail buckets must be empty, not wrapped.
+        "SELECT id, ntile(9) OVER (ORDER BY id) FROM t ORDER BY 1 ASC NULLS FIRST",
+        // nth_value past the end of a two-row frame.
+        "SELECT id, nth_value(k, 5) OVER (ORDER BY id ROWS BETWEEN CURRENT ROW AND 1 FOLLOWING) \
+         FROM t ORDER BY 1 ASC NULLS FIRST",
+        // lag with a zero offset is the current row.
+        "SELECT id, lag(k, 0) OVER (ORDER BY id) FROM t ORDER BY 1 ASC NULLS FIRST",
+        // The classic surprise: the default frame ends at the current row, so
+        // last_value is the current row and not the partition's last.
+        "SELECT id, last_value(k) OVER (ORDER BY id) FROM t ORDER BY 1 ASC NULLS FIRST",
+        // RANGE over a key with NULL peers.
+        "SELECT id, sum(k) OVER (ORDER BY k RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) \
+         FROM t ORDER BY 1 ASC NULLS FIRST",
+        // rank and dense_rank diverge exactly on ties, over text with a NULL.
+        "SELECT id, rank() OVER (ORDER BY s DESC NULLS LAST), \
+         dense_rank() OVER (ORDER BY s DESC NULLS LAST) FROM t ORDER BY 1 ASC NULLS FIRST",
+        // Empty input: no partitions at all.
+        "SELECT id, row_number() OVER (ORDER BY id) FROM t WHERE id > 100 ORDER BY 1 ASC NULLS FIRST",
+        // A single-row partition with a frame that reaches outside it.
+        "SELECT id, sum(k) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) \
+         FROM t WHERE id = 3 ORDER BY 1 ASC NULLS FIRST",
+        // A window inside each branch of a set operation: two independent
+        // frames over two different row sets.
+        "SELECT id, row_number() OVER (ORDER BY id) FROM t WHERE id < 3 UNION ALL \
+         SELECT id, row_number() OVER (ORDER BY id) FROM t WHERE id >= 5 \
+         ORDER BY 1 ASC NULLS FIRST, 2 ASC NULLS FIRST",
+        // A window over NULL-extended join rows.
+        "SELECT t.id, u.kk, count(*) OVER (PARTITION BY u.kk ORDER BY t.id, u.id) \
+         FROM t LEFT OUTER JOIN u ON t.id = u.id \
+         ORDER BY 1 ASC NULLS FIRST, 2 ASC NULLS FIRST",
+        // DISTINCT over window output.
+        "SELECT DISTINCT count(*) OVER (PARTITION BY k) FROM t ORDER BY 1 ASC NULLS FIRST",
+        // LIMIT/OFFSET slice the post-window result.
+        "SELECT id, row_number() OVER (ORDER BY id DESC NULLS LAST) FROM t \
+         ORDER BY 2 ASC NULLS FIRST LIMIT 3 OFFSET 2",
+        // A frame entirely past the end of every partition.
+        "SELECT id, count(*) OVER (ORDER BY id ROWS BETWEEN 5 FOLLOWING AND 9 FOLLOWING), \
+         sum(k) OVER (ORDER BY id ROWS BETWEEN 5 FOLLOWING AND 9 FOLLOWING) \
+         FROM t ORDER BY 1 ASC NULLS FIRST",
+        // An empty frame on the first row: NULL for an aggregate, 0 for count.
+        "SELECT id, first_value(s) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) \
+         FROM t ORDER BY 1 ASC NULLS FIRST",
+        // Float aggregate over a sliding frame, partitioned by a nullable text.
+        "SELECT id, avg(f) OVER (PARTITION BY s ORDER BY id ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) \
+         FROM t ORDER BY 1 ASC NULLS FIRST",
+        // min/max over strings inside a frame.
+        "SELECT id, max(s) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) \
+         FROM t ORDER BY 1 ASC NULLS FIRST",
+        // Two different OVER clauses in one projection: two window sorts.
+        "SELECT id, row_number() OVER (ORDER BY k ASC NULLS FIRST, id), \
+         row_number() OVER (PARTITION BY s ORDER BY id DESC) FROM t ORDER BY 1 ASC NULLS FIRST",
+        // A window over an aggregated result -- legal in both engines and
+        // RESTRICTION R15 in the generator, so this is its only coverage.
+        "SELECT k, count(*), sum(count(*)) OVER (ORDER BY k ASC NULLS FIRST) \
+         FROM t GROUP BY k ORDER BY 1 ASC NULLS FIRST",
+    ];
+
+    let mut sess = Session::in_memory();
+    for stmt in G_DDL.iter().chain([&U_ROWS]) {
+        sess.execute(stmt).unwrap_or_else(|e| panic!("`{stmt}`: {e}"));
+    }
+    let mut script = String::from(PREAMBLE);
+    for stmt in S_DDL.iter().chain([&U_ROWS]) {
+        let _ = writeln!(script, "{stmt};");
+    }
+    // One sqlite process for all twenty, attributed by the same sentinel the
+    // batched reader uses.
+    for q in QUERIES {
+        let _ = writeln!(script, "{q};\nSELECT '{SENTINEL}';");
+    }
+    let (out, err) = sqlite_raw(&script).expect("sqlite3 runs");
+    assert!(err.trim().is_empty(), "sqlite refused a probe: {err}");
+    let marker = format!("'{}'", SENTINEL.replace('\'', "''"));
+    let mut expected: Vec<Vec<Vec<Cell>>> = Vec::with_capacity(QUERIES.len());
+    let mut cur = Vec::new();
+    for line in out.lines() {
+        if line == marker {
+            expected.push(std::mem::take(&mut cur));
+        } else {
+            cur.push(parse_quote_row(line));
+        }
+    }
+    assert_eq!(expected.len(), QUERIES.len(), "sentinel attribution is off");
+
+    for (q, want) in QUERIES.iter().zip(&expected) {
+        let got: Vec<Vec<Cell>> = sess
+            .query(q)
+            .unwrap_or_else(|e| panic!("granular refused `{q}`: {e}"))
+            .to_values()
+            .iter()
+            .map(|r| r.iter().map(cell_of_value).collect())
+            .collect();
+        assert_eq!(
+            got.len(),
+            want.len(),
+            "`{q}`\ngranular {} rows:\n{}sqlite {} rows:\n{}",
+            got.len(),
+            fmt_rows(&got),
+            want.len(),
+            fmt_rows(want)
+        );
+        for (i, (a, b)) in got.iter().zip(want).enumerate() {
+            assert!(
+                rows_equal(a, b),
+                "`{q}` row {i}: granular {} | sqlite {}",
+                a.iter().map(fmt_cell).collect::<Vec<_>>().join(", "),
+                b.iter().map(fmt_cell).collect::<Vec<_>>().join(", ")
+            );
+        }
+    }
+}
+
+/// Proof that the window comparison can see a window bug.
+///
+/// A soak that reports nothing is either evidence or a broken harness, and the
+/// two look identical from outside. `comparator_catches_injected_wrong_answers`
+/// answers the general question by perturbing a cell; this answers the specific
+/// one, by feeding the comparator one engine's answer to a query and the other
+/// engine's answer to the query a *plausibly broken implementation* would have
+/// computed instead. Each pair below is a real defect somebody has shipped:
+///
+///   * reading `RANGE ... CURRENT ROW` as `ROWS ... CURRENT ROW`, so tied rows
+///     get different running totals instead of the same one;
+///   * `last_value` over the whole partition instead of the default frame,
+///     which ends at the current row;
+///   * an off-by-one in `lag`'s offset;
+///   * `rank` where `dense_rank` was asked for.
+///
+/// If the comparator cannot tell these apart, "0 mismatches" over fifty
+/// thousand cases means nothing.
+#[test]
+fn the_window_comparison_can_see_the_bugs_it_is_looking_for() {
+    if skip_without_sqlite() {
+        return;
+    }
+    let table = TableDef {
+        name: "t0".into(),
+        cols: vec![
+            ColDef { name: "id".into(), ty: Ty::Int, nullable: false },
+            ColDef { name: "k".into(), ty: Ty::Int, nullable: true },
+        ],
+        rows: (0..12)
+            .map(|i| {
+                vec![
+                    Cell::Int(i),
+                    if i == 4 { Cell::Null } else { Cell::Int(i % 3) },
+                ]
+            })
+            .collect(),
+        sort: SortKey::Id,
+        chunk: 5,
+        optimize: false,
+        keyed: false,
+    };
+    let case_of = |w: Win| Case {
+        seed: 0,
+        tables: vec![table.clone()],
+        mutations: Vec::new(),
+        query: Query {
+            from: From::One(0),
+            star: false,
+            distinct: false,
+            items: vec![E::Col(0, 0), E::Over(Box::new(w))],
+            filter: None,
+            group_by: Vec::new(),
+            having: None,
+            set_tail: None,
+            order: vec![(1, true, true), (2, true, true)],
+            limit: None,
+            offset: 0,
+        },
+    };
+    let by_k = || vec![(E::Col(0, 1), true, true)];
+    let by_id = || vec![(E::Col(0, 0), true, true), (E::Col(0, 1), true, true)];
+    let agg = |name: &'static str, order: Vec<(E, bool, bool)>, frame: &'static str| Win {
+        name,
+        args: vec![E::Col(0, 1)],
+        star: false,
+        part: Vec::new(),
+        order,
+        frame,
+    };
+    let pairs: [(&str, Win, Win); 4] = [
+        (
+            "RANGE read as ROWS",
+            agg("sum", by_k(), "RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW"),
+            agg("sum", by_k(), "ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW"),
+        ),
+        (
+            "last_value over the partition rather than the default frame",
+            agg("last_value", by_id(), ""),
+            agg("last_value", by_id(), "ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING"),
+        ),
+        (
+            "lag off by one",
+            Win {
+                name: "lag",
+                args: vec![E::Col(0, 1), E::Lit(Cell::Int(1))],
+                star: false,
+                part: Vec::new(),
+                order: by_id(),
+                frame: "",
+            },
+            Win {
+                name: "lag",
+                args: vec![E::Col(0, 1), E::Lit(Cell::Int(2))],
+                star: false,
+                part: Vec::new(),
+                order: by_id(),
+                frame: "",
+            },
+        ),
+        (
+            "rank where dense_rank was asked for",
+            Win { name: "dense_rank", args: vec![], star: false, part: Vec::new(), order: by_k(), frame: "" },
+            Win { name: "rank", args: vec![], star: false, part: Vec::new(), order: by_k(), frame: "" },
+        ),
+    ];
+    for (what, right, wrong) in pairs {
+        let (truth, broken) = (case_of(right), case_of(wrong));
+        // Sanity first: each query on its own must agree across the engines, or
+        // the "injected" difference below could be a pre-existing one.
+        for c in [&truth, &broken] {
+            let (g, s) = (run_granular(c), sqlite_one(c));
+            assert!(
+                compare(c, g, s).is_none(),
+                "{what}: the two engines already disagree on a control query:\n{}",
+                c.script(Dialect::Granular)
+            );
+        }
+        let good = run_granular(&truth).expect("granular runs the control");
+        let bad = sqlite_one(&broken).expect("sqlite runs the mutant");
+        assert!(
+            compare(&truth, Ok(good), Ok(bad)).is_some(),
+            "{what}: the comparator cannot tell the correct answer from the \
+             one a broken implementation would give, so a clean soak proves \
+             nothing about this shape:\n{}",
+            truth.script(Dialect::Granular)
+        );
     }
 }

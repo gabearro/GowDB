@@ -97,6 +97,26 @@ pub const BULK_INSERT_THRESHOLD: usize = 4 * GRANULE_SIZE;
 /// Compact once the part count reaches this, to bound point-lookup fan-out.
 pub const AUTO_COMPACT_PARTS: usize = 16;
 
+/// Keys probed per [`Table::multi_locate`] call in [`Table::insert_with`].
+///
+/// The two scratch arrays are on the stack, so the window is sized for the
+/// prefetch pipeline rather than for the batch: a few hundred outstanding
+/// misses already saturate it, and a granule's worth would put 20 KB on a
+/// frame that a worker thread's smaller stack also has to hold.
+const PROBE_CHUNK: usize = 256;
+
+/// What a repeated primary key means to a batch.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum KeyConflict {
+    /// Last write wins: the newest row for a key shadows the rest. What an
+    /// `INSERT` means, and what two separate `INSERT`s have always meant.
+    Replace,
+    /// A repeat is a unique-key violation and the batch is refused. What an
+    /// `UPDATE`'s re-insert means: it rewrites *existing* rows, so two of them
+    /// under one key is one row destroying another, not a write.
+    Reject,
+}
+
 /// Bytes a streaming scan tries to keep its decode buffer within, across all
 /// projected columns. Sized for a conservative 32 KB L1 data cache.
 const SCAN_L1_BUDGET: usize = 32 * 1024;
@@ -501,6 +521,23 @@ impl Table {
 
     /// Insert a block whose columns are in schema order.
     pub fn insert(&mut self, block: Block) -> Result<usize> {
+        self.insert_with(block, KeyConflict::Replace)
+    }
+
+    /// [`Table::insert`], choosing what a repeated primary key means.
+    ///
+    /// The two callers want opposite things from the same code, and conflating
+    /// them lost rows silently. An `INSERT` of `(1,'a'),(1,'b')` is
+    /// last-write-wins, exactly as two separate statements would be. An
+    /// `UPDATE`'s re-insert is not a write of new rows at all: it is the same
+    /// live rows written back under whatever the assignment made of their key,
+    /// so two of them arriving under one key means the statement mapped
+    /// distinct live rows onto one identity. Collapsing that is a unique-key
+    /// violation dressed up as success -- `UPDATE t SET id = 9` over three
+    /// rows reported "3 rows affected" and left one -- so it is refused, and
+    /// the count the caller reports is honest again because every row it
+    /// counted really landed.
+    pub fn insert_with(&mut self, block: Block, on_conflict: KeyConflict) -> Result<usize> {
         let block = self.coerce_block(block)?;
         let n = block.rows();
         if n == 0 {
@@ -510,9 +547,17 @@ impl Table {
             // Big batch: flush whatever is buffered so ordering stays
             // newest-part-wins, then pack this batch straight into a part.
             self.flush()?;
-            self.ingest_block(block)?;
+            self.ingest_block(block, on_conflict)?;
             self.maybe_auto_compact()?;
             return Ok(n);
+        }
+        // The buffered path collapses in `Delta::put_keyed`, which overwrites
+        // the slot a key already owns and cannot report that it did. Checking
+        // the batch up front is the only place the two rows are both still
+        // visible -- and it is off the common path entirely, since `Replace`
+        // never asks.
+        if on_conflict == KeyConflict::Reject {
+            self.reject_key_collisions(&block)?;
         }
         // Small batch: buffer it. Cells are written straight into the delta's
         // arena -- building a `Vec<Value>` per row here was most of the cost of
@@ -539,6 +584,102 @@ impl Table {
             self.flush()?;
         }
         Ok(n)
+    }
+
+    /// Refuse a batch that would leave one primary key owning two live rows.
+    ///
+    /// Two ways that happens, and both are checked: the batch carrying a key
+    /// twice, and the batch carrying a key some row *outside* it still holds.
+    /// Only [`KeyConflict::Reject`] asks, so an `INSERT` pays nothing.
+    fn reject_key_collisions(&mut self, block: &Block) -> Result<()> {
+        let Some(pk) = self.pk_col else { return Ok(()) };
+        self.reject_stored_key_collisions(block, pk)?;
+        // Within the batch. Unsorted here (this is the buffered path, which
+        // never sorts), so the lanes go into one `Vec` and are sorted in
+        // place: a hash set would allocate per distinct key to answer a
+        // question one pass over 8-byte lanes answers.
+        let n = block.rows();
+        let phys = self.pk_phys.expect("a pk column implies a pk physical type");
+        let ty = self.def.schema.ty(pk);
+        let keys = &block.columns[pk];
+        let mut lanes: Vec<u64> = Vec::with_capacity(n);
+        for r in 0..n {
+            lanes.push(keys.value(r).to_lane_phys(phys, ty)?);
+        }
+        lanes.sort_unstable();
+        let Some(i) = lanes.windows(2).position(|w| w[0] == w[1]) else { return Ok(()) };
+        let dup = lanes[i];
+        let row = (0..n)
+            .find(|&r| keys.value(r).to_lane_phys(phys, ty).is_ok_and(|l| l == dup))
+            .unwrap_or(0);
+        Err(self.collision_err(block, pk, row, IN_ONE_STATEMENT))
+    }
+
+    /// The half of [`Table::reject_key_collisions`] that asks the table: does
+    /// any key in `block` already have a live row?
+    ///
+    /// Probed through one fixed buffer rather than a `Vec<Option<RowLoc>>` the
+    /// width of the batch. `multi_locate`'s win is the prefetch pipeline
+    /// *inside* a chunk, which saturates long before a whole-batch buffer
+    /// would, so a whole-table UPDATE need not allocate a second array
+    /// proportional to the table.
+    fn reject_stored_key_collisions(&mut self, block: &Block, pk: usize) -> Result<()> {
+        // Nothing left to collide with. This is not a micro-guard: the sweep
+        // in front of an `UPDATE ... SET pk = ...` hides every row the
+        // predicate matched, so a whole-table key reassignment arrives here
+        // with the table empty -- and that is the shape that would otherwise
+        // pay a full point lookup per row against a table whose bloom filters
+        // all still say "maybe" (the rows are tombstoned, not gone). Two
+        // counter reads instead.
+        //
+        // A/B interleaved against a build with the whole check compiled out
+        // (temporary `AtomicBool`, best-of-15 per side, four alternating
+        // runs), `UPDATE t SET id = id + n`:
+        //
+        // ```text
+        //        n         without the guard      with it
+        //     1 000              0.98-1.02      0.96, 1.00, 1.06, 0.96
+        //    20 000              1.08-1.20      0.70, 0.85, 1.26
+        //   200 000        0.76, 0.76, 1.09     1.06, 1.11, 1.19
+        // ```
+        //
+        // The two 0.76 readings at 200 000 are the check doing 200 000 point
+        // lookups; with the guard nothing is outside this machine's noise.
+        if self.delta.is_empty() && peek(&mut self.parts, &self.txn).live_rows() == 0 {
+            return Ok(());
+        }
+        let n = block.rows();
+        let phys = self.pk_phys.expect("a pk column implies a pk physical type");
+        let mut lanes = [0u64; PROBE_CHUNK];
+        let mut locs = [None; PROBE_CHUNK];
+        for base in (0..n).step_by(PROBE_CHUNK) {
+            let len = PROBE_CHUNK.min(n - base);
+            {
+                let keys = &block.columns[pk];
+                let ty = self.def.schema.ty(pk);
+                for (i, l) in lanes[..len].iter_mut().enumerate() {
+                    *l = keys.value(base + i).to_lane_phys(phys, ty)?;
+                }
+            }
+            let out = &mut locs[..len];
+            self.multi_locate(&lanes[..len], out);
+            if let Some(i) = out.iter().position(Option::is_some) {
+                return Err(self.collision_err(block, pk, base + i, "a row already stored"));
+            }
+        }
+        Ok(())
+    }
+
+    #[cold]
+    fn collision_err(&self, block: &Block, pk: usize, row: usize, other: &str) -> Error {
+        Error::exec(format!(
+            "`{}`.`{}` = {} would be shared with {}: a primary key names one row, so \
+             this would destroy the other",
+            self.def.name,
+            self.def.schema.field(pk).name,
+            block.column(pk).value(row).render_plain(),
+            other
+        ))
     }
 
     /// Write a single row, row-oriented.
@@ -618,7 +759,7 @@ impl Table {
     }
 
     /// Sort, dedup, tombstone shadowed rows, and append a new part.
-    fn ingest_block(&mut self, block: Block) -> Result<()> {
+    fn ingest_block(&mut self, block: Block, on_conflict: KeyConflict) -> Result<()> {
         if block.rows() == 0 {
             return Ok(());
         }
@@ -643,6 +784,20 @@ impl Table {
             KeyOrder::Unsorted => Some(sort_permutation(&block, &self.def.order_by)?),
             _ => None,
         };
+        // The bulk path's collision check. Its within-batch half is free here:
+        // the block is already in key order, so `first_dup_row` walks adjacent
+        // pairs rather than building a set. The *stored*-row half still has to
+        // be asked, and is asked before anything is touched.
+        if on_conflict == KeyConflict::Reject {
+            if let Some(pk) = pk_col {
+                self.reject_stored_key_collisions(&block, pk)?;
+                let sorted_dups = perm.is_none() && order == KeyOrder::SortedWithDups;
+                if let Some(r) = first_dup_row(&block, pk, perm.as_deref().filter(|_| !sorted_dups))
+                {
+                    return Err(self.collision_err(&block, pk, r, IN_ONE_STATEMENT));
+                }
+            }
+        }
         match (pk_col, perm.as_mut()) {
             (Some(pk), Some(p)) => dedup_perm_last_by_key(&block, pk, p)?,
             // The batch arrived in key order, so the sort was skipped -- and
@@ -1089,10 +1244,13 @@ impl Table {
     /// [`Table::delete_where`], additionally collecting the primary-key lane
     /// of every row it hid.
     ///
-    /// A logging session needs them: [`crate::persist::Wal::append_delete`]
-    /// names a row by key lane and there is no other delete record, so the
-    /// lanes are what makes the sweep replayable. They have to be the rows
-    /// *newly* hidden rather than
+    /// A logging session with a keyed table needs them:
+    /// [`crate::persist::Wal::append_delete`] names a row by key lane and
+    /// there is no other delete record, so the lanes are what makes the sweep
+    /// replayable. A table with no single-column key passes `None` and gets
+    /// its durability from `Session::fold_to_parts` instead -- asking for
+    /// lanes there would read a column that is not the key. They have to be
+    /// the rows *newly* hidden rather than
     /// the rows the predicate matched -- a row an earlier statement already
     /// tombstoned is not part of this statement's effect, and logging it again
     /// would make the count the caller reports disagree with the log. Reading
@@ -2107,6 +2265,35 @@ impl SameKey for f64 {
     #[inline(always)]
     fn same(&self, o: &f64) -> bool {
         self == o || (self.is_nan() && o.is_nan())
+    }
+}
+
+/// The second half of every collision message, shared so the two sites cannot
+/// drift apart.
+const IN_ONE_STATEMENT: &str = "another row in the same statement";
+
+/// The block row of the first key that repeats, reading through `perm` when
+/// the block is only in key order under a permutation.
+///
+/// One pass over adjacent pairs: the caller has already established that the
+/// order it hands over is key order, which is what makes duplicates adjacent.
+/// Returns the *later* of the pair, since that is the row a reader would call
+/// the offending one.
+fn first_dup_row(block: &Block, key_col: usize, perm: Option<&[u32]>) -> Option<usize> {
+    fn go<T: SameKey>(v: &[T], perm: Option<&[u32]>) -> Option<usize> {
+        match perm {
+            Some(p) => p
+                .windows(2)
+                .find(|w| v[w[0] as usize].same(&v[w[1] as usize]))
+                .map(|w| w[1] as usize),
+            None => (1..v.len()).find(|&i| v[i].same(&v[i - 1])),
+        }
+    }
+    match &block.column(key_col).data {
+        ColumnData::U64(v) => go(v, perm),
+        ColumnData::I64(v) => go(v, perm),
+        ColumnData::F64(v) => go(v, perm),
+        ColumnData::Str(v) => go(v, perm),
     }
 }
 

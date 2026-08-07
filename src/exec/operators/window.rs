@@ -873,7 +873,7 @@ fn eval_agg(
             Sweep::Whole => {
                 let mut acc = (af.new)(&tys, &f.params)?;
                 acc.update(&args, &ids[ps..pe])?;
-                let v = acc.finish();
+                let v = acc.finish()?;
                 for _ in ps..pe {
                     b.push_value(&v)?;
                 }
@@ -897,7 +897,7 @@ fn eval_agg(
                         acc.update(&args, &ids[fed..e])?;
                         fed = e;
                     }
-                    b.push_value(&acc.finish())?;
+                    b.push_value(&acc.finish()?)?;
                 }
             }
             Sweep::Backward => {
@@ -920,7 +920,7 @@ fn eval_agg(
                         acc.update(&args, &ids[s..fed])?;
                         fed = s;
                     }
-                    scratch.push(acc.finish());
+                    scratch.push(acc.finish()?);
                 }
                 for v in scratch.iter().rev() {
                     b.push_value(v)?;
@@ -939,7 +939,7 @@ fn eval_agg(
                     if s < e {
                         acc.update(&args, &ids[s..e])?;
                     }
-                    b.push_value(&acc.finish())?;
+                    b.push_value(&acc.finish()?)?;
                 }
             }
         }

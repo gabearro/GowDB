@@ -52,10 +52,12 @@
 //!
 //! * `groupArray` returns a comma-joined `String`, because this engine has no
 //!   Array type. Capped at [`GROUP_ARRAY_LIMIT`] elements.
-//! * Integer `sum` **saturates** at the return type's bounds instead of
-//!   wrapping. `finish()` cannot fail (it returns `Value`, not `Result`), so
-//!   the choice is saturate or wrap; saturation at least stays monotone.
-//!   Overflow of the internal `i128` *is* reported, from `update`/`merge`.
+//! * `sum` **raises** when the exact `i128` total does not fit the declared
+//!   return type, where ClickHouse wraps. It used to saturate, for the single
+//!   reason that `finish` returned `Value` and had no way to refuse; see
+//!   [`Accumulator::finish`] for why that was the worst of the three options.
+//!   Overflow of the internal `i128` is still reported from `update`/`merge`,
+//!   where it is order-independent.
 //! * `quantile` is exact (same machinery as `quantileExact`), not the
 //!   reservoir-sampled approximation. Memory is O(rows in the group).
 //! * Aggregates over zero rows return `NULL`, `count` alone returns 0. That
@@ -192,6 +194,42 @@ fn div_round(num: i128, den: i128) -> i128 {
     }
 }
 
+/// The narrowing at the end of `finish` refused.
+///
+/// Worded exactly as `scalar::dec_overflow` words it, because `avg(p)` and
+/// `sum(p)/count(*)` are the same query and now fail on the same rows: one
+/// sentence to recognise, not two.
+///
+/// `#[cold]` + `#[inline(never)]` keeps the `format!` -- a several-hundred-byte
+/// code sequence -- out of `finish`, which is inlined into the per-group emit
+/// loop and whose whole body is otherwise a compare and a move.
+#[cold]
+#[inline(never)]
+fn dec_overflow(who: &str, scale: u8) -> Error {
+    Error::exec(format!(
+        "{who}: result does not fit Decimal64({scale}) -- more than 18 significant digits"
+    ))
+}
+
+#[cold]
+#[inline(never)]
+fn int_overflow(who: &str, ty: &str) -> Error {
+    Error::exec(format!("{who}: total does not fit {ty}"))
+}
+
+/// `units * 10^-scale`, or the refusal above.
+///
+/// `>` and not `>=`: `DECIMAL_MAX_UNITS` is 18 nines and is itself a legal
+/// lane. `unsigned_abs` rather than `abs` so `i128::MIN` cannot panic here --
+/// unreachable from any real fold, and free to rule out.
+#[inline]
+fn fit_dec(units: i128, scale: u8, who: &str) -> Result<Value> {
+    if units.unsigned_abs() > DECIMAL_MAX_UNITS as u128 {
+        return Err(dec_overflow(who, scale));
+    }
+    Ok(Value::Decimal(units as i64, scale))
+}
+
 /// Total order on `f64` that matches [`Value`]'s: NaN sorts last, `-0.0` ties
 /// with `0.0`. Used so a typed min/max scan agrees with a `Value` comparison.
 #[inline]
@@ -281,8 +319,8 @@ impl Accumulator for CountAcc {
         self.n += downcast::<CountAcc>(other, "count")?.n;
         Ok(())
     }
-    fn finish(&self) -> Value {
-        Value::UInt(self.n)
+    fn finish(&self) -> Result<Value> {
+        Ok(Value::UInt(self.n))
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -451,7 +489,20 @@ impl SumCore {
     fn as_f64(&self) -> f64 {
         match self.state {
             SumState::Int(t) => t as f64,
-            SumState::Float { sum, comp } => sum + comp,
+            // Once the high part has saturated there is nothing left to
+            // compensate, and `comp` has itself gone to -inf (the Neumaier
+            // remainder of `1e308 + 1e308` is `(1e308 - inf) + 1e308`). Adding
+            // them then answers **NaN** for a sum whose honest value is `inf`,
+            // which is a silent wrong answer of the same family as the decimal
+            // clamps: `sum(x) > 0` was false and `sum(x) <= 0` was false too.
+            // One compare per group, never per row.
+            SumState::Float { sum, comp } => {
+                if sum.is_finite() {
+                    sum + comp
+                } else {
+                    sum
+                }
+            }
         }
     }
 }
@@ -484,7 +535,7 @@ impl Accumulator for SumAcc {
     fn merge(&mut self, other: &dyn Accumulator) -> Result<()> {
         self.core.merge_core(&downcast::<SumAcc>(other, "sum")?.core, "sum")
     }
-    fn finish(&self) -> Value {
+    fn finish(&self) -> Result<Value> {
         // Zero rows is NULL, unconditionally -- SQL standard and SQLite.
         //
         // This used to be 0 for a NULL-free argument (ClickHouse) and NULL for
@@ -497,14 +548,13 @@ impl Accumulator for SumAcc {
         // return over the same input, so `sum` was the outlier rather than the
         // house style; picking 0 for both would have meant changing those too.
         if self.core.n == 0 {
-            return Value::Null;
+            return Ok(Value::Null);
         }
         match (self.core.scale, self.core.state) {
             // Summing a decimal is exact for free, and that is the nicest
             // property of storing the scale in the type: the i128 total is
             // already a count of the argument's own units, so the point goes
             // back where it was with no arithmetic and no f64 in the path.
-            // Saturation is the same rule as below, at the decimal range.
             //
             // The arm costs the other three a tuple test that `finish` runs
             // once per group: 2.13 -> 2.17 ns per group, best-of-9 interleaved
@@ -512,16 +562,22 @@ impl Accumulator for SumAcc {
             // real and it is 0.1 ns). Folding a decimal column and folding the
             // identical `Int64` lanes measure the same, 0.96-1.06 across five
             // runs -- one code path, as intended.
-            (Some(s), SumState::Int(t)) => {
-                Value::Decimal(t.clamp(-DECIMAL_MAX_UNITS, DECIMAL_MAX_UNITS) as i64, s)
-            }
-            // Saturating narrowing: documented in the module header. The exact
-            // total lives in i128; only this last step can lose it.
+            (Some(s), SumState::Int(t)) => fit_dec(t, s, "sum"),
+            // The exact total lives in i128 and only this last step can lose
+            // it, so this is the step that refuses. It used to clamp, which
+            // meant two rows of 5000000000000000.00 summed to
+            // 9999999999999999.99 *and* `sum(p) = 10000000000000000.00`
+            // then evaluated TRUE -- a wrong answer consistent with itself.
             (_, SumState::Int(t)) if self.signed => {
-                Value::Int(t.clamp(i64::MIN as i128, i64::MAX as i128) as i64)
+                i64::try_from(t).map(Value::Int).map_err(|_| int_overflow("sum", "Int64"))
             }
-            (_, SumState::Int(t)) => Value::UInt(t.clamp(0, u64::MAX as i128) as u64),
-            (_, SumState::Float { sum, comp }) => Value::Float(sum + comp),
+            (_, SumState::Int(t)) => {
+                u64::try_from(t).map(Value::UInt).map_err(|_| int_overflow("sum", "UInt64"))
+            }
+            // Through `as_f64` so the saturated-high-part rule lives in one
+            // place: `avg` reads the same total and must not disagree with
+            // `sum` about whether it is `inf` or NaN.
+            (_, SumState::Float { .. }) => Ok(Value::Float(self.core.as_f64())),
         }
     }
     fn as_any(&self) -> &dyn Any {
@@ -547,9 +603,9 @@ impl Accumulator for AvgAcc {
     fn merge(&mut self, other: &dyn Accumulator) -> Result<()> {
         self.core.merge_core(&downcast::<AvgAcc>(other, "avg")?.core, "avg")
     }
-    fn finish(&self) -> Value {
+    fn finish(&self) -> Result<Value> {
         if self.core.n == 0 {
-            return Value::Null;
+            return Ok(Value::Null);
         }
         match (self.core.scale, self.core.state) {
             // One widened integer divide, once per group. The total is already
@@ -558,19 +614,24 @@ impl Accumulator for AvgAcc {
             // back the imprecision this type exists to remove.
             //
             // `os` must be the scale `ret_avg` promised: the output column is
-            // built from that type and takes this lane as-is.
+            // built from that type and takes this lane as-is. That promotion is
+            // also why this arm refuses rather than clamps. Clamping happened
+            // *after* the widening, so at scale 6 the representable magnitude
+            // collapsed to 10^12 whatever the column's declared scale: a single
+            // row of 1000000000000.00 averaged to 999999999999.999999 while
+            // `max` of the same column answered 1000000000000.00.
             (Some(s), SumState::Int(t)) => {
                 let os = div_out_scale(s);
-                let u = match t.checked_mul(POW10[(os - s) as usize]) {
-                    Some(num) => div_round(num, self.core.n as i128),
-                    // Needs ~10^14 rows of full-precision units to reach, and
-                    // the mean is then past the decimal range anyway, so this
-                    // saturates exactly as the in-range clamp below does.
-                    None => t.signum() * DECIMAL_MAX_UNITS,
-                };
-                Value::Decimal(u.clamp(-DECIMAL_MAX_UNITS, DECIMAL_MAX_UNITS) as i64, os)
+                // The `checked_mul` arm needs ~1.7e20 rows of full-precision
+                // units before the divide could pull the mean back into range,
+                // so it is not a distinct outcome worth a distinct message.
+                let u = t
+                    .checked_mul(POW10[(os - s) as usize])
+                    .map(|num| div_round(num, self.core.n as i128))
+                    .ok_or_else(|| dec_overflow("avg", os))?;
+                fit_dec(u, os, "avg")
             }
-            _ => Value::Float(self.core.as_f64() / self.core.n as f64),
+            _ => Ok(Value::Float(self.core.as_f64() / self.core.n as f64)),
         }
     }
     fn as_any(&self) -> &dyn Any {
@@ -635,8 +696,11 @@ impl Accumulator for MinMaxAcc {
         }
         Ok(())
     }
-    fn finish(&self) -> Value {
-        self.best.clone().unwrap_or(Value::Null)
+    fn finish(&self) -> Result<Value> {
+        // Infallible by construction, and that is the point of the decimal note
+        // above: the answer is a lane the argument column already held, so it
+        // is in range because the column was.
+        Ok(self.best.clone().unwrap_or(Value::Null))
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -696,8 +760,8 @@ impl Accumulator for AnyAcc {
         }
         Ok(())
     }
-    fn finish(&self) -> Value {
-        self.v.clone().unwrap_or(Value::Null)
+    fn finish(&self) -> Result<Value> {
+        Ok(self.v.clone().unwrap_or(Value::Null))
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -764,8 +828,8 @@ impl Accumulator for ArgAcc {
         }
         Ok(())
     }
-    fn finish(&self) -> Value {
-        self.val.clone().unwrap_or(Value::Null)
+    fn finish(&self) -> Result<Value> {
+        Ok(self.val.clone().unwrap_or(Value::Null))
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -841,8 +905,8 @@ impl Accumulator for UniqExactAcc {
         }
         Ok(())
     }
-    fn finish(&self) -> Value {
-        Value::UInt(self.set.len() as u64)
+    fn finish(&self) -> Result<Value> {
+        Ok(Value::UInt(self.set.len() as u64))
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -942,8 +1006,8 @@ impl Accumulator for HllAcc {
         }
         Ok(())
     }
-    fn finish(&self) -> Value {
-        Value::UInt(self.estimate())
+    fn finish(&self) -> Result<Value> {
+        Ok(Value::UInt(self.estimate()))
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -995,11 +1059,11 @@ impl Accumulator for GroupArrayAcc {
         self.items.extend(o.items.iter().take(room).cloned());
         Ok(())
     }
-    fn finish(&self) -> Value {
+    fn finish(&self) -> Result<Value> {
         if self.items.is_empty() {
-            return Value::Null;
+            return Ok(Value::Null);
         }
-        Value::str(self.items.join(","))
+        Ok(Value::str(self.items.join(",")))
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -1020,16 +1084,31 @@ impl Accumulator for GroupArrayAcc {
 ///
 /// A decimal argument is collected as raw lanes -- the scale is fixed per
 /// column, so lanes sort exactly as values do -- and the point goes back on in
-/// `finish`. (Lanes past 2^53 are not exact in the `f64` store; that is the
-/// same limit an `Int64` argument has already carried here, and at scale 2 it
-/// is 90 trillion.)
+/// `finish`.
 struct QuantileAcc {
-    vals: Vec<f64>,
+    /// Every observed value, one word each: **either** `f64` bits or
+    /// `Decimal64` lanes, discriminated by `scale`.
+    ///
+    /// A two-variant enum would put a tag word on a struct that exists once per
+    /// group (40 bytes -> 48, asserted below), and `scale` already answers the
+    /// question; `f64::to_bits`/`from_bits` are register moves, not work.
+    ///
+    /// Holding the decimal lanes as integers is a correctness fix, not a
+    /// micro-optimization. They used to live in the `f64` store, where a lane
+    /// past 2^53 does not survive the round trip: over a `Decimal64(2)` column
+    /// holding 1234567890123456.78, `quantileExact` answered
+    /// 1234567890123456.80 while `min` and `max` over the same one row answered
+    /// .78. Sorting them as integers is also strictly cheaper than
+    /// `f64::total_cmp`.
+    vals: Vec<u64>,
     p: f64,
     interpolate: bool,
-    /// The argument's decimal scale, hoisted out of the row loop.
+    /// The argument's decimal scale, hoisted out of the row loop, and the
+    /// discriminant for `vals` above.
     scale: Option<u8>,
 }
+
+const _: () = assert!(std::mem::size_of::<QuantileAcc>() == 40);
 
 /// Denominator for the interpolation weight, which is the one input to the
 /// decimal path below that an `i128` cannot hold exactly: `p*(n-1)`'s fraction
@@ -1042,11 +1121,26 @@ impl Accumulator for QuantileAcc {
     fn update(&mut self, args: &[Column], sel: &[u32]) -> Result<()> {
         let col = arg_at(args, 0, "quantile")?;
         let vals = &mut self.vals;
-        match &col.data {
-            ColumnData::U64(v) => each_valid(col, sel, |i| vals.push(v[i] as f64)),
-            ColumnData::I64(v) => each_valid(col, sel, |i| vals.push(v[i] as f64)),
-            ColumnData::F64(v) => each_valid(col, sel, |i| vals.push(v[i])),
-            ColumnData::Str(_) => return Err(Error::exec("quantile requires a numeric column")),
+        // The decimal question is asked once per block and never per row, which
+        // is the same shape `SumCore::add` and `GroupArrayAcc::update` use.
+        match (self.scale, &col.data) {
+            (Some(_), ColumnData::I64(v)) => each_valid(col, sel, |i| vals.push(v[i] as u64)),
+            // A `Decimal64` column is physically `I64` everywhere in the
+            // engine, so this is a planner bug rather than a user error --
+            // but it must not silently mix two encodings in one `vals`.
+            (Some(_), _) => {
+                return Err(Error::exec("quantile: decimal accumulator fed a non-decimal column"))
+            }
+            (None, ColumnData::U64(v)) => {
+                each_valid(col, sel, |i| vals.push((v[i] as f64).to_bits()))
+            }
+            (None, ColumnData::I64(v)) => {
+                each_valid(col, sel, |i| vals.push((v[i] as f64).to_bits()))
+            }
+            (None, ColumnData::F64(v)) => each_valid(col, sel, |i| vals.push(v[i].to_bits())),
+            (None, ColumnData::Str(_)) => {
+                return Err(Error::exec("quantile requires a numeric column"))
+            }
         }
         Ok(())
     }
@@ -1055,49 +1149,59 @@ impl Accumulator for QuantileAcc {
         self.vals.extend_from_slice(&o.vals);
         Ok(())
     }
-    fn finish(&self) -> Value {
+    fn finish(&self) -> Result<Value> {
         if self.vals.is_empty() {
-            return Value::Null;
+            return Ok(Value::Null);
         }
         // `finish` takes `&self` and must be repeatable, so we sort a copy.
         // Called once per group, so the extra pass is not on any hot path.
         let mut v = self.vals.clone();
-        v.sort_unstable_by(f64::total_cmp);
         let n = v.len();
-        if !self.interpolate {
-            let idx = ((self.p * n as f64).floor() as usize).min(n - 1);
-            // An element that was actually observed, so a decimal one keeps the
-            // argument's own scale: nothing was divided, nothing was widened.
-            return match self.scale {
-                Some(s) => Value::Decimal(v[idx] as i64, s),
-                None => Value::Float(v[idx]),
-            };
-        }
+        // Rank arithmetic is shared; only the decode of `v` differs, and it is
+        // decided once here rather than at each of the four reads below.
+        let rank = |p: f64| ((p * n as f64).floor() as usize).min(n - 1);
         let pos = self.p * (n - 1) as f64;
-        let lo = pos.floor() as usize;
+        let (lo, frac) = (pos.floor() as usize, pos - pos.floor());
         let hi = (lo + 1).min(n - 1);
-        let frac = pos - lo as f64;
-        match self.scale {
-            // Interpolating between two lanes divides, so it widens like `avg`
-            // and `divide` do rather than rounding the answer back onto the
-            // argument's last digit -- the median of 1.19 and 3.81 is 2.50, not
-            // 3. Everything but the weight stays in `i128`: the widest term is
-            // `10^18 * 10^6 * 10^9`, five digits clear of the top.
-            //
-            // The rounding is applied to the whole interpolated value, not to
-            // the `(b-a)` increment: sorting makes that increment positive, so
-            // rounding it away from zero would round -1.5 up to -1 while 1.5
-            // went to 2.
-            Some(s) => {
-                let os = div_out_scale(s);
-                let mul = POW10[(os - s) as usize];
-                let (a, b) = (v[lo] as i128 * mul, v[hi] as i128 * mul);
-                let w = (frac * QUANTILE_WEIGHT_ONE as f64).round() as i128;
-                let u = div_round(a * QUANTILE_WEIGHT_ONE + (b - a) * w, QUANTILE_WEIGHT_ONE);
-                Value::Decimal(u.clamp(-DECIMAL_MAX_UNITS, DECIMAL_MAX_UNITS) as i64, os)
-            }
-            None => Value::Float(v[lo] + (v[hi] - v[lo]) * frac),
+
+        let Some(s) = self.scale else {
+            v.sort_unstable_by(|a, b| f64::from_bits(*a).total_cmp(&f64::from_bits(*b)));
+            let g = |i: usize| f64::from_bits(v[i]);
+            return Ok(Value::Float(if self.interpolate {
+                g(lo) + (g(hi) - g(lo)) * frac
+            } else {
+                g(rank(self.p))
+            }));
+        };
+
+        // Signed compare: the words are `i64` lanes, so an unsigned sort would
+        // rank every negative price above every positive one.
+        v.sort_unstable_by_key(|&b| b as i64);
+        let g = |i: usize| v[i] as i64 as i128;
+        if !self.interpolate {
+            // An element that was actually observed, so it keeps the argument's
+            // own scale and is in range because the column was: nothing was
+            // divided, nothing was widened, and nothing went through an `f64`.
+            return Ok(Value::Decimal(v[rank(self.p)] as i64, s));
         }
+        // Interpolating between two lanes divides, so it widens like `avg` and
+        // `divide` do rather than rounding the answer back onto the argument's
+        // last digit -- the median of 1.19 and 3.81 is 2.50, not 3. Everything
+        // but the weight stays in `i128`: the widest term is
+        // `10^18 * 10^6 * 10^9`, five digits clear of the top.
+        //
+        // The rounding is applied to the whole interpolated value, not to the
+        // `(b-a)` increment: sorting makes that increment positive, so rounding
+        // it away from zero would round -1.5 up to -1 while 1.5 went to 2.
+        let os = div_out_scale(s);
+        let mul = POW10[(os - s) as usize];
+        let (a, b) = (g(lo) * mul, g(hi) * mul);
+        let w = (frac * QUANTILE_WEIGHT_ONE as f64).round() as i128;
+        let u = div_round(a * QUANTILE_WEIGHT_ONE + (b - a) * w, QUANTILE_WEIGHT_ONE);
+        // Same widening as `avg`, so the same refusal: at scale 6 the
+        // representable magnitude is 10^12, and clamping there answered
+        // 999999999999.999999 for a median the column held exactly.
+        fit_dec(u, os, "quantile")
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -1221,28 +1325,31 @@ impl Accumulator for WelfordAcc {
         self.n += o.n;
         Ok(())
     }
-    fn finish(&self) -> Value {
+    fn finish(&self) -> Result<Value> {
         let denom = if self.kind.sample() {
             if self.n < 2 {
-                return Value::Null;
+                return Ok(Value::Null);
             }
             (self.n - 1) as f64
         } else {
             if self.n < 1 {
-                return Value::Null;
+                return Ok(Value::Null);
             }
             self.n as f64
         };
         let var = self.m2 / denom;
         let out = if self.kind.root() { var.max(0.0).sqrt() } else { var };
-        Value::Float(match self.scale {
+        // No range to overflow: `ret_var` declares `Float64` for every argument
+        // including a decimal one, so the descale below lands in a type that
+        // already admits every magnitude the fold can reach.
+        Ok(Value::Float(match self.scale {
             // Quadratic in the input for a variance, linear for its root.
             Some(s) => {
                 let p = POW10[s as usize] as f64;
                 out / if self.kind.root() { p } else { p * p }
             }
             None => out,
-        })
+        }))
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -1299,7 +1406,7 @@ impl Accumulator for CondAcc {
         // Delegate the real type check to the inner accumulators.
         self.inner.merge(o.inner.as_ref())
     }
-    fn finish(&self) -> Value {
+    fn finish(&self) -> Result<Value> {
         self.inner.finish()
     }
     fn as_any(&self) -> &dyn Any {
@@ -1798,6 +1905,12 @@ mod tests {
 
     /// Build, feed everything, finish.
     fn run(f: &AggFn, tys: &[DataType], params: &[Value], cols: &[Column]) -> Value {
+        try_run(f, tys, params, cols).unwrap()
+    }
+
+    /// `run`, but keeping the refusal: `finish` narrows a wider fold to the
+    /// declared return type and that is allowed to fail.
+    fn try_run(f: &AggFn, tys: &[DataType], params: &[Value], cols: &[Column]) -> Result<Value> {
         let n = cols.first().map_or(0, |c| c.len());
         let mut a = (f.new)(tys, params).unwrap();
         a.update(cols, &all(n)).unwrap();
@@ -1818,7 +1931,7 @@ mod tests {
         a.update(cols, &idx[..mid]).unwrap();
         b.update(cols, &idx[mid..]).unwrap();
         a.merge(b.as_ref()).unwrap();
-        (whole.finish(), a.finish())
+        (whole.finish().unwrap(), a.finish().unwrap())
     }
 
     fn f(v: &Value) -> f64 {
@@ -1939,7 +2052,7 @@ mod tests {
         let mut a = (c.new)(&[], &[]).unwrap();
         a.update(&[], &all(1000)).unwrap();
         a.update(&[], &all(7)).unwrap();
-        assert_eq!(a.finish(), Value::UInt(1007));
+        assert_eq!(a.finish().unwrap(), Value::UInt(1007));
     }
 
     #[test]
@@ -1954,9 +2067,9 @@ mod tests {
         let c = lookup("count").unwrap();
         assert_eq!(run(c, &[NI64], &[], &[ints(&[])]), Value::UInt(0));
         let mut a = (c.new)(&[], &[]).unwrap();
-        assert_eq!(a.finish(), Value::UInt(0));
+        assert_eq!(a.finish().unwrap(), Value::UInt(0));
         a.update(&[], &[]).unwrap();
-        assert_eq!(a.finish(), Value::UInt(0));
+        assert_eq!(a.finish().unwrap(), Value::UInt(0));
     }
 
     // ----------------------------------------------------------------- sum
@@ -1988,19 +2101,29 @@ mod tests {
         assert_eq!(run(s, &[DataType::Bool], &[], &[bools(&[true, false, true])]), Value::UInt(2));
     }
 
+    /// Inverted: this pinned the saturating narrowing, which was only ever a
+    /// consequence of `finish` returning `Value` and having no way to refuse.
+    /// `sum` of three `i64::MAX` used to answer `i64::MAX`, a number that
+    /// compares, sorts and renders like the true total and is not it.
     #[test]
-    fn sum_accumulates_beyond_i64_in_i128() {
-        // Three i64::MAX values overflow i64 many times over; the i128 fold
-        // holds them and only the final narrowing saturates.
+    fn sum_accumulates_beyond_i64_in_i128_and_refuses_to_narrow_what_does_not_fit() {
         let s = lookup("sum").unwrap();
-        let v = run(s, &[NI64], &[], &[ints(&[i64::MAX, i64::MAX, i64::MAX])]);
-        assert_eq!(v, Value::Int(i64::MAX));
-        // ... and the negative direction saturates symmetrically.
-        let v = run(s, &[NI64], &[], &[ints(&[i64::MIN, i64::MIN])]);
-        assert_eq!(v, Value::Int(i64::MIN));
-        // An intermediate excursion above i64::MAX must come back exactly.
+        let e = try_run(s, &[NI64], &[], &[ints(&[i64::MAX, i64::MAX, i64::MAX])]).unwrap_err();
+        assert!(e.to_string().contains("Int64"), "{e}");
+        assert!(try_run(s, &[NI64], &[], &[ints(&[i64::MIN, i64::MIN])]).is_err());
+        // The whole point of the i128 fold: an intermediate excursion past
+        // i64 is not an error, because it comes back exactly.
         let v = run(s, &[NI64], &[], &[ints(&[i64::MAX, i64::MAX, i64::MIN, i64::MIN])]);
         assert_eq!(v, Value::Int(-2));
+        // Both edges are themselves representable and must still be answered.
+        assert_eq!(run(s, &[NI64], &[], &[ints(&[i64::MAX])]), Value::Int(i64::MAX));
+        assert_eq!(run(s, &[NI64], &[], &[ints(&[i64::MIN])]), Value::Int(i64::MIN));
+        // The unsigned narrowing has the same edge one range up.
+        assert!(try_run(s, &[DataType::UInt64], &[], &[uints(&[u64::MAX, u64::MAX])]).is_err());
+        assert_eq!(
+            run(s, &[DataType::UInt64], &[], &[uints(&[u64::MAX])]),
+            Value::UInt(u64::MAX)
+        );
     }
 
     /// Inverted from `sum_of_empty_input_follows_nullability`, which pinned the
@@ -2155,13 +2278,13 @@ mod tests {
         let mut a = (an.new)(&[NI64], &[]).unwrap();
         a.update(&[ints(&[7, 8])], &all(2)).unwrap();
         a.update(&[ints(&[9])], &all(1)).unwrap();
-        assert_eq!(a.finish(), Value::Int(7));
+        assert_eq!(a.finish().unwrap(), Value::Int(7));
 
         let al = lookup("anylast").unwrap();
         let mut b = (al.new)(&[NI64], &[]).unwrap();
         b.update(&[ints(&[7, 8])], &all(2)).unwrap();
         b.update(&[ints(&[9])], &all(1)).unwrap();
-        assert_eq!(b.finish(), Value::Int(9));
+        assert_eq!(b.finish().unwrap(), Value::Int(9));
     }
 
     // ------------------------------------------------------ argMin/argMax
@@ -2274,7 +2397,7 @@ mod tests {
         a.update(&[ints(&a_vals)], &all(a_vals.len())).unwrap();
         b.update(&[ints(&b_vals)], &all(b_vals.len())).unwrap();
         a.merge(b.as_ref()).unwrap();
-        let got = a.finish().as_u64().unwrap() as f64;
+        let got = a.finish().unwrap().as_u64().unwrap() as f64;
         let err = (got - 50_000.0).abs() / 50_000.0;
         assert!(err < 0.02, "merged HLL error {err:.4} (got {got})");
     }
@@ -2287,9 +2410,9 @@ mod tests {
         let mut b = (u.new)(&[NI64], &[]).unwrap();
         a.update(&[ints(&vals)], &all(vals.len())).unwrap();
         b.update(&[ints(&vals)], &all(vals.len())).unwrap();
-        let before = a.finish();
+        let before = a.finish().unwrap();
         a.merge(b.as_ref()).unwrap();
-        assert_eq!(before, a.finish(), "union with itself must not change the estimate");
+        assert_eq!(before, a.finish().unwrap(), "union with itself must not change the estimate");
     }
 
     // ---------------------------------------------------------- groupArray
@@ -2510,10 +2633,11 @@ mod tests {
             let f = lookup(name).unwrap();
             let mut a = (f.new)(&[NI64], &[]).unwrap();
             a.update(&[ints(&[1, 2, 3, 4])], &all(4)).unwrap();
-            let before = a.finish();
+            let before = a.finish().unwrap();
             let empty = (f.new)(&[NI64], &[]).unwrap();
             a.merge(empty.as_ref()).unwrap();
-            assert_eq!(before, a.finish(), "{name}: merging an empty partial changed the result");
+            let after = a.finish().unwrap();
+            assert_eq!(before, after, "{name}: merging an empty partial changed the result");
         }
     }
 
@@ -2538,9 +2662,10 @@ mod tests {
             }
             let fresh = a.boxed_clone();
             let virgin = (f.new)(tys, &[]).unwrap();
-            assert_eq!(fresh.finish(), virgin.finish(), "{name}: clone was not empty");
+            let empty = virgin.finish().unwrap();
+            assert_eq!(fresh.finish().unwrap(), empty, "{name}: clone was not empty");
             // ...and the original is untouched.
-            assert_ne!(a.finish(), virgin.finish(), "{name}: original was disturbed");
+            assert_ne!(a.finish().unwrap(), empty, "{name}: original was disturbed");
         }
     }
 
@@ -2550,7 +2675,8 @@ mod tests {
             let f = lookup(name).unwrap();
             let mut a = (f.new)(&[NI64], &[]).unwrap();
             a.update(&[ints(&[3, 1, 4, 1, 5])], &all(5)).unwrap();
-            assert_eq!(a.finish(), a.finish(), "{name}: finish is not idempotent");
+            let (x, y) = (a.finish().unwrap(), a.finish().unwrap());
+            assert_eq!(x, y, "{name}: finish is not idempotent");
         }
     }
 
@@ -2559,11 +2685,11 @@ mod tests {
         let s = lookup("sum").unwrap();
         let mut a = (s.new)(&[NI64], &[]).unwrap();
         a.update(&[ints(&[1, 2, 3, 4, 5])], &[0, 2, 4]).unwrap();
-        assert_eq!(a.finish(), Value::Int(9));
+        assert_eq!(a.finish().unwrap(), Value::Int(9));
         // Repeated indices are folded repeatedly -- `sel` is a list, not a set.
         let mut b = (s.new)(&[NI64], &[]).unwrap();
         b.update(&[ints(&[7])], &[0, 0, 0]).unwrap();
-        assert_eq!(b.finish(), Value::Int(21));
+        assert_eq!(b.finish().unwrap(), Value::Int(21));
     }
 
     // -------------------------------------------------------- -If variants
@@ -2574,7 +2700,7 @@ mod tests {
         let cond = bools(&[true, false, true, true]);
         let mut a = (c.new)(&[DataType::Bool], &[]).unwrap();
         a.update(&[cond], &all(4)).unwrap();
-        assert_eq!(a.finish(), Value::UInt(3));
+        assert_eq!(a.finish().unwrap(), Value::UInt(3));
     }
 
     #[test]
@@ -2683,10 +2809,10 @@ mod tests {
         a.update(&[ints(&[5]), bools(&[true])], &[0]).unwrap();
         let mut fresh = a.boxed_clone();
         // A fresh clone has seen no rows, which for `sum` is NULL, not 0.
-        assert!(fresh.finish().is_null());
+        assert!(fresh.finish().unwrap().is_null());
         fresh.update(&[ints(&[9]), bools(&[true])], &[0]).unwrap();
-        assert_eq!(fresh.finish(), Value::Int(9));
-        assert_eq!(a.finish(), Value::Int(5));
+        assert_eq!(fresh.finish().unwrap(), Value::Int(9));
+        assert_eq!(a.finish().unwrap(), Value::Int(5));
     }
 
     #[test]
@@ -2702,6 +2828,14 @@ mod tests {
     // Every one of these pinned a shipped wrong answer: a `Decimal64(2)` lane
     // is a count of hundredths, and four accumulators here read it as the
     // number itself. `sum(price)` over 3.81 and 1.19 answered 500.
+    //
+    // The second wave is about *magnitude* rather than scale, and it shipped
+    // because these tests all used two- and three-digit lanes. `avg`, `sum` and
+    // the interpolating quantiles clamped instead of refusing, and
+    // `quantileExact` kept its lanes in an `f64`; between them, four aggregates
+    // answered numbers the column did not contain. Every case below that names
+    // a magnitude is one of those, and the end-to-end pins are in
+    // `tests/decimal_exactness.rs`.
 
     fn decs(scale: u8, v: &[i64]) -> Column {
         Column::i64s(DataType::Decimal64(scale), v.to_vec())
@@ -2745,13 +2879,22 @@ mod tests {
         assert!(!d.same_variant(&i), "only the reported type differs");
     }
 
+    /// Inverted: this pinned a clamp at the decimal range, which is how two
+    /// rows of 5000000000000000.00 summed to 9999999999999999.99 *and*
+    /// `sum(p) = 10000000000000000.00` evaluated TRUE on the same rows -- a
+    /// wrong answer nothing downstream could distinguish from the right one.
     #[test]
-    fn sum_of_a_decimal_saturates_inside_the_decimal_range() {
+    fn sum_of_a_decimal_refuses_to_leave_the_decimal_range() {
         let s = lookup("sum").unwrap();
         let max = crate::types::value::DECIMAL_MAX_UNITS as i64;
-        let got = run(s, &[DEC2], &[], &[decs(2, &[i64::MAX, i64::MAX])]);
+        for lanes in [[i64::MAX, i64::MAX], [i64::MIN, i64::MIN], [max, 1], [-max, -1]] {
+            let e = try_run(s, &[DEC2], &[], &[decs(2, &lanes)]).unwrap_err();
+            assert!(e.to_string().contains("Decimal64(2)"), "{lanes:?}: {e}");
+        }
+        // The edge itself is representable and is still answered, exactly.
+        let got = run(s, &[DEC2], &[], &[decs(2, &[max - 1, 1])]);
         assert!(got.eq_exact(&Value::Decimal(max, 2)), "{got:?}");
-        let got = run(s, &[DEC2], &[], &[decs(2, &[i64::MIN, i64::MIN])]);
+        let got = run(s, &[DEC2], &[], &[decs(2, &[-(max - 1), -1])]);
         assert!(got.eq_exact(&Value::Decimal(-max, 2)), "{got:?}");
     }
 
@@ -2809,6 +2952,43 @@ mod tests {
         assert!(whole.eq_exact(&m), "{m:?}");
     }
 
+    /// The headline bug: `avg` widens to `max(s,6)` and then used to *clamp* at
+    /// 18 digits, so the representable magnitude collapsed to 10^12 whatever
+    /// the column's declared scale. One row of 1000000000000.00 averaged to
+    /// 999999999999.999999 while `max` of the same row answered
+    /// 1000000000000.00, and the fabricated answer was internally consistent.
+    #[test]
+    fn avg_of_a_decimal_refuses_the_promoted_scale_it_cannot_represent() {
+        let a = lookup("avg").unwrap();
+        // 10^12 at scale 2 is 10^14 lanes, which at scale 6 needs 10^18 -- one
+        // unit past the 18 nines a Decimal64 holds.
+        let e = try_run(a, &[DEC2], &[], &[decs(2, &[100_000_000_000_000])]).unwrap_err();
+        assert!(e.to_string().contains("Decimal64(6)"), "{e}");
+        // The largest mean that does fit still comes back, exactly, and is one
+        // lane below the refusal above.
+        let got = run(a, &[DEC2], &[], &[decs(2, &[99_999_999_999_999])]);
+        assert!(got.eq_exact(&Value::Decimal(999_999_999_999_990_000, 6)), "{got:?}");
+        // A scale that does not widen has no promoted range to fall out of, so
+        // the identical magnitude is answered rather than refused.
+        let got = run(a, &[DataType::Decimal64(6)], &[], &[decs(6, &[100_000_000_000_000])]);
+        assert!(got.eq_exact(&Value::Decimal(100_000_000_000_000, 6)), "{got:?}");
+    }
+
+    /// `avg(x)` and `sum(x)/count(*)` are the same query, so they must not
+    /// disagree about *whether* the mean exists either -- the expression side
+    /// has always raised here, and `avg` used to fabricate.
+    #[test]
+    fn avg_and_the_equivalent_divide_fail_on_the_same_rows() {
+        let lanes = [200_000_000_000_000i64, 400_000_000_000_000];
+        let mean = try_run(lookup("avg").unwrap(), &[DEC2], &[], &[decs(2, &lanes)]);
+        // What `sum(p)/count(*)` does: rescale the exact total to the quotient
+        // scale that `divide` picked, which is the same `div_out_scale`.
+        let total: i128 = lanes.iter().map(|&l| l as i128).sum();
+        let quotient = crate::types::value::decimal_rescale(total, 2, div_out_scale(2))
+            .filter(|u| u.unsigned_abs() <= DECIMAL_MAX_UNITS as u128);
+        assert!(mean.is_err() && quotient.is_none(), "{mean:?} vs {quotient:?}");
+    }
+
     /// Interpolating divides, so it widens like `avg`; `quantileExact` picks an
     /// element it actually saw, so it keeps the argument's own type.
     #[test]
@@ -2839,6 +3019,39 @@ mod tests {
         // A quarter of the way is exact in binary, so the weight is too.
         let got = run(q, &t, &[Value::Float(0.25)], &[decs(9, &[0, 400])]);
         assert!(got.eq_exact(&Value::Decimal(100, 9)), "{got:?}");
+    }
+
+    /// The lanes used to live in an `f64`, so anything past 2^53 came back
+    /// rounded: `quantileExact` over one row of 1234567890123456.78 answered
+    /// 1234567890123456.80 while `min`/`max` over the same row answered .78.
+    /// An element the column actually held must come back bit for bit.
+    #[test]
+    fn quantile_exact_returns_the_lane_it_saw_past_the_float_mantissa() {
+        let qe = lookup("quantileexact").unwrap();
+        let big = 123_456_789_012_345_678i64; // 2^53 is ~9.0e15; this is 1.2e17
+        assert_ne!(big as f64 as i64, big, "the f64 round trip must actually lose it");
+        for lane in [big, -big, DECIMAL_MAX_UNITS as i64] {
+            let got = run(qe, &[DEC2], &[], &[decs(2, &[lane])]);
+            assert!(got.eq_exact(&Value::Decimal(lane, 2)), "{lane}: {got:?}");
+        }
+        // Order still has to be value order across the sign, which an unsigned
+        // sort of the reinterpreted lanes would get exactly backwards.
+        let col = decs(2, &[big, -big, 0]);
+        assert!(run(qe, &[DEC2], &[], &[col.clone()]).eq_exact(&Value::Decimal(0, 2)));
+        let q0 = lookup("quantileexact").unwrap();
+        let got = run(q0, &[DEC2], &[Value::Float(0.0)], &[col]);
+        assert!(got.eq_exact(&Value::Decimal(-big, 2)), "{got:?}");
+    }
+
+    /// Interpolating widens to `max(s,6)`, so it inherits `avg`'s refusal
+    /// rather than `avg`'s old clamp.
+    #[test]
+    fn interpolating_quantiles_refuse_the_promoted_scale_they_cannot_represent() {
+        for n in ["median", "quantile"] {
+            let q = lookup(n).unwrap();
+            let e = try_run(q, &[DEC2], &[], &[decs(2, &[100_000_000_000_000])]).unwrap_err();
+            assert!(e.to_string().contains("Decimal64(6)"), "{n}: {e}");
+        }
     }
 
     /// Welford runs on the raw lanes and the scale comes off the *result*:

@@ -55,7 +55,22 @@ pub trait Accumulator: Any + Send {
     /// Combine a partial aggregate computed elsewhere (parallel scan merge).
     fn merge(&mut self, other: &dyn Accumulator) -> Result<()>;
     /// Final value. Must be callable more than once.
-    fn finish(&self) -> Value;
+    ///
+    /// Fallible because the fold is deliberately wider than the declared return
+    /// type -- `sum` totals in `i128`, `avg` divides at a *promoted* decimal
+    /// scale -- so the narrowing at the end can genuinely not fit. The
+    /// engine-wide policy for that is **error; never saturate, never wrap**.
+    ///
+    /// Saturating is the worst of the three and is what this used to do, for
+    /// the sole reason that `finish` returned `Value` and had no way to say no.
+    /// A saturated total is a *number*: it compares equal to itself, it sorts,
+    /// it renders, and nothing downstream can tell it from the true one.
+    /// Concretely, over a `Decimal64(2)` column holding 10^12, `avg` answered
+    /// 999999999999.999999 while `max` over the same column answered
+    /// 1000000000000.00; and `sum(x)/count(*)`, which goes through
+    /// `scalar::dec_divide` and *does* raise, contradicted `avg(x)` on the same
+    /// rows. Raising is what makes those agree.
+    fn finish(&self) -> Result<Value>;
     fn as_any(&self) -> &dyn Any;
     /// A fresh accumulator of the same kind and configuration.
     fn boxed_clone(&self) -> Box<dyn Accumulator>;

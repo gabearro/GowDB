@@ -471,6 +471,22 @@ pub(crate) fn accumulate_into(
 
 /// Turn a finished group table into `[group..., aggs...]` blocks, in the
 /// table's own group order.
+///
+/// [`Accumulator::finish`] is fallible (it narrows a wider fold to the declared
+/// return type and may refuse), which widens its return from 24 bytes to 48 and
+/// adds a branch per group. Measured, because a `Result` through a vtable is
+/// exactly the shape that stops inlining: A/B interleaved with the order
+/// swapped each round, best-of-25 per side, **timing the emit loop alone**
+/// (the scan and the hash build are ~95% of the query and all of its variance,
+/// and neither changed), 400k groups over 800k rows, six rounds, medians of
+/// new/old -- `sum(Int64)` 0.91, `avg(Int64)` 0.99, `sum(Float64)` 0.94,
+/// `sum(Decimal64)` 0.97, `avg(Decimal64)` 0.97, `count+min+max` 0.96. Net
+/// faster on every aggregate, because the `split_at_mut` + `zip` below pays for
+/// the `Result` several times over: it drops the per-*cell* bounds check on the
+/// key arena, the accumulator arena and the builder vector to one per group.
+/// (Load average was ~55 during the run, so single readings spanned 0.72-1.58;
+/// the medians are the number. End to end the whole loop is ~5% of the query,
+/// so none of this is visible from outside.)
 pub(crate) fn emit(
     groups: &Groups,
     group: &[BoundExpr],
@@ -504,12 +520,16 @@ pub(crate) fn emit(
         let mut builders: Vec<ColumnBuilder> = (0..width)
             .map(|i| ColumnBuilder::with_capacity(ty_at(i), end - start))
             .collect();
+        // Split once per block rather than adding `ngroup + ai` per cell, and
+        // zip over slices rather than index them: both arenas are proved in
+        // range once per group instead of once per column. See the note above.
+        let (kb, ab) = builders.split_at_mut(ngroup);
         for g in start..end {
-            for c in 0..ngroup {
-                builders[c].push_value(&groups.keys[g * ngroup + c])?;
+            for (b, k) in kb.iter_mut().zip(&groups.keys[g * ngroup..][..ngroup]) {
+                b.push_value(k)?;
             }
-            for ai in 0..nagg {
-                builders[ngroup + ai].push_value(&groups.accs[g * nagg + ai].finish())?;
+            for (b, a) in ab.iter_mut().zip(&groups.accs[g * nagg..][..nagg]) {
+                b.push_value(&a.finish()?)?;
             }
         }
         // An aggregate over an empty group finishes as NULL (`min` of

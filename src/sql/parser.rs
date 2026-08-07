@@ -646,10 +646,29 @@ impl Parser<'_> {
                 self.expect(&Token::Eq)?;
                 let name = self.ident()?;
                 if self.at(&Token::LParen) {
-                    // Engine arguments (`ReplacingMergeTree(ver)`) are parsed
-                    // and dropped: `Engine` is a plain enum with nowhere to
-                    // keep them.
-                    self.paren_text()?;
+                    // Engine arguments used to be parsed and dropped, which on
+                    // the one argument that exists here is a wrong answer:
+                    // `ReplacingMergeTree(v)` says *the row with the largest
+                    // `v` wins*, and dropping it leaves last-write-wins, so
+                    // inserting `(1,5)` then `(1,2)` returned 2 where the DDL
+                    // asked for 5. Silent, and indistinguishable from correct
+                    // until you know the version column exists.
+                    //
+                    // `ENGINE = MergeTree()` is the same engine spelled with
+                    // empty parens and keeps working; anything inside them --
+                    // the version column, or the legacy
+                    // `MergeTree(date, (k), 8192)` positional form -- names
+                    // semantics this engine does not implement.
+                    let args = self.paren_text()?;
+                    if args != "()" {
+                        return Err(Error::unsupported(format!(
+                            "`ENGINE = {name}{args}`: engine arguments are not implemented. \
+                             `{name}(...)` would change which row survives a merge (a \
+                             version column) or how the part is laid out, and this engine \
+                             has nowhere to keep either -- accepting it would silently \
+                             give you plain `{name}` semantics instead"
+                        )));
+                    }
                 }
                 // The name table lives in `Engine::parse`, and its error kind
                 // (`Unsupported`) is the honest one: the syntax was fine, the
@@ -668,13 +687,22 @@ impl Parser<'_> {
                 self.expect_kw("BY")?;
                 ct.partition_by = Some(self.expr()?);
             } else if self.at_kw("SAMPLE") {
-                self.bump();
-                self.expect_kw("BY")?;
-                self.expr()?; // accepted, ignored: no sampling in this engine
-            } else if self.eat_kw("TTL") {
-                self.expr()?; // ditto
+                // Both of these used to be parsed and thrown away, and the
+                // README already listed them as "not implemented" with the
+                // promise that each such feature "fails with a specific
+                // NOT_IMPLEMENTED message naming the feature". They did not.
+                //
+                // `TTL` is the one with teeth: a table declared
+                // `TTL ts + INTERVAL 30 DAY` and silently given no expiry
+                // keeps returning rows the DDL said would be gone, and grows
+                // without bound. `SAMPLE BY` is inert on its own (there is no
+                // `SELECT ... SAMPLE` to consume it) but is still a stated
+                // storage property the engine does not arrange for.
+                return Err(unimplemented_clause("SAMPLE BY"));
+            } else if self.at_kw("TTL") {
+                return Err(unimplemented_clause("TTL"));
             } else if self.eat_kw("SETTINGS") {
-                self.skip_settings()?;
+                self.settings(SettingScope::Table)?;
             } else if self.eat_kw("AS") {
                 if self.at_kw("SELECT") || self.at_kw("WITH") || self.at(&Token::LParen) {
                     ct.as_query = Some(Box::new(self.query()?));
@@ -698,25 +726,66 @@ impl Parser<'_> {
         let mut default = None;
         let mut codec = None;
         loop {
+            let at = self.pos();
             if self.eat_kws(&["NOT", "NULL"]) {
-                // no-op: types are non-nullable unless wrapped
+                // `NOT NULL` used to be eaten and dropped -- including on a
+                // `Nullable(...)` column, so `CREATE TABLE n (x
+                // Nullable(String) NOT NULL)` then took `INSERT ... (NULL)`,
+                // stored the NULL, and echoed `Nullable(String)` back from
+                // SHOW CREATE TABLE with the constraint gone.
+                //
+                // It is honoured here rather than enforced per row, and the
+                // difference is the whole design: in this engine nullability
+                // *is* the type, and a non-`Nullable` column already refuses
+                // NULL on every write path (`coerce`/`Column::push_value` ->
+                // "cannot store NULL in non-nullable String"). So `x String
+                // NOT NULL` is already true and costs nothing to keep -- no
+                // flag on `Field`, no per-row check, no extra byte per column.
+                //
+                // That leaves only the contradictory spelling, and it is
+                // refused instead of silently resolved. Rewriting
+                // `Nullable(String) NOT NULL` to `String` would be defensible,
+                // but it edits a type the user wrote and can read back; an
+                // error naming both halves cannot be misread, and the fix is
+                // one word either way.
+                if ty.is_nullable() {
+                    return Err(Error::parse(
+                        format!(
+                            "column `{name}`: `NOT NULL` contradicts the declared type \
+                             `{ty}`. Nullability is part of the type here, so write \
+                             `{}` (which already refuses NULL) or drop the `NOT NULL`",
+                            ty.strip_nullable()
+                        ),
+                        at,
+                    ));
+                }
             } else if self.eat_kw("NULL") {
+                // The dual, and *not* symmetric with the arm above: a bare
+                // type states no nullability, so `NULL` adds it; an explicit
+                // `Nullable(...)` states it, so `NOT NULL` conflicts.
                 ty = ty.to_nullable();
             } else if self.eat_kw("DEFAULT") {
                 default = Some(self.expr()?);
             } else if self.eat_kw("CODEC") {
-                // Stored as source text; the storage layer maps it to a codec
-                // chain, and unknown chains must survive parsing to be
-                // diagnosed there with the column name in hand.
+                // Kept as source text, and **currently read by nobody**: the
+                // storage layer picks its own chain (delta/FOR/bitpack, then
+                // LZ4 if it pays). Accepting it is the one discard in this
+                // production that cannot change an answer -- a codec choice
+                // moves bytes, not values -- so it is a documented lie about
+                // compression rather than about data. See the audit note in
+                // tests/no_silent_discard.rs.
                 let text = self.paren_text()?;
                 codec = Some(text[1..text.len() - 1].to_string());
             } else if self.eat_kw("COMMENT") {
+                // Dropped, and the only clause here for which that is honest:
+                // nothing claims it back (SHOW CREATE TABLE does not print
+                // column comments), and it has no effect to lose.
                 match self.peek() {
                     Some(Token::Str(_)) => self.bump(),
                     _ => return self.err("a string after COMMENT"),
                 }
-            } else if self.eat_kw("TTL") {
-                self.expr()?;
+            } else if self.at_kw("TTL") {
+                return Err(unimplemented_clause("TTL"));
             } else {
                 break;
             }
@@ -798,25 +867,306 @@ impl Parser<'_> {
         self.err("`TABLES`, `DATABASES` or `CREATE TABLE`")
     }
 
-    /// `SETTINGS k = v, ...`. Parsed for syntax only: nothing in this engine
-    /// reads a setting yet, and silently dropping them beats rejecting queries
-    /// copied out of a ClickHouse console.
-    fn skip_settings(&mut self) -> Result<()> {
+    /// `SETTINGS k = v, ...`, checked against [`SETTINGS_TABLE`].
+    ///
+    /// This used to be `skip_settings`: it validated the *syntax* and dropped
+    /// the result, so `SELECT 1 SETTINGS max_threads = 2` returned `Ok` with
+    /// no effect, and so did `SETTINGS not_a_real_setting = 'zzz'`. Same
+    /// failure as `DEFAULT`-as-text and `DateTime64(3)` -- a clause read,
+    /// acknowledged, and dropped -- except that a setting is *only* an
+    /// instruction, so dropping it discards 100% of what was asked.
+    ///
+    /// Three outcomes now, one per column of the table:
+    ///   * a setting this engine has already fixed, at the value it is fixed
+    ///     at -- honoured, because it asks for exactly what happens;
+    ///   * the same setting at any other value, or a recognised setting that
+    ///     is not implemented -- `Unsupported`, naming what it would have done;
+    ///   * a name nothing here knows -- a parse error with an offset, since at
+    ///     that point it is most likely a typo.
+    fn settings(&mut self, scope: SettingScope) -> Result<()> {
         loop {
-            self.ident()?;
+            let at = self.pos();
+            let name = self.ident()?;
             self.expect(&Token::Eq)?;
-            self.eat(&Token::Minus);
-            match self.peek() {
-                Some(Token::Number(_)) | Some(Token::Str(_)) | Some(Token::Word { .. }) => {
-                    self.bump()
+            let neg = self.eat(&Token::Minus);
+            // Values are re-serialized from the token rather than sliced out
+            // of the source, so `= 1024` and `= '1024'` compare equal against
+            // the table's fixed value and the error message quotes back
+            // something canonical.
+            let value = match self.peek() {
+                Some(t @ (Token::Number(_) | Token::Str(_) | Token::Word { .. })) => {
+                    let v = t.to_string();
+                    self.bump();
+                    v
                 }
                 _ => return self.err("a setting value"),
-            }
+            };
+            check_setting(&name, neg, &value, scope, at)?;
             if !self.eat(&Token::Comma) {
                 return Ok(());
             }
         }
     }
+}
+
+/// Which `SETTINGS` clause a name showed up in. The two lists are disjoint --
+/// `index_granularity` means nothing on a `SELECT` and `max_threads` means
+/// nothing on a `CREATE TABLE` -- so scoping them turns a misplaced setting
+/// into a message that says where it belongs instead of "unknown".
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SettingScope {
+    Query,
+    Table,
+}
+
+/// One row of [`SETTINGS_TABLE`].
+struct SettingSpec {
+    name: &'static str,
+    scope: SettingScope,
+    /// `Some(v)`: this engine has already fixed the property, at `v`, so the
+    /// setting is honoured at that value and refused at any other.
+    /// `None`: recognised, would change results, resource limits or failure
+    /// modes, and is not implemented.
+    fixed: Option<&'static str>,
+    /// Tail of the message, phrased as what the engine actually does. Written
+    /// for someone holding a ClickHouse script and wondering what to delete.
+    note: &'static str,
+}
+
+/// Every `SETTINGS` name this engine recognises, and what it really does here.
+///
+/// The list is short on purpose. ClickHouse has ~1000 settings and this is not
+/// a compatibility shim: the point of naming any of them is that a recognised
+/// name produces a message about *this* engine ("blocks are 8192 rows, fixed
+/// at compile time") instead of the useless "unknown setting". Everything else
+/// falls through to the typo path, which says so.
+///
+/// The `fixed` column is where the honest accepts live, and it is short for
+/// the same reason: a value goes in it only when this engine's behaviour and
+/// ClickHouse's meaning of that setting coincide *exactly*, which is a much
+/// stronger claim than "roughly similar" and was checked one at a time.
+const SETTINGS_TABLE: &[SettingSpec] = &[
+    // ---- table scope -----------------------------------------------------
+    SettingSpec {
+        name: "index_granularity",
+        scope: SettingScope::Table,
+        // crate::common::GRANULE_SIZE. Not a runtime knob: G_SHIFT is derived
+        // from it and the granule index shifts by it, so a per-table value
+        // would have to travel with every part.
+        fixed: Some("1024"),
+        note: "granules here are a compile-time 1024 rows (common::GRANULE_SIZE), \
+               which is what zone maps, the sparse index and the LZ4 block all key off",
+    },
+    SettingSpec {
+        name: "index_granularity_bytes",
+        scope: SettingScope::Table,
+        fixed: None,
+        note: "granules are sized in rows only; there is no adaptive granularity",
+    },
+    SettingSpec {
+        name: "min_rows_for_wide_part",
+        scope: SettingScope::Table,
+        // Deliberately not `Some("0")`: a part here is granule-major (one
+        // framed section per granule holding every column), which is neither
+        // ClickHouse's wide nor its compact layout, so claiming to honour
+        // either spelling would be the same overclaim this table exists to
+        // stop.
+        fixed: None,
+        note: "parts have one layout here -- granule-major, one framed section per \
+               granule -- so there is no wide/compact choice to make",
+    },
+    SettingSpec {
+        name: "min_bytes_for_wide_part",
+        scope: SettingScope::Table,
+        fixed: None,
+        note: "parts have one layout here -- granule-major, one framed section per \
+               granule -- so there is no wide/compact choice to make",
+    },
+    SettingSpec {
+        name: "storage_policy",
+        scope: SettingScope::Table,
+        fixed: None,
+        note: "there is one storage tier: the data directory given to --data",
+    },
+    SettingSpec {
+        name: "ttl_only_drop_parts",
+        scope: SettingScope::Table,
+        fixed: None,
+        note: "TTL is not implemented, so there is no expiry to schedule",
+    },
+    SettingSpec {
+        name: "merge_with_ttl_timeout",
+        scope: SettingScope::Table,
+        fixed: None,
+        note: "TTL is not implemented, so there is no expiry to schedule",
+    },
+    SettingSpec {
+        name: "allow_nullable_key",
+        scope: SettingScope::Table,
+        // Checked by driving it: `ORDER BY <Nullable col>` is accepted and the
+        // rows come back sorted. What it loses is only the *index* --
+        // `TableDef::sort_col` declines a nullable lane because the lane has
+        // no slot for the null flag and so is not order-preserving across
+        // granules -- and losing an index is a plan choice, not an answer.
+        fixed: Some("1"),
+        note: "a Nullable ORDER BY key is always allowed and sorts correctly; it just \
+               gets no sparse index or point-lookup path, so scans replace seeks",
+    },
+    // ---- query scope -----------------------------------------------------
+    SettingSpec {
+        name: "max_threads",
+        scope: SettingScope::Query,
+        fixed: None,
+        note: "the exchange operator sizes its own fan-out from the part count and \
+               the core count; there is no per-query override",
+    },
+    SettingSpec {
+        name: "max_block_size",
+        scope: SettingScope::Query,
+        // crate::common::BLOCK_SIZE.
+        fixed: Some("8192"),
+        note: "blocks are a compile-time 8192 rows (common::BLOCK_SIZE); every \
+               operator's reused scratch buffers are sized off it",
+    },
+    SettingSpec {
+        name: "max_insert_block_size",
+        scope: SettingScope::Query,
+        // Deliberately not `Some("8192")` even though its read-side twin is:
+        // `BLOCK_SIZE` governs what a *scan* hands the executor, and nothing
+        // re-chunks an INSERT on the way in -- a 100k-row VALUES list arrives
+        // as one 100k-row block. Claiming 8192 here would be a false accept in
+        // a table whose whole purpose is to stop those.
+        fixed: None,
+        note: "an INSERT is ingested as the one block it arrives as; nothing splits it \
+               on the way in, so there is no insert block size to cap",
+    },
+    SettingSpec {
+        name: "max_memory_usage",
+        scope: SettingScope::Query,
+        fixed: None,
+        note: "there is no per-query memory accounting, so this would not fail the \
+               query at the limit -- it would let it run to the OOM killer instead",
+    },
+    SettingSpec {
+        name: "max_execution_time",
+        scope: SettingScope::Query,
+        fixed: None,
+        note: "there is no deadline check in the operator loop",
+    },
+    SettingSpec {
+        name: "max_result_rows",
+        scope: SettingScope::Query,
+        fixed: None,
+        note: "there is no result quota; use LIMIT, which is enforced",
+    },
+    SettingSpec {
+        name: "max_rows_to_read",
+        scope: SettingScope::Query,
+        fixed: None,
+        note: "there is no read quota",
+    },
+    SettingSpec {
+        name: "max_bytes_to_read",
+        scope: SettingScope::Query,
+        fixed: None,
+        note: "there is no read quota",
+    },
+    SettingSpec {
+        name: "max_bytes_before_external_group_by",
+        scope: SettingScope::Query,
+        fixed: None,
+        note: "aggregation is in-memory; it does not spill, so this threshold has \
+               nothing to trigger",
+    },
+    SettingSpec {
+        name: "max_bytes_before_external_sort",
+        scope: SettingScope::Query,
+        fixed: None,
+        note: "the sort is in-memory; it does not spill, so this threshold has \
+               nothing to trigger",
+    },
+    SettingSpec {
+        name: "join_use_nulls",
+        scope: SettingScope::Query,
+        // The `= 1` behaviour is the only one implemented: unmatched rows on
+        // the outer side are filled with NULL, never with the type's zero.
+        fixed: Some("1"),
+        note: "an unmatched outer row is always filled with NULL here, never with \
+               the column type's default",
+    },
+    SettingSpec {
+        name: "distributed_product_mode",
+        scope: SettingScope::Query,
+        fixed: None,
+        note: "there is no distributed engine",
+    },
+    SettingSpec {
+        name: "prefer_localhost_replica",
+        scope: SettingScope::Query,
+        fixed: None,
+        note: "there is no distributed engine",
+    },
+];
+
+/// Judge one `k = v` pair. Split out of [`Parser::settings`] so the table and
+/// the three messages sit together, and so the parser body stays a loop.
+#[cold]
+fn check_setting(
+    name: &str,
+    neg: bool,
+    value: &str,
+    scope: SettingScope,
+    at: usize,
+) -> Result<()> {
+    let Some(spec) = SETTINGS_TABLE.iter().find(|s| s.name.eq_ignore_ascii_case(name)) else {
+        return Err(Error::parse(
+            format!("unknown setting `{name}`; this engine recognises only settings it \
+                     actually implements, so an unfamiliar name is a typo here rather \
+                     than a no-op"),
+            at,
+        ));
+    };
+    if spec.scope != scope {
+        let (here, there) = match scope {
+            SettingScope::Query => ("query-level", "CREATE TABLE"),
+            SettingScope::Table => ("table-level", "a query"),
+        };
+        return Err(Error::parse(
+            format!("`{}` is not a {here} setting; it belongs on {there}", spec.name),
+            at,
+        ));
+    }
+    match spec.fixed {
+        // Quotes come off because `SETTINGS x = '8192'` and `x = 8192` ask for
+        // the same thing, and the lexer keeps them apart.
+        Some(v) if !neg && value.trim_matches('\'') == v => Ok(()),
+        Some(v) => Err(Error::unsupported(format!(
+            "`{}` is fixed at {v} in this engine and cannot be set to {}{value}: {}",
+            spec.name,
+            if neg { "-" } else { "" },
+            spec.note
+        ))),
+        None => Err(Error::unsupported(format!(
+            "`SETTINGS {}` is not implemented: {}. Remove the setting -- accepting it \
+             and doing nothing is how a query silently gets something other than what \
+             it asked for",
+            spec.name, spec.note
+        ))),
+    }
+}
+
+/// A clause the grammar knows and the engine does not, refused where it is
+/// read. Cold and shared so each site is one line: the temptation these
+/// replace was `self.expr()?;` with a `// accepted, ignored` comment, which is
+/// how `TTL` and `SAMPLE BY` came to be listed as unimplemented in the README
+/// while quietly parsing clean.
+#[cold]
+fn unimplemented_clause(what: &'static str) -> Error {
+    Error::unsupported(format!(
+        "`{what}` is not implemented. It parses, so it used to be accepted and \
+         dropped; it is refused now because a declaration this engine does not \
+         arrange for is worse than one it does not recognise"
+    ))
 }
 
 // ------------------------------------------------------------------ queries
@@ -893,7 +1243,7 @@ impl Parser<'_> {
             } else if self.eat_kw("OFFSET") {
                 q.offset = Some(self.expr()?);
             } else if self.eat_kw("SETTINGS") {
-                self.skip_settings()?;
+                self.settings(SettingScope::Query)?;
             } else {
                 return Ok(());
             }
@@ -1157,16 +1507,45 @@ impl Parser<'_> {
                 continue;
             }
 
-            // Strictness/locality modifiers are recognized so ClickHouse SQL
-            // parses, then dropped: this engine has one join implementation.
+            // Strictness and locality modifiers. These used to be recognized
+            // and dropped "because this engine has one join implementation",
+            // which is true and is exactly the problem: the one it has is
+            // `ALL`, and every dropped modifier asked for a *different row
+            // set*. `a ANY LEFT JOIN b` on a right side with two matching rows
+            // returned both, where `ANY` means at most one -- a silent
+            // duplicate-row bug on the most ordinary shape there is.
+            //
+            // Only the two that really are no-ops survive: `ALL` names what
+            // this engine does, and `GLOBAL` is a shard-distribution hint with
+            // no shards to distribute to.
+            //
+            // The check has to wait until a `JOIN` is confirmed, because this
+            // prefix is speculative -- `ANY` and `ALL` are ordinary words
+            // elsewhere, and the `save`/restore below un-reads them when what
+            // followed was not a join at all.
             let save = self.i;
-            while self.at_kw("GLOBAL")
-                || self.at_kw("ANY")
-                || self.at_kw("ALL")
-                || self.at_kw("ASOF")
-                || self.at_kw("SEMI")
-                || self.at_kw("ANTI")
-            {
+            let mut strictness: Option<&'static str> = None;
+            loop {
+                let m = if self.at_kw("GLOBAL") {
+                    "GLOBAL"
+                } else if self.at_kw("ALL") {
+                    "ALL"
+                } else if self.at_kw("ANY") {
+                    "ANY"
+                } else if self.at_kw("ASOF") {
+                    "ASOF"
+                } else if self.at_kw("SEMI") {
+                    "SEMI"
+                } else if self.at_kw("ANTI") {
+                    "ANTI"
+                } else {
+                    break;
+                };
+                // First one wins the message; `SEMI ANY JOIN` is nonsense
+                // anyway and naming the leading keyword is the clearer report.
+                if !matches!(m, "GLOBAL" | "ALL") && strictness.is_none() {
+                    strictness = Some(m);
+                }
                 self.bump();
             }
             let op = if self.eat_kw("INNER") {
@@ -1189,6 +1568,21 @@ impl Parser<'_> {
                 return Ok(left);
             };
             self.expect_kw("JOIN")?;
+            if let Some(m) = strictness {
+                return Err(Error::unsupported(format!(
+                    "`{m} JOIN` is not implemented: {}. This engine joins with ALL \
+                     semantics (every matching pair), so accepting the keyword would \
+                     return a different row set than the one you asked for",
+                    match m {
+                        "ANY" => "ANY keeps at most one match per row",
+                        "SEMI" => "SEMI returns left rows that have a match, and only \
+                                   the left columns",
+                        "ANTI" => "ANTI returns left rows that have no match, and only \
+                                   the left columns",
+                        _ => "ASOF matches the nearest preceding row, not an equal one",
+                    }
+                )));
+            }
 
             let right = self.table_factor()?;
             let constraint = if self.eat_kw("ON") {
@@ -2399,10 +2793,88 @@ mod tests {
         assert_eq!(q.limit_by.unwrap().1, vec![Expr::col("a")]);
     }
 
+    /// Inverted. This used to be `settings_are_parsed_and_dropped`, and it
+    /// asserted the bug: `SETTINGS max_threads = 8, x = 'y', z = -1` parsed
+    /// clean, so a query asking for two threads and a made-up setting got
+    /// neither and no complaint. A setting is only an instruction, so dropping
+    /// one discards the whole request.
     #[test]
-    fn settings_are_parsed_and_dropped() {
-        let s = select_of("SELECT a FROM t SETTINGS max_threads = 8, x = 'y', z = -1");
+    fn settings_are_checked_not_dropped() {
+        // The value that *is* what this engine does is honoured...
+        let s = select_of("SELECT a FROM t SETTINGS max_block_size = 8192");
         assert_eq!(s.projection.len(), 1);
+        assert!(parse("SELECT a FROM t SETTINGS join_use_nulls = 1, max_block_size = '8192'")
+            .is_ok());
+
+        // ...every other value, and every unimplemented setting, is refused
+        // with the reason attached.
+        for (sql, word) in [
+            ("SELECT a FROM t SETTINGS max_threads = 8", "max_threads"),
+            ("SELECT a FROM t SETTINGS x = 'y'", "unknown setting"),
+            ("SELECT a FROM t SETTINGS z = -1", "unknown setting"),
+            ("SELECT a FROM t SETTINGS max_block_size = 4096", "8192"),
+            ("SELECT a FROM t SETTINGS join_use_nulls = 0", "NULL"),
+            // Recognised, and *not* honoured at its read-side twin's value:
+            // nothing re-chunks an INSERT, so there is no cap to agree with.
+            ("SELECT a FROM t SETTINGS max_insert_block_size = 8192", "arrives as"),
+            // Right name, wrong clause: reported as misplaced, not unknown.
+            ("SELECT a FROM t SETTINGS index_granularity = 1024", "CREATE TABLE"),
+        ] {
+            let e = parse(sql).unwrap_err().to_string();
+            assert!(e.contains(word), "{sql}: `{word}` missing from {e}");
+        }
+        // A negated value cannot equal a fixed one, and must not be read as if
+        // the minus were not there.
+        assert!(parse("SELECT a FROM t SETTINGS max_block_size = -8192").is_err());
+        // Syntax checking is unchanged.
+        assert!(parse("SELECT a FROM t SETTINGS max_threads").is_err());
+        assert!(parse("SELECT a FROM t SETTINGS max_threads = ").is_err());
+    }
+
+    /// The other three clauses found by the same audit, all of which parsed
+    /// clean and did nothing. `ENGINE = ReplacingMergeTree(v)` is the one that
+    /// returned wrong data: the version column decides which row survives, and
+    /// dropped it degrades to last-write-wins.
+    #[test]
+    fn clauses_the_engine_does_not_implement_are_refused() {
+        for (sql, word) in [
+            (
+                "CREATE TABLE t (a UInt64, v UInt64) ENGINE = ReplacingMergeTree(v) ORDER BY a",
+                "engine arguments",
+            ),
+            ("CREATE TABLE t (a UInt64) ENGINE = MergeTree ORDER BY a TTL a + 1", "TTL"),
+            ("CREATE TABLE t (a UInt64 TTL a + 1) ENGINE = MergeTree ORDER BY a", "TTL"),
+            ("CREATE TABLE t (a UInt64) ENGINE = MergeTree ORDER BY a SAMPLE BY a", "SAMPLE BY"),
+        ] {
+            let e = parse(sql).unwrap_err().to_string();
+            assert!(e.contains(word), "{sql}: `{word}` missing from {e}");
+        }
+        // Empty parens name no argument, so they are the same engine.
+        assert!(parse("CREATE TABLE t (a UInt64) ENGINE = MergeTree() ORDER BY a").is_ok());
+    }
+
+    /// `NOT NULL` used to be eaten and dropped even on a `Nullable` column, so
+    /// the contradiction was resolved silently in favour of the *weaker* half.
+    /// Nullability is part of the type here, so the plain spelling is already
+    /// enforced and only the contradiction needs saying.
+    #[test]
+    fn not_null_is_honoured_or_refused() {
+        let ct = match one("CREATE TABLE t (a UInt64 NOT NULL, b String NOT NULL) ENGINE = Memory")
+        {
+            Statement::CreateTable(ct) => *ct,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(ct.columns[0].ty, DataType::UInt64);
+        assert_eq!(ct.columns[1].ty, DataType::String);
+
+        let e = parse("CREATE TABLE t (a Nullable(String) NOT NULL) ENGINE = Memory")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("NOT NULL") && e.contains("Nullable(String)"), "{e}");
+        assert!(parse("CREATE TABLE t (a LowCardinality(Nullable(String)) NOT NULL) ENGINE = Memory")
+            .is_err());
+        // `NULL` stays additive: a bare type declares no nullability.
+        assert!(parse("CREATE TABLE t (a String NULL) ENGINE = Memory").is_ok());
     }
 
     // -------------------------------------------------------------- joins
@@ -2418,7 +2890,11 @@ mod tests {
             ("SELECT * FROM a FULL OUTER JOIN b ON a.x = b.x", JoinOp::Full),
             ("SELECT * FROM a CROSS JOIN b", JoinOp::Cross),
             ("SELECT * FROM a, b", JoinOp::Cross),
-            ("SELECT * FROM a ANY LEFT JOIN b ON a.x = b.x", JoinOp::Left),
+            // The two modifiers that really are no-ops: `ALL` names this
+            // engine's own semantics, and `GLOBAL` distributes to shards that
+            // do not exist.
+            ("SELECT * FROM a ALL LEFT JOIN b ON a.x = b.x", JoinOp::Left),
+            ("SELECT * FROM a GLOBAL JOIN b ON a.x = b.x", JoinOp::Inner),
         ];
         for (sql, want) in cases {
             match select_of(sql).from.unwrap() {
@@ -2426,6 +2902,30 @@ mod tests {
                 other => panic!("{sql}: {other:?}"),
             }
         }
+    }
+
+    /// Inverted. `ANY LEFT JOIN` used to parse to a plain `Left`, so a right
+    /// side with two matching rows returned both where `ANY` asked for at most
+    /// one -- silent duplicate rows, from a keyword the parser acknowledged.
+    /// `SEMI`/`ANTI`/`ASOF` were worse: they name a different row set *and* a
+    /// different column set.
+    #[test]
+    fn join_strictness_that_changes_the_row_set_is_refused() {
+        for (sql, word) in [
+            ("SELECT * FROM a ANY LEFT JOIN b ON a.x = b.x", "ANY JOIN"),
+            ("SELECT * FROM a ANY JOIN b ON a.x = b.x", "ANY JOIN"),
+            ("SELECT * FROM a SEMI LEFT JOIN b ON a.x = b.x", "SEMI JOIN"),
+            ("SELECT * FROM a ANTI LEFT JOIN b ON a.x = b.x", "ANTI JOIN"),
+            ("SELECT * FROM a ASOF JOIN b ON a.x = b.x", "ASOF JOIN"),
+            ("SELECT * FROM a GLOBAL ANY JOIN b ON a.x = b.x", "ANY JOIN"),
+        ] {
+            let e = parse(sql).unwrap_err().to_string();
+            assert!(e.contains(word), "{sql}: `{word}` missing from {e}");
+        }
+        // The prefix is speculative, and the rejection must not fire when what
+        // followed was never a join: `any` is also an aggregate here.
+        assert!(parse("SELECT any(x) FROM t").is_ok());
+        assert!(parse("SELECT * FROM t WHERE x = 1 AND all_ok = 2").is_ok());
     }
 
     #[test]
@@ -2570,7 +3070,7 @@ mod tests {
              PARTITION BY toYYYYMM(ts)
              ORDER BY (id, url)
              PRIMARY KEY id
-             SETTINGS index_granularity = 8192",
+             SETTINGS index_granularity = 1024",
         );
         let ct = match st {
             Statement::CreateTable(ct) => *ct,

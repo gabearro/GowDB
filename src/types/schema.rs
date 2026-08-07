@@ -35,7 +35,28 @@ impl Field {
     /// non-constant default (`DEFAULT now()`) is reported as unsupported
     /// rather than accepted and silently ignored.
     pub fn with_default(self, lit: &str) -> Result<Self> {
-        let v = parse_sql_literal(lit).ok_or_else(|| {
+        let t = lit.trim();
+        // A decimal default is read from its own digits, never through `f64`.
+        //
+        // This path is the *catalog reload* (persist/reader.rs hands back the
+        // text `default_sql()` wrote), and `parse_sql_literal` folds anything
+        // containing a `.` into a double. A `Decimal64(18)` carries 18
+        // significant digits and a double carries ~15.9, so
+        // `DEFAULT '0.123456789012345678'` -- exact when the column was
+        // created, because a quoted literal goes through `parse_decimal_str`
+        // -- came back as 0.123456789012345680 after a restart. Silent, in the
+        // digits nobody checks, and permanent: the next checkpoint writes the
+        // corrupted value back out as if it had always been that.
+        //
+        // Handing the text to `Value::str` puts it back on `to_decimal_units`,
+        // which is the same exact parser the INSERT path uses, so the DDL, the
+        // reload and the per-row cast all agree by construction.
+        if self.ty.is_decimal()
+            && t.starts_with(|c: char| c.is_ascii_digit() || c == '-' || c == '+' || c == '.')
+        {
+            return self.with_default_value(Value::str(t));
+        }
+        let v = parse_sql_literal(t).ok_or_else(|| {
             Error::unsupported(format!(
                 "DEFAULT for column `{}` must be a constant literal, got `{lit}`",
                 self.name
@@ -65,9 +86,23 @@ impl Field {
     ///
     /// Temporal values get quoted, which `Value`'s own `Display` does not do —
     /// a bare `DEFAULT 2024-01-01` is three integers and a subtraction.
+    ///
+    /// **Decimals get quoted for the same class of reason**, and it is the
+    /// half of the reload fix that `with_default` cannot do alone. That fix
+    /// makes the *catalog* path exact, but `SHOW CREATE TABLE` output is meant
+    /// to be pasted into a migration, and a bare `DEFAULT 0.123456789012345678`
+    /// goes back through the lexer, which has only `Value::Float` for a
+    /// number with a point — so the printed DDL re-created the column with a
+    /// different default than the one it was printed from. Quoting keeps the
+    /// digits as digits all the way to `parse_decimal_str`.
+    ///
+    /// Both spellings still load, so a catalog written before this reads back
+    /// unchanged.
     pub fn default_sql(&self) -> Option<String> {
         self.default.as_ref().map(|v| match v {
-            Value::Date(_) | Value::DateTime(_) => format!("'{}'", v.render_plain()),
+            Value::Date(_) | Value::DateTime(_) | Value::Decimal(..) => {
+                format!("'{}'", v.render_plain())
+            }
             other => other.to_string(),
         })
     }
@@ -690,6 +725,18 @@ mod tests {
             (DataType::DateTime, "'2024-01-15 13:45:30'"),
             (DataType::Nullable(Box::new(DataType::Int64)), "NULL"),
             (DataType::Nullable(Box::new(DataType::Float32)), "1.5"),
+            // Decimals were missing from this list, and that is how a reload
+            // came to change one. The 18-digit cases are the ones a double
+            // cannot hold: they only round-trip because `with_default` reads
+            // the digits instead of parsing to `f64` first.
+            (DataType::Decimal64(2), "12.34"),
+            (DataType::Decimal64(2), "'12.34'"),
+            (DataType::Decimal64(2), "-12.34"),
+            (DataType::Decimal64(0), "7"),
+            (DataType::Decimal64(18), "0.123456789012345678"),
+            (DataType::Decimal64(17), "-9.22337203685477580"),
+            (DataType::Nullable(Box::new(DataType::Decimal64(4))), "0.0001"),
+            (DataType::Nullable(Box::new(DataType::Decimal64(4))), "NULL"),
         ] {
             let f = defaulted(ty.clone(), lit);
             let text = f.default_sql().expect("a default was set");
@@ -705,6 +752,62 @@ mod tests {
         // Parsing every integer through f64 would round this to 2^64.
         let f = defaulted(DataType::UInt64, "18446744073709551615");
         assert_eq!(f.default_value(), Some(&Value::UInt(u64::MAX)));
+    }
+
+    /// The bug this pins: `parse_sql_literal` routes anything with a `.`
+    /// through `f64`, which holds ~15.9 significant digits against
+    /// `Decimal64(18)`'s 18. So a default that was *exact* at CREATE TABLE
+    /// (a quoted literal goes straight to `parse_decimal_str`) came back
+    /// changed after the catalog reload re-parsed the text -- and the next
+    /// checkpoint wrote the changed value back out as if it had always been
+    /// that.
+    #[test]
+    fn a_decimal_default_survives_the_catalog_reload_exactly() {
+        let exact = |lit: &str, scale: u8| -> i64 {
+            let ty = DataType::Decimal64(scale);
+            let f = Field::new("c", ty.clone()).with_default(lit).unwrap();
+            match f.default_value() {
+                Some(Value::Decimal(u, s)) => {
+                    assert_eq!(*s, scale);
+                    *u
+                }
+                other => panic!("{lit}: {other:?}"),
+            }
+        };
+        // The scale is also the digit budget -- `Decimal64(18)` is 18 nines --
+        // so the widest exact case is a pure fraction. 0.123456789012345678
+        // shortest-round-trips as an f64 to 0.12345678901234568, seventeen
+        // digits: the eighteenth is the one that used to be lost.
+        assert_eq!(exact("0.123456789012345678", 18), 123_456_789_012_345_678);
+        assert_eq!(exact("-0.123456789012345678", 18), -123_456_789_012_345_678);
+        assert_eq!(exact("12.34", 2), 1234);
+        assert_eq!(exact("0.1", 2), 10);
+        // Half-away-from-zero, the same rule the INSERT path uses -- reading
+        // the text rather than the double is what keeps the two in agreement.
+        assert_eq!(exact("2.5", 0), 3);
+        assert_eq!(exact("1.005", 2), 101);
+        // And the whole point: reload is a fixpoint, not an approximation.
+        let f = Field::new("c", DataType::Decimal64(18))
+            .with_default("0.123456789012345678")
+            .unwrap();
+        let text = f.default_sql().unwrap();
+        // Quoted, so pasting the printed DDL back does not route the digits
+        // through the lexer's `f64`.
+        assert_eq!(text, "'0.123456789012345678'");
+        let back = Field::new("c", DataType::Decimal64(18)).with_default(&text).unwrap();
+        assert_eq!(back.default_value(), f.default_value());
+
+        // Non-numeric text still takes the ordinary route, so NULL and the
+        // usual rejections behave as before.
+        let n = DataType::Decimal64(2).to_nullable();
+        assert_eq!(
+            Field::new("c", n).with_default("NULL").unwrap().default_value(),
+            Some(&Value::Null)
+        );
+        assert!(Field::new("c", DataType::Decimal64(2)).with_default("'abc'").is_err());
+        assert!(Field::new("c", DataType::Decimal64(2)).with_default("now()").is_err());
+        // Wider than the lane: refused, not truncated.
+        assert!(Field::new("c", DataType::Decimal64(18)).with_default("99.5").is_err());
     }
 
     #[test]

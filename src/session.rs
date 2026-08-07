@@ -34,6 +34,23 @@
 //! a transaction that only reads costs nothing, and a transaction over one
 //! table does not drag the others into it.
 //!
+//! ### A transaction that has failed stays failed
+//!
+//! The first statement to return an error while a transaction is open
+//! *poisons* it: every later statement is refused, and `COMMIT` rolls back and
+//! reports rather than publishing. Two holes close together. A statement that
+//! failed used to leave the transaction open, so the statements after it
+//! returned `Ok` over writes the session was already committed to discarding.
+//! And a nested `BEGIN` errored while leaving the outer transaction open, so
+//! the inner block's `COMMIT` -- which believed it was ending its own
+//! transaction -- durably committed the outer one's uncommitted work at a
+//! boundary the outer writer never chose.
+//!
+//! `ROLLBACK` is the way out and always runs. `COMMIT` on a poisoned
+//! transaction rolls back and returns an error rather than the `Ok` PostgreSQL
+//! reports for the same case: a client that gets `Ok` from `COMMIT` is
+//! entitled to believe its writes landed.
+//!
 //! ### What autocommit pays
 //!
 //! Nothing. A statement outside a transaction takes the same path it always
@@ -70,6 +87,7 @@ use crate::sql::ast::{
     ColumnDef, CreateTable, ExplainKind, Insert, InsertSource, ObjectName, Statement,
 };
 use crate::sql::parse;
+use crate::storage::table::KeyConflict;
 use crate::types::{Block, Column, ColumnBuilder, DataType, Field, Schema, TableDef, Value};
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -173,7 +191,6 @@ impl std::fmt::Display for ResultSet {
         if self.schema.is_empty() {
             return write!(f, "Ok.");
         }
-        let rows = self.to_values();
         let ncols = self.schema.len();
         let mut widths: Vec<usize> = self
             .schema
@@ -181,17 +198,26 @@ impl std::fmt::Display for ResultSet {
             .iter()
             .map(|f| f.name.chars().count())
             .collect();
-        let cells: Vec<Vec<String>> = rows
-            .iter()
-            .map(|r| {
-                (0..ncols)
-                    .map(|c| r.get(c).map(|v| v.render_plain()).unwrap_or_default())
-                    .collect()
-            })
-            .collect();
-        for r in &cells {
-            for (c, s) in r.iter().enumerate() {
-                widths[c] = widths[c].max(s.chars().count());
+        // Rendered straight out of the blocks. The old shape went through
+        // `to_values()` first, which materialized a `Vec<Vec<Value>>` of the
+        // whole result *in addition* to the strings -- two full copies live at
+        // once, one of them thrown away unread.
+        let mut cells: Vec<Vec<String>> = Vec::with_capacity(self.rows());
+        for b in &self.blocks {
+            for r in 0..b.rows() {
+                let row: Vec<String> = (0..ncols)
+                    .map(|c| {
+                        if c < b.width() {
+                            b.column(c).value(r).render_plain()
+                        } else {
+                            String::new()
+                        }
+                    })
+                    .collect();
+                for (c, s) in row.iter().enumerate() {
+                    widths[c] = widths[c].max(s.chars().count());
+                }
+                cells.push(row);
             }
         }
         let rule =
@@ -201,21 +227,21 @@ impl std::fmt::Display for ResultSet {
                     if i > 0 {
                         write!(f, "{m}")?;
                     }
-                    write!(f, "{}", "─".repeat(w + 2))?;
+                    fill(f, RULE_RUN, '─'.len_utf8(), w + 2)?;
                 }
                 writeln!(f, "{r}")
             };
         rule(f, "┌", "┬", "┐")?;
         write!(f, "│")?;
         for (i, fl) in self.schema.fields().iter().enumerate() {
-            write!(f, " {:w$} │", fl.name, w = widths[i])?;
+            pad_cell(f, &fl.name, widths[i])?;
         }
         writeln!(f)?;
         rule(f, "├", "┼", "┤")?;
         for r in &cells {
             write!(f, "│")?;
             for (i, s) in r.iter().enumerate() {
-                write!(f, " {:w$} │", s, w = widths[i])?;
+                pad_cell(f, s, widths[i])?;
             }
             writeln!(f)?;
         }
@@ -228,6 +254,44 @@ impl std::fmt::Display for ResultSet {
             self.stats.elapsed_us as f64 / 1000.0
         )
     }
+}
+
+/// 64 spaces and 64 box-drawing dashes, the padding units [`fill`] copies from.
+const PAD_RUN: &str = "                                                                ";
+const RULE_RUN: &str = "────────────────────────────────────────────────────────────────";
+
+/// Write `n` copies of a one-character unit, `chunk.len() / unit` at a time.
+///
+/// Replaces `"─".repeat(w + 2)`, which allocated a `String` per column per rule
+/// line -- three per column for every rendered result, and on a wide cell a
+/// multi-hundred-kilobyte one.
+fn fill(f: &mut std::fmt::Formatter<'_>, chunk: &str, unit: usize, mut n: usize) -> std::fmt::Result {
+    let per = chunk.len() / unit;
+    while n > 0 {
+        let k = n.min(per);
+        f.write_str(&chunk[..k * unit])?;
+        n -= k;
+    }
+    Ok(())
+}
+
+/// One `│`-terminated cell: a space, `s` left-aligned in `w` columns, a space.
+///
+/// Hand-padded rather than `{:w$}`, and this is a crash fix rather than a
+/// tidy-up: `std::fmt` packs a *runtime* width into a `u16`, so a cell or a
+/// column name longer than 65535 characters -- one 64 KiB JSON blob, one long
+/// log line -- panicked inside the formatter. With `panic = "abort"` in the
+/// release profile that is a SIGABRT with no unwinding, which in a library
+/// embedding takes the host process down. Padding by hand has no ceiling, and
+/// as a side effect skips the formatting machinery's per-argument runtime
+/// dispatch.
+fn pad_cell(f: &mut std::fmt::Formatter<'_>, s: &str, w: usize) -> std::fmt::Result {
+    f.write_str(" ")?;
+    f.write_str(s)?;
+    // `chars`, not `len`: the widths were measured that way, so a multi-byte
+    // cell must be measured the same way or the columns stop lining up.
+    fill(f, PAD_RUN, 1, w.saturating_sub(s.chars().count()))?;
+    f.write_str(" │")
 }
 
 pub struct Session {
@@ -265,6 +329,17 @@ pub struct Session {
 #[derive(Default)]
 struct Txn {
     tables: Vec<Enlisted>,
+    /// The first error a statement raised while this transaction was open.
+    ///
+    /// Once set the transaction is *poisoned*: every later statement is
+    /// refused and COMMIT rolls back instead of committing. Without it a
+    /// failed statement left the transaction open and the ones after it
+    /// returned `Ok` over work that was then discarded at exit -- a client
+    /// that never checks a second time is told its writes landed when they
+    /// did not. A `String` rather than an `Error`, because carrying the
+    /// original would mean cloning it on every read of the flag; the message
+    /// is the only part worth repeating.
+    poisoned: Option<String>,
 }
 
 struct Enlisted {
@@ -276,6 +351,11 @@ struct Enlisted {
     seq: Option<u64>,
     /// The log's LSN when this table was enlisted. ROLLBACK rewinds here.
     lsn: u64,
+    /// Set when this table took a mutation the log cannot express -- a
+    /// positional sweep on a table with no single-column primary key. COMMIT
+    /// makes it durable by folding the parts to disk instead; see
+    /// [`Session::fold_to_parts`].
+    fold: bool,
 }
 
 /// Transaction control. Not in the SQL grammar -- `src/sql` is not this
@@ -405,24 +485,21 @@ impl Session {
     ///
     /// The delete counterpart to [`Session::log_insert`], with the same two
     /// durability rules -- and one more that only a bulk statement needs: the
-    /// enlistment and the log-handle lookup are hoisted out of the loop. Doing
-    /// them per record costs a linear scan of the transaction's table list and
-    /// a string compare, which was free when a statement logged one record and
-    /// is not when it logs a million.
+    /// enlistment, the log-handle lookup *and the write* are hoisted out of
+    /// the loop. Doing the first two per record costs a linear scan of the
+    /// transaction's table list and a string compare; doing the third per
+    /// record costs a syscall, which on a nineteen-byte record is the entire
+    /// operation. Measured on a 50 000-row `DELETE` through a persistent
+    /// session, best-of-5 interleaved: 881 ms per-record, 6.9 ms batched --
+    /// **127x**, and the residue is the sweep plus the single fsync. The
+    /// table of sizes is next to the mutation section below.
     fn log_deletes(&mut self, path: &str, lanes: &[u64]) -> Result<()> {
         let seq = self.enlist(path)?;
         let Some(w) = self.wal_for(path)? else { return Ok(()) };
         match seq {
-            Some(s) => {
-                for &l in lanes {
-                    w.append_delete_staged(s, l)?;
-                }
-                Ok(())
-            }
+            Some(s) => w.append_deletes_staged(s, lanes).map(|_| ()),
             None => {
-                for &l in lanes {
-                    w.append_delete(l)?;
-                }
+                w.append_deletes(lanes)?;
                 w.sync()
             }
         }
@@ -439,11 +516,18 @@ impl Session {
     ///
     /// Costs one `Option` write: no table is touched and no log is opened
     /// until the transaction actually writes to one.
+    ///
+    /// A nested `BEGIN` is refused **and poisons the transaction it found**.
+    /// Leaving the outer one merely open was the whole bug: the inner block
+    /// then ran to its own `COMMIT`, which durably committed the outer
+    /// transaction's uncommitted work at a boundary nobody had asked for.
+    /// Poisoning turns that premature commit into a refusal, which is the one
+    /// answer that cannot silently publish somebody else's rows.
     pub fn begin(&mut self) -> Result<()> {
-        if self.txn.is_some() {
-            return Err(Error::unsupported(
-                "a transaction is already open; nested transactions are not supported",
-            ));
+        if let Some(txn) = self.txn.as_mut() {
+            let msg = "a transaction is already open; nested transactions are not supported";
+            txn.poisoned.get_or_insert_with(|| msg.to_string());
+            return Err(Error::unsupported(msg));
         }
         self.txn = Some(Txn::default());
         Ok(())
@@ -454,6 +538,12 @@ impl Session {
     /// A failure anywhere in the durable half rolls the whole thing back, so
     /// COMMIT either happens or does not -- it never half-happens and then
     /// reports an error over a table that has already moved.
+    ///
+    /// A poisoned transaction is rolled back and the failure reported. It is
+    /// deliberately **not** an `Ok` that quietly discards (which is what
+    /// `COMMIT` did before, and what PostgreSQL reports as `ROLLBACK`): a
+    /// client that gets `Ok` from `COMMIT` is entitled to believe its writes
+    /// landed, and here they did not.
     pub fn commit(&mut self) -> Result<()> {
         // Taken up front so the durable half can borrow the roster while it
         // holds `&mut self` for the catalog and the logs -- the alternative is
@@ -462,6 +552,15 @@ impl Session {
         let Some(txn) = self.txn.take() else {
             return Err(Error::exec("COMMIT without an open transaction"));
         };
+        if let Some(why) = &txn.poisoned {
+            let e = Error::exec(format!(
+                "COMMIT refused and the transaction rolled back: an earlier statement \
+                 in it failed ({why})"
+            ));
+            self.txn = Some(txn);
+            let _ = self.rollback();
+            return Err(e);
+        }
         match self.commit_durable(&txn.tables) {
             Ok(()) => {
                 // Infallible: one pointer store per enlisted table. This is
@@ -471,6 +570,18 @@ impl Session {
                     if let Ok(t) = self.catalog.table_by_path_mut(&e.path) {
                         t.commit_txn();
                     }
+                }
+                // Strictly after the publish, and this is the one place where
+                // visibility precedes durability: `write_table` persists what
+                // `snapshot()` reports, which before `commit_txn` is still the
+                // private overlay, so folding first would put uncommitted rows
+                // on disk. Nothing can observe the gap -- `commit` is
+                // synchronous and a crash inside it takes the observer with it
+                // -- and a fold that fails reports an error over a
+                // transaction that is visible but not yet durable, which is
+                // the same shape as the multi-table caveat in the module docs.
+                for e in txn.tables.iter().filter(|e| e.fold) {
+                    self.fold_to_parts(&e.path)?;
                 }
                 Ok(())
             }
@@ -484,17 +595,48 @@ impl Session {
         }
     }
 
+    /// Refuse a statement when the open transaction has already failed.
+    ///
+    /// One `Option` test on the fast path; `None` for every autocommit
+    /// statement and for every healthy transaction.
+    #[inline]
+    fn check_poisoned(&self) -> Result<()> {
+        match self.txn.as_ref().and_then(|t| t.poisoned.as_deref()) {
+            None => Ok(()),
+            Some(why) => Err(poisoned_err(why)),
+        }
+    }
+
+    /// Record `e` as the reason the open transaction (if any) is poisoned, and
+    /// hand it back unchanged.
+    #[cold]
+    fn poison(&mut self, e: Error) -> Error {
+        if let Some(txn) = self.txn.as_mut() {
+            txn.poisoned.get_or_insert_with(|| e.to_string());
+        }
+        e
+    }
+
     /// The fallible half of COMMIT: flush the buffered rows into each overlay,
     /// then fsync a commit marker into each enlisted log.
     ///
     /// Durability strictly before visibility. Nothing has been published when
     /// this returns -- the overlays are still private -- so an error here is
     /// undone by dropping them.
+    ///
+    /// A *folding* table is the one exception, and it is deliberate: its
+    /// commit point is the `TABLE` rename inside [`Session::fold_to_parts`],
+    /// not a marker. Writing a marker as well would open a window in which the
+    /// log's `Insert` records are released but the sweep's tombstones are not
+    /// yet in a part -- a crash there would replay the inserts and resurrect
+    /// exactly the rows the statement deleted. With no marker, a crash before
+    /// the fold drops the whole staged group, which is what a COMMIT that did
+    /// not finish means.
     fn commit_durable(&mut self, tables: &[Enlisted]) -> Result<()> {
         for e in tables {
             self.catalog.table_by_path_mut(&e.path)?.flush()?;
         }
-        for e in tables {
+        for e in tables.iter().filter(|e| !e.fold) {
             let Some(seq) = e.seq else { continue };
             let w = self
                 .wals
@@ -563,8 +705,62 @@ impl Session {
             .as_mut()
             .expect("checked above")
             .tables
-            .push(Enlisted { path: path.to_string(), seq, lsn });
+            .push(Enlisted { path: path.to_string(), seq, lsn, fold: false });
         Ok(seq)
+    }
+
+    /// Note that `path` took a mutation the write-ahead log cannot describe,
+    /// so COMMIT has to make it durable by writing the parts out instead.
+    ///
+    /// `enlist` has always run first, so the entry is the last one pushed --
+    /// the reverse scan finds it on the first compare. With no transaction to
+    /// defer to (a direct API caller rather than `atomic_stmt`) the statement
+    /// is already committed, so the fold happens now instead: deferring to a
+    /// COMMIT that will never arrive is how a durability hole is built.
+    fn mark_fold(&mut self, path: &str) -> Result<()> {
+        if let Some(txn) = self.txn.as_mut() {
+            if let Some(e) = txn.tables.iter_mut().rev().find(|e| e.path == path) {
+                e.fold = true;
+                return Ok(());
+            }
+        }
+        self.fold_to_parts(path)
+    }
+
+    /// Checkpoint **one** table: flush it, write its parts and commit record,
+    /// then discard the log those parts now cover.
+    ///
+    /// This is the durability device for a positional sweep -- see
+    /// [`Session::apply_sweep`]. It is deliberately not [`Session::checkpoint`],
+    /// which walks every table in the catalog: the mutation touched one, and
+    /// rewriting the rest would make an unrelated table's size a cost of this
+    /// statement.
+    ///
+    /// The write ordering is `save_catalog`'s, and it is the ordering the
+    /// persist module docs prove: commit the parts with the log watermark they
+    /// cover, *then* truncate the log and reset the watermark. A crash in the
+    /// window replays a covered prefix (harmless, the watermark skips it) or
+    /// leaves a log shorter than the recorded watermark, which `load_catalog`
+    /// detects and repairs.
+    fn fold_to_parts(&mut self, path: &str) -> Result<()> {
+        let Some(root) = self.catalog.dir().map(Path::to_path_buf) else { return Ok(()) };
+        let (db, tbl) = path.split_once('.').unwrap_or(("default", path));
+        let t = self.catalog.table_by_path_mut(path)?;
+        // A `Memory` table is defined to vanish on restart, so there is
+        // nothing to make durable and nowhere to write it.
+        if !t.def.engine.is_persistent() {
+            return Ok(());
+        }
+        t.flush()?;
+        crate::persist::write_table(&root.join(db), t)?;
+        let tdir = root.join(db).join(tbl);
+        // Through the cached handle rather than a fresh `Wal::open`, so the
+        // session's idea of the log's length stays correct; reopening behind
+        // the cache is what forces `Session::checkpoint` to drop it.
+        if let Some(w) = self.wal_for(path)? {
+            w.truncate()?;
+        }
+        crate::persist::store::set_wal_committed(&tdir, crate::persist::format::HEADER_LEN as u64)
     }
 
     /// Run `f` as one atomic statement.
@@ -626,10 +822,19 @@ impl Session {
         if mentions_txn_keyword(sql) {
             return self.run_mixed(sql);
         }
-        let stmts = parse(sql)?;
+        // Poisoning is applied here rather than inside `exec_statement`,
+        // because a parse error is a statement that failed too -- and one that
+        // never reaches `exec_statement`.
+        let stmts = match parse(sql) {
+            Ok(s) => s,
+            Err(e) => return Err(self.poison(e)),
+        };
         let mut out = Vec::with_capacity(stmts.len());
         for s in &stmts {
-            out.push(self.exec_statement(s)?);
+            match self.exec_statement(s) {
+                Ok(rs) => out.push(rs),
+                Err(e) => return Err(self.poison(e)),
+            }
         }
         Ok(out)
     }
@@ -659,6 +864,9 @@ impl Session {
             match txn_stmt(span) {
                 Some(t) => {
                     let t0 = Instant::now();
+                    // ROLLBACK is the way *out* of a poisoned transaction, so
+                    // it is the one statement that must still run; BEGIN and
+                    // COMMIT poison or report on their own.
                     match t {
                         TxnStmt::Begin => self.begin()?,
                         TxnStmt::Commit => self.commit()?,
@@ -672,8 +880,15 @@ impl Session {
                     // The statement's own text, from its first token to the
                     // semicolon that ended it (or the end of the input).
                     let end = if i == toks.len() { sql.len() } else { toks[i].pos };
-                    for s in &parse(&sql[span[0].pos..end])? {
-                        out.push(self.exec_statement(s)?);
+                    let stmts = match parse(&sql[span[0].pos..end]) {
+                        Ok(s) => s,
+                        Err(e) => return Err(self.poison(e)),
+                    };
+                    for s in &stmts {
+                        match self.exec_statement(s) {
+                            Ok(rs) => out.push(rs),
+                            Err(e) => return Err(self.poison(e)),
+                        }
                     }
                 }
             }
@@ -683,6 +898,11 @@ impl Session {
 
     fn exec_statement(&mut self, stmt: &Statement) -> Result<ResultSet> {
         let t0 = Instant::now();
+        // Nothing runs in a transaction that has already failed. Returning
+        // `Ok` here is the shape of the bug: the statement's writes go into an
+        // overlay the session is committed to discarding, and the client is
+        // told they landed.
+        self.check_poisoned()?;
         // DDL persists itself immediately (see the checkpoint below), and a
         // checkpoint inside a transaction would write out uncommitted parts.
         // Refused rather than silently promoted to an implicit commit, which
@@ -1308,6 +1528,35 @@ impl Session {
     // keep in step. The zone maps already answer that case by header check:
     // deleting one row by key out of 200 000 measures 0.053 ms end to end,
     // parse and publish included.
+    //
+    // ## What a *persistent* session pays on top, measured
+    //
+    // The sweep above is the in-memory half. On disk the statement also has to
+    // become durable, and that is where the time actually went. Numbers below
+    // are A/B interleaved (best-of-5 per side, alternating) on a table
+    // checkpointed first, so the log starts empty:
+    //
+    // ```text
+    //   persistent DELETE, rows hidden    per-record log     batched      speedup
+    //         1 000                          20.80 ms       5.81 ms        3.6x
+    //         5 000                          91.86 ms      10.00 ms        9.2x
+    //        50 000                         880.67 ms       6.91 ms      127.5x
+    // ```
+    //
+    // The old shape framed and `write(2)`-ed one nineteen-byte record per
+    // hidden row, so the syscall *was* the statement -- 17.7 us per row, four
+    // orders of magnitude above the 0.008 us the sweep itself spends. One
+    // buffer and one write per statement leaves the cost flat in the row
+    // count, which is what "bulk" was supposed to mean. See
+    // `Wal::append_deletes`.
+    //
+    // The unkeyed route pays a table fold instead of a log write, and it is
+    // dominated by fsync rather than by size -- 53.6 ms to delete 5 000 rows
+    // of 10 000, 61.3 ms to delete 50 000 of 100 000, against 0.12 ms and
+    // 0.81 ms for the same sweeps with logging off. That is the price of
+    // durability without a durable row identity, and at bulk sizes it is
+    // still an order of magnitude *under* what the keyed log path cost before
+    // this change.
 
     fn run_alter_delete(
         &mut self,
@@ -1378,7 +1627,17 @@ impl Session {
             if let Some(sw) = &sweep {
                 s.apply_sweep(&path, sw)?;
             }
-            s.update_blocks(&path, blocks)
+            // `carried` is exactly "the key is written back unchanged", which
+            // is the only case where the re-insert is *meant* to land on top
+            // of an existing key. Everything else assigns the key, so the
+            // sweep has already retired every row this statement rewrites, and
+            // a key that still has a live row belongs to a row the statement
+            // did not name -- overwriting it is data loss, not an update.
+            let mode = match carried {
+                true => KeyConflict::Replace,
+                false => KeyConflict::Reject,
+            };
+            s.update_blocks(&path, blocks, mode)
         })
         .map(ResultSet::with_affected)
     }
@@ -1397,23 +1656,40 @@ impl Session {
         Sweep::of(optimizer::optimize(m.source)?)
     }
 
-    /// Apply one bulk delete: hide the rows, log the keys, one publish.
+    /// Apply one bulk delete: hide the rows, make them durable, one publish.
+    ///
+    /// ## Two durability routes, because a row's identity is not always a key
+    ///
+    /// The log's delete record names a primary-key *lane*
+    /// ([`crate::persist::Wal::append_delete`]), which is a value and therefore
+    /// survives anything that moves the row. When the table has one that is
+    /// the whole story: hide the rows, log a lane each, done in O(parts).
+    ///
+    /// A table with only `ORDER BY`, or with a composite `PRIMARY KEY`, has no
+    /// such lane -- and that is the *default* MergeTree shape, so refusing (as
+    /// this did) left the most ordinary persistent table unable to take a
+    /// DELETE or an UPDATE at all. The sweep hides rows by position, and the
+    /// obvious record for that is the position, `(part, row)`. It is not
+    /// sound here and it is worth writing down why, because the shape looks
+    /// right: replay reconstructs the table as *checkpointed parts + the log*,
+    /// and a part built after the checkpoint exists only as the `Insert`
+    /// records that fed it. Whether those rows end up in one part or three
+    /// depends on when the delta happened to flush and whether auto-compaction
+    /// fired -- neither of which is in the log -- so `(part, row)` captured at
+    /// runtime names a different row after recovery, or none. Making it sound
+    /// needs a durable row identity (a per-row id, 8 bytes on every row of
+    /// every table) or logged part boundaries (a flush/merge record, and
+    /// replay driving them). Both are real work; a positional record without
+    /// one of them is a silently wrong answer waiting for a crash.
+    ///
+    /// So the unkeyed sweep is made durable the other way: the rows are hidden
+    /// in memory and COMMIT writes the table's parts out, delete masks and
+    /// all, then discards the log those parts now cover
+    /// ([`Session::fold_to_parts`]). That is one table rewrite per mutating
+    /// *statement* -- not per row, and not the whole catalog -- and it is
+    /// exact rather than probably-exact.
     fn apply_sweep(&mut self, path: &str, sweep: &Sweep) -> Result<usize> {
-        // Refused before anything is touched. A positional delete has no
-        // write-ahead representation -- the log's only delete record names a
-        // primary-key *lane* (`Wal::append_delete`), and a table with no
-        // single-column key has no lane to name. In memory that is fine, there
-        // being no log and nothing to recover; on a logging session,
-        // acknowledging it would mean a crash silently resurrects the rows,
-        // and for an UPDATE replays the append without its tombstone and
-        // duplicates them. Refused rather than corrupted.
-        if self.wal_enabled && self.catalog.table_by_path(path)?.pk_col().is_none() {
-            return Err(Error::unsupported(format!(
-                "`{path}` has no single-column primary key, so its deleted rows cannot be \
-                 written to the log; the mutation would not survive a crash. Add \
-                 `PRIMARY KEY <col>`, or run it on an in-memory session"
-            )));
-        }
+        let keyed = self.catalog.table_by_path(path)?.pk_col().is_some();
         // Enlisted unconditionally, and this is load-bearing:
         // `Table::edit`/`publish` redirect into the transaction's private
         // overlay only once `begin_txn` has run on that table, and `enlist` is
@@ -1422,25 +1698,33 @@ impl Session {
         // straight into the committed set and ROLLBACK would have nothing to
         // drop.
         self.enlist(path)?;
-        // Only a logging session needs the lanes, and asking for them costs a
-        // packed-lane read per hidden row plus a `Vec` that grows to the
-        // affected count. An in-memory delete of a million rows should pay
-        // neither, so the sink is `None` unless there is a log to feed; the
-        // guard above has already established that a log implies a key.
+        // Only a *logging, keyed* sweep needs the lanes, and asking for them
+        // costs a packed-lane read per hidden row plus a `Vec` that grows to
+        // the affected count. An in-memory delete of a million rows should pay
+        // neither, and neither should the unkeyed path, whose durability comes
+        // from the parts.
+        let want_lanes = self.wal_enabled && keyed;
         let mut keys = Vec::new();
         let n = self.catalog.table_by_path_mut(path)?.delete_where_keys(
             &sweep.projection,
             sweep.pred.as_ref(),
             &sweep.zone,
-            self.wal_enabled.then_some(&mut keys),
+            want_lanes.then_some(&mut keys),
         )?;
         if !keys.is_empty() {
             self.log_deletes(path, &keys)?;
+        } else if n > 0 && self.wal_enabled && !keyed {
+            self.mark_fold(path)?;
         }
         Ok(n)
     }
 
-    fn update_blocks(&mut self, path: &str, blocks: Vec<Block>) -> Result<usize> {
+    fn update_blocks(
+        &mut self,
+        path: &str,
+        blocks: Vec<Block>,
+        mode: KeyConflict,
+    ) -> Result<usize> {
         // Coalesced into one insert, not one per executor block. `Table::insert`
         // packs any batch at or above `BULK_INSERT_THRESHOLD` straight into a
         // part of its own, so feeding it 8192-row blocks one at a time built a
@@ -1460,7 +1744,11 @@ impl Session {
         // where there is no key the sweep's tombstones were logged just above.
         self.log_insert(path, &acc)?;
         let t = self.catalog.table_by_path_mut(path)?;
-        let n = t.insert(acc)?;
+        // Logged before it is attempted, and rejected *after*: that ordering
+        // is exactly what the staged-record form exists for. The statement
+        // runs inside `atomic_stmt`, so a refusal here rolls the transaction
+        // back and `Wal::rewind_to` erases the record the write never earned.
+        let n = t.insert_with(acc, mode)?;
         t.flush()?;
         Ok(n)
     }
@@ -1822,6 +2110,14 @@ impl Sweep {
             zone: node.zone_filters,
         }))
     }
+}
+
+#[cold]
+fn poisoned_err(why: &str) -> Error {
+    Error::exec(format!(
+        "the transaction cannot continue: an earlier statement in it failed ({why}). \
+         ROLLBACK to start again"
+    ))
 }
 
 #[cold]
@@ -2372,13 +2668,17 @@ mod tests {
 
     /// DDL checkpoints, and a checkpoint inside a transaction would persist
     /// parts a ROLLBACK is still entitled to erase. Both doors are shut.
+    ///
+    /// Partly inverted: the refusal is unchanged, but it no longer leaves the
+    /// transaction usable. A statement that fails inside a transaction poisons
+    /// it, so each refusal is tested in a transaction of its own -- the old
+    /// shape ran all four in one and then committed, which is exactly the
+    /// "statements after a failure return Ok and are discarded" hole.
     #[test]
     fn ddl_and_checkpoint_are_refused_inside_a_transaction() {
         let s = Scratch::new("session-txn-ddl");
         let mut db = Session::open(s.path()).unwrap();
         db.execute(KEYED).unwrap();
-        db.execute("BEGIN").unwrap();
-        db.execute("INSERT INTO t VALUES (1, 10)").unwrap();
 
         for ddl in [
             "CREATE TABLE u (id UInt64) ENGINE = MergeTree ORDER BY id",
@@ -2386,12 +2686,22 @@ mod tests {
             "TRUNCATE TABLE t",
             "ALTER TABLE t ADD COLUMN w Int64",
         ] {
+            db.execute("BEGIN").unwrap();
+            db.execute("INSERT INTO t VALUES (1, 10)").unwrap();
             let e = db.execute(ddl).unwrap_err();
             assert_eq!(e.code(), "NOT_IMPLEMENTED", "{ddl}: {e}");
+            // Poisoned, so the rows it wrote can only be discarded.
+            assert_eq!(db.execute("COMMIT").unwrap_err().code(), "EXECUTION_ERROR");
+            assert!(!db.in_transaction(), "{ddl}: a refused COMMIT still ends the transaction");
+            assert_eq!(count(&mut db), 0, "{ddl}: the poisoned transaction published rows");
         }
-        assert_eq!(db.checkpoint().unwrap_err().code(), "NOT_IMPLEMENTED");
 
-        // The transaction is untouched by all of that, and still commits.
+        db.execute("BEGIN").unwrap();
+        db.execute("INSERT INTO t VALUES (1, 10)").unwrap();
+        assert_eq!(db.checkpoint().unwrap_err().code(), "NOT_IMPLEMENTED");
+        // `checkpoint` is the direct API, not a statement, so it reports
+        // without poisoning -- and the transaction it declined to persist
+        // still commits.
         assert_eq!(count(&mut db), 1);
         db.execute("COMMIT").unwrap();
         assert_eq!(count(&mut db), 1);
@@ -2428,6 +2738,12 @@ mod tests {
         assert_eq!((n(&mut s, "a"), n(&mut s, "b"), n(&mut s, "c")), (2, 3, 1));
     }
 
+    /// Partly inverted: the last line used to be `COMMIT` succeeding after a
+    /// refused nested `BEGIN`, which is the bug. A block that opens its own
+    /// transaction, finds one already open, and then commits was committing
+    /// the *outer* transaction's uncommitted work at a boundary the outer
+    /// writer never chose. The nested `BEGIN` now poisons, so the only way on
+    /// is ROLLBACK.
     #[test]
     fn commit_or_rollback_without_a_transaction_is_an_error() {
         let mut s = Session::in_memory();
@@ -2435,8 +2751,21 @@ mod tests {
         assert!(s.execute("COMMIT").is_err());
         assert!(s.execute("ROLLBACK").is_err());
         s.execute("BEGIN").unwrap();
+        s.execute("INSERT INTO t VALUES (1, 10)").unwrap();
         assert!(s.execute("BEGIN").is_err(), "nesting is refused");
+        assert!(s.in_transaction(), "and leaves the outer transaction open");
+        assert!(s.execute("COMMIT").is_err(), "which it must not publish");
+        assert!(!s.in_transaction());
+        assert_eq!(count(&mut s), 0, "the nested block's COMMIT committed the outer work");
+
+        // ROLLBACK is the way out, and after it the session is ordinary again.
+        s.execute("BEGIN").unwrap();
+        assert!(s.execute("BEGIN").is_err());
+        s.execute("ROLLBACK").unwrap();
+        s.execute("BEGIN").unwrap();
+        s.execute("INSERT INTO t VALUES (1, 10)").unwrap();
         s.execute("COMMIT").unwrap();
+        assert_eq!(count(&mut s), 1);
     }
 
     /// The interception must not shadow ordinary SQL. A string literal, a
@@ -2703,36 +3032,40 @@ mod tests {
         assert!(u.contains("Scan default.t [id, a, b]"), "{u}");
     }
 
-    /// A positional delete has no write-ahead representation, so a logging
-    /// session must refuse it rather than acknowledge a mutation a crash would
-    /// silently undo. The same statement is fine in memory, and fine on disk
-    /// once the table has a key to log by.
+    /// Inverted. This test used to assert that a logging session **refuses**
+    /// an unkeyed mutation, because a positional sweep has no write-ahead
+    /// representation. That was true of the log and false of durability as a
+    /// whole: `apply_sweep` now makes such a statement durable by folding the
+    /// table's parts to disk at COMMIT (see [`Session::fold_to_parts`]), so
+    /// the most ordinary persistent shape -- `ENGINE = MergeTree ORDER BY id`,
+    /// no PRIMARY KEY -- can be mutated at all. What the test pins now is that
+    /// the mutation lands *and survives a reopen with no explicit checkpoint*.
     #[test]
-    fn an_unkeyed_mutation_is_refused_on_a_logging_session() {
+    fn an_unkeyed_mutation_is_durable_on_a_logging_session() {
         let s = Scratch::new("session-unkeyed-mutation");
-        let mut db = Session::open(s.path()).unwrap();
-        db.execute("CREATE TABLE u (id UInt64, v Int64) ENGINE = MergeTree ORDER BY tuple()")
+        {
+            let mut db = Session::open(s.path()).unwrap();
+            db.execute("CREATE TABLE u (id UInt64, v Int64) ENGINE = MergeTree ORDER BY tuple()")
+                .unwrap();
+            db.execute("INSERT INTO u VALUES (1,10),(2,20)").unwrap();
+            db.execute("DELETE FROM u WHERE id = 1").unwrap();
+            assert_eq!(vals(&mut db, "SELECT count() FROM u")[0][0], Value::UInt(1));
+            db.execute("UPDATE u SET v = 99 WHERE id = 2").unwrap();
+            assert_eq!(vals(&mut db, "SELECT v FROM u WHERE id = 2")[0][0], Value::Int(99));
+
+            // With a key, the same shapes work through the log instead.
+            db.execute(
+                "CREATE TABLE k (id UInt64, v Int64) ENGINE = MergeTree PRIMARY KEY id ORDER BY id",
+            )
             .unwrap();
-        db.execute("INSERT INTO u VALUES (1,10),(2,20)").unwrap();
-
-        let err = db.execute("DELETE FROM u WHERE id = 1").unwrap_err();
-        assert_eq!(err.code(), "NOT_IMPLEMENTED", "{err}");
-        assert!(err.to_string().contains("PRIMARY KEY"), "{err}");
-        // Refused means refused: nothing was hidden on the way out.
-        assert_eq!(vals(&mut db, "SELECT count() FROM u")[0][0], Value::UInt(2));
-        assert!(db.execute("UPDATE u SET v = 1 WHERE id = 1").is_err());
-        assert_eq!(vals(&mut db, "SELECT v FROM u WHERE id = 1")[0][0], Value::Int(10));
-
-        // With a key, the same shapes work and survive a checkpoint.
-        db.execute(
-            "CREATE TABLE k (id UInt64, v Int64) ENGINE = MergeTree PRIMARY KEY id ORDER BY id",
-        )
-        .unwrap();
-        db.execute("INSERT INTO k VALUES (1,10),(2,20),(3,30)").unwrap();
-        db.execute("DELETE FROM k WHERE id = 2").unwrap();
-        db.checkpoint().unwrap();
-        drop(db);
+            db.execute("INSERT INTO k VALUES (1,10),(2,20),(3,30)").unwrap();
+            db.execute("DELETE FROM k WHERE id = 2").unwrap();
+        }
+        // No checkpoint, no clean shutdown: whatever survives is what the
+        // statements themselves made durable.
         let mut db = Session::open(s.path()).unwrap();
+        assert_eq!(vals(&mut db, "SELECT count() FROM u")[0][0], Value::UInt(1));
+        assert_eq!(vals(&mut db, "SELECT v FROM u WHERE id = 2")[0][0], Value::Int(99));
         assert_eq!(vals(&mut db, "SELECT count() FROM k")[0][0], Value::UInt(2));
     }
 
