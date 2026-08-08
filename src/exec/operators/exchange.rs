@@ -1174,11 +1174,14 @@ mod tests {
             "SELECT count(*) FROM t WHERE id % 3 = 0",
             "SELECT k, count(*) FROM t WHERE k = 99 GROUP BY k",
             // ORDER BY: full sorts on both strategies, and top-K
-            "SELECT id FROM t ORDER BY id DESC",
+            // NOTE: `ORDER BY id [DESC]` is deliberately absent. `t` is
+            // `ORDER BY id`, so those are sort-eliminated now and read in
+            // storage order without a sort or a fan-out. They are asserted
+            // below instead, because "declines the exchange" is the RIGHT
+            // answer for them and this list means "must parallelise".
             "SELECT k, id FROM t ORDER BY k",
             "SELECT s, id FROM t ORDER BY s, id DESC",
             "SELECT n FROM t ORDER BY n",
-            "SELECT id FROM t ORDER BY id LIMIT 10",
             "SELECT k, id FROM t ORDER BY k LIMIT 100",
             "SELECT s, k FROM t ORDER BY s, k DESC LIMIT 25",
             "SELECT id FROM t ORDER BY f DESC LIMIT 7",
@@ -1190,6 +1193,26 @@ mod tests {
             assert!(goes_parallel(&mut s, q), "the exchange declined `{q}`");
             let (serial, parallel) = both(&mut s, q);
             assert_eq!(parallel, serial, "parallel disagrees with serial on `{q}`");
+        }
+
+        // The sort-key-prefix shapes. Declining the exchange is correct here --
+        // there is no sort to parallelise -- but the ANSWER still has to be the
+        // one a sort would have produced, and a fast wrong order is the failure
+        // mode sort elimination actually has. Checked against the same query
+        // with the key wrapped so the ordering property is hidden from the
+        // planner and the sort runs for real.
+        for (fast, forced) in [
+            ("SELECT id FROM t ORDER BY id", "SELECT id FROM t ORDER BY id + 0"),
+            ("SELECT id FROM t ORDER BY id LIMIT 10", "SELECT id FROM t ORDER BY id + 0 LIMIT 10"),
+            ("SELECT id FROM t ORDER BY id DESC", "SELECT id FROM t ORDER BY id + 0 DESC"),
+            (
+                "SELECT id FROM t ORDER BY id DESC LIMIT 10",
+                "SELECT id FROM t ORDER BY id + 0 DESC LIMIT 10",
+            ),
+        ] {
+            let (a, _) = both(&mut s, fast);
+            let (b, _) = both(&mut s, forced);
+            assert_eq!(a, b, "sort elimination changed the order of `{fast}`");
         }
     }
 
@@ -1426,13 +1449,22 @@ mod tests {
             // never reaches a worker.
             "SELECT count(*), sum(k) FROM t WHERE id >= 500000",
             "SELECT k, count(*), min(id), max(id) FROM t WHERE id > 100000 GROUP BY k",
-            "SELECT id FROM t WHERE id >= 550000 ORDER BY id LIMIT 25",
             "SELECT s, count(DISTINCT k) FROM t WHERE id < 600000 GROUP BY s",
         ] {
             assert!(goes_parallel(&mut s, q), "the exchange declined `{q}`");
             let (serial, parallel) = both(&mut s, q);
             assert_eq!(parallel, serial, "{q}");
         }
+
+        // `ORDER BY id` on a table keyed by `id` is sort-eliminated even with a
+        // predicate in front of it, so it declines the exchange on purpose --
+        // there is no sort left to fan out. What still has to hold, across
+        // several parts and a live delete bitmap, is the order itself.
+        let fast = "SELECT id FROM t WHERE id >= 550000 ORDER BY id LIMIT 25";
+        let forced = "SELECT id FROM t WHERE id >= 550000 ORDER BY id + 0 LIMIT 25";
+        let (a, _) = both(&mut s, fast);
+        let (b, _) = both(&mut s, forced);
+        assert_eq!(a, b, "sort elimination changed the order across parts");
     }
 
     // ------------------------------------------------- the plan node and ANALYZE

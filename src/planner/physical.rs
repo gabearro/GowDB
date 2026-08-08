@@ -6,7 +6,7 @@
 //! was a 1:1 structural mapping from [`LogicalPlan`] to operators, with no
 //! place to put a decision even if one had been obvious.
 //!
-//! Four decisions live here today.
+//! Five decisions live here today.
 //!
 //! ## 1. Index selection
 //!
@@ -33,6 +33,12 @@
 //! nothing) *and* costs the scan an O(list) membership test per row. The
 //! remaining 3.6 us is almost entirely front end -- `SELECT 1` costs 1.2 us on
 //! the same build.
+//!
+//! `id = 1 OR id = 2` is the same predicate written the other way and used to
+//! reach none of this: `split_conjuncts` stops at an `OR`, so the disjunction
+//! arrived at [`key_set`] as one conjunct and matched no shape. It now folds
+//! into the same probe list -- 333x on 1M rows, with the measurements and the
+//! refusals next to the code.
 //!
 //! The negative cases matter as much, and were measured the same way: full
 //! scans, range scans, `GROUP BY`, a predicate on a non-key column, `id > k`,
@@ -148,6 +154,16 @@
 //! reduction the granule size buys; a string column pays three times as much
 //! because every bound is decoded through that granule's own dictionary.
 //!
+//! ### Reaching it through a derived table
+//!
+//! `SELECT count() FROM (SELECT k FROM t) u` binds to `Aggregate` over
+//! `Project` over `Scan`: the subquery is inlined, but its column list survives
+//! as a projection, and the fold used to insist on sitting *directly* on the
+//! scan. So the commonest way to write a subquery lost the fold entirely, on a
+//! query whose answer is a row count. A column projection cannot add or drop a
+//! row, so [`meta_source`] looks through it -- 128x on 1M rows, with the table
+//! of measurements there.
+//!
 //! ### Why a filtered count is the general case
 //!
 //! A granule whose zone map proves that *every* row matches the predicate
@@ -189,6 +205,77 @@
 //!   `ScanNode::zone_filters`, which is a deliberately lossy summary (an `IN`
 //!   list becomes a `[min, max]` range) and would over-count if trusted as an
 //!   equivalent.
+//!
+//! ## 5. Reading in the order it is already stored in
+//!
+//! `SELECT k FROM t ORDER BY k LIMIT 5` used to cost 0.41 ms against 0.009 ms
+//! for the same query without the `ORDER BY` -- a `TopK` under a 14-worker
+//! `Exchange`, to ask for the order the rows are already lying in. A `MergeTree`
+//! part *is* a sorted run and [`Scan`](PhysicalPlan::Scan) walks parts in set
+//! order and granules in part order, so for the right `ORDER BY` the sort was
+//! being asked to reproduce the order of its own input. [`read_in_order`] is
+//! the decision; there is no new operator, because the answer is that the sort
+//! should not be there.
+//!
+//! A/B interleaved in one loop with a temporary switch, the sides alternating
+//! which ran first, best-of-25 per side (best-of-9 for the unlimited sorts),
+//! 300k rows / 14 cores unless stated:
+//!
+//! ```text
+//!                                              sorted    read in order
+//!   ORDER BY k LIMIT 5                         0.414 ms    0.0085 ms   48.9x
+//!   ORDER BY k LIMIT 5, two columns            0.445       0.0145      30.7x
+//!   ORDER BY k LIMIT 1000                      0.496       0.0090      55.3x
+//!   ORDER BY k LIMIT 5 OFFSET 100000           0.606       0.0625       9.7x
+//!   ORDER BY k, no limit                       0.751       0.160        4.7x
+//!   ORDER BY k, no limit, two columns          1.001       0.399        2.5x
+//!   SELECT *, six columns, no limit            2.073       1.183        1.8x
+//!   WHERE k >= <99% cut> ORDER BY k LIMIT 5    0.084       0.0095       8.8x
+//!   WHERE k >= <99% cut> ORDER BY k            0.063       0.0092       6.9x
+//!   ORDER BY k LIMIT 5, four disjoint parts    0.344       0.0082      42.1x
+//!   ORDER BY k LIMIT 5, 1M rows                0.471       0.0087      57.9x
+//!   ORDER BY k, no limit, 1M rows              2.160       0.574        3.8x
+//! ```
+//!
+//! The `LIMIT` column is the point: with the sort gone the limit reaches the
+//! scan, so the query reads one granule instead of the table, and the figure is
+//! flat in the table size (0.0085 ms at 300k, 0.0087 ms at 1M) where the sort
+//! it replaces is not. Without a `LIMIT` the win is smaller and comes from
+//! somewhere else -- the read streams instead of materializing the relation and
+//! sorting it.
+//!
+//! ### The negative case this rule really has, and the gate for it
+//!
+//! Dropping the sort also drops the `Exchange` that was wrapped round it, so
+//! the scan underneath goes from 14 workers to one. That is repaid many times
+//! over when the ordered read touches fewer rows -- but a predicate the zone
+//! maps cannot decide prunes nothing, so the read walks the whole table either
+//! way and the only thing that changed is that it lost 13 cores:
+//!
+//! ```text
+//!   WHERE v = 42 ORDER BY k LIMIT 5   (300k)  0.156 ms -> 0.354 ms  0.44x
+//!   WHERE v = 42 ORDER BY k           (300k)  0.162    -> 0.352     0.46x
+//!   WHERE v = 42 ORDER BY k LIMIT 5   (1M)    0.341    -> 1.161     0.29x
+//! ```
+//!
+//! The loss grows with the table because it is the parallel scan that was
+//! carrying the query: `v = 42` matches 300 of 300k rows, so the sort being
+//! replaced was sorting 300 rows and cost nothing to begin with. So the PREWHERE
+//! list has to be one the *sort column* decides, or not exist -- the same gate
+//! `meta_path` has, for the same reason, and with it every shape above is
+//! between 0.97x and 1.07x. The one thing given up is a wide off-key filter with
+//! no limit (`WHERE v < 900 ORDER BY k`, 1.29x, where the sort really was the
+//! cost); 1.29x on a machine that swings 30% is not worth the 0.29x next to it.
+//!
+//! ### What this is invisible in
+//!
+//! `EXPLAIN PIPELINE` shows the sort *absent*, which is the truth but not a
+//! statement. Every other decision in this file names itself in the plan text
+//! (`IndexLookup`, `MetaAggregate`, `Exchange n workers`) and this one cannot,
+//! because saying it needs a pass-through `PhysicalPlan` variant and every
+//! variant needs an arm in `exec::operators::build_physical`, which is not this
+//! task's file. The tests in `tests/plan_access_paths.rs` assert the absence
+//! instead.
 //!
 //! ## What this is deliberately *not*
 //!
@@ -465,6 +552,9 @@ fn lower_at<'a>(
         LogicalPlan::Window { input, node } => {
             PhysicalPlan::Window { input: Box::new(lower_at(input, catalog, d, false)?), node }
         }
+        // The rows are already in this order on disk, so the cheapest sort is
+        // the one that does not run. See `read_in_order`.
+        LogicalPlan::Sort { input, keys } if read_in_order(input, keys, catalog) => *down(input)?,
         LogicalPlan::Sort { input, keys } => fan_out(
             PhysicalPlan::Sort { input: down(input)?, keys, fetch: None },
             catalog,
@@ -635,6 +725,47 @@ fn key_set(e: &BoundExpr, col: usize, ty: &DataType) -> Option<Vec<u64>> {
             };
             vec![exact_lane(v, ty)?]
         }
+        // `id = 1 OR id = 2` is `id IN (1, 2)` written the other way, and it is
+        // how people write two keys. It never reached the index because
+        // `split_conjuncts` stops at an `OR`, so the whole disjunction arrived
+        // here as one conjunct and matched neither arm above -- a full table
+        // scan for a query that names its rows. A/B interleaved in one loop
+        // with a temporary switch, best-of-15 per side, 1M rows:
+        //
+        // ```text
+        //   WHERE id = 1 OR id = 2                    2.07 ms -> 6.2 us   333x
+        //   WHERE id = 1 OR id = 2 OR id = 3 OR id = 4 3.24 ms -> 8.5 us   383x
+        //   WHERE id IN (1, 2) OR id = 3              3.78 ms -> 6.9 us   550x
+        //   WHERE (id = 1 OR id = 2) AND v >= 0       2.17 ms -> 8.3 us   261x
+        //   count() WHERE id = 10 OR id = 900000       499 us -> 7.9 us    63x
+        // ```
+        //
+        // and the shapes it must not touch, measured the same way, all 1.0x:
+        // `id = 1 OR v = 2`, `id = 1 OR id > 2`, `id = 1 OR id = 5.5`,
+        // `NOT (id = 1 OR id = 2)`, plain `id = 1`, `v = 1`.
+        //
+        // **Every** disjunct has to be a key equality. One that is not admits
+        // rows no probe would find, and the index is only allowed to
+        // over-produce candidates, never to miss one.
+        BoundExpr::Binary { op: BinaryOp::Or, .. } => {
+            let mut out = Vec::new();
+            let mut ok = true;
+            or_disjuncts(e, &mut |d| {
+                if !ok {
+                    return;
+                }
+                match key_set(d, col, ty) {
+                    // A nested `IN` list is a disjunct like any other, so
+                    // `id IN (1, 2) OR id = 3` folds into one probe list.
+                    Some(k) => out.extend(k),
+                    None => ok = false,
+                }
+            });
+            if !ok {
+                return None;
+            }
+            out
+        }
         BoundExpr::InList { expr, list, negated: false } if expr.as_column() == Some(col) => {
             let mut out = Vec::with_capacity(list.len());
             for v in list {
@@ -657,6 +788,27 @@ fn key_set(e: &BoundExpr, col: usize, ty: &DataType) -> Option<Vec<u64>> {
     Some(keys)
 }
 
+/// Visit the leaves of an `OR` tree, the mirror of
+/// [`BoundExpr::split_conjuncts`].
+///
+/// A callback rather than a `Vec<&BoundExpr>`: the caller only folds, so there
+/// is no reason to build a list of leaves first. An explicit stack rather than
+/// recursion, because `k = 1 OR k = 2 OR ...` nests as deep as the query text is
+/// long -- `split_conjuncts` recurses and gets away with it because the parser
+/// caps depth, but one `Vec` at plan time is cheaper than depending on that.
+fn or_disjuncts(e: &BoundExpr, f: &mut dyn FnMut(&BoundExpr)) {
+    let mut stack = vec![e];
+    while let Some(cur) = stack.pop() {
+        match cur {
+            BoundExpr::Binary { left, op: BinaryOp::Or, right, .. } => {
+                stack.push(right);
+                stack.push(left);
+            }
+            leaf => f(leaf),
+        }
+    }
+}
+
 /// The stored lane for a literal, but only when the conversion loses nothing.
 ///
 /// `Value::to_lane` is lossy on purpose -- it is the *write* path, where the
@@ -672,7 +824,11 @@ fn key_set(e: &BoundExpr, col: usize, ty: &DataType) -> Option<Vec<u64>> {
 /// than short-circuiting to an empty result: the reasoning that gets from
 /// "inexact" to "matches nothing" runs through `Value`'s cross-representation
 /// ordering, and this is not a place to be clever for a query nobody writes.
-fn exact_lane(v: &Value, ty: &DataType) -> Option<u64> {
+/// `pub(crate)` for the index-nested-loop join, which turns each row of its
+/// build side into a probe key and needs *this* conversion rather than a second
+/// one: two spellings of "does this literal name a stored key" that disagreed
+/// would be a wrong answer on one path and not the other.
+pub(crate) fn exact_lane(v: &Value, ty: &DataType) -> Option<u64> {
     let phys = ty.base().physical();
     let lane = v.to_lane_phys(phys, ty).ok()?;
     let back = match phys {
@@ -762,10 +918,12 @@ fn meta_path<'a>(
     if !group.is_empty() || aggs.is_empty() {
         return None;
     }
-    // Directly over the scan, not over a `Filter` or a `Join`: the predicate
+    // Over the scan, not over a `Filter`, a `Limit` or a `Join`: the predicate
     // has to be the one the scan node carries, or the fallback the operator
-    // applies to a straddling granule would not be the query's predicate.
-    let LogicalPlan::Scan(node) = input else { return None };
+    // applies to a straddling granule would not be the query's predicate --
+    // and a `Limit` makes the count the limit's rather than the table's.
+    // Column projections *are* looked through; see [`meta_source`].
+    let (node, map) = meta_source(input)?;
 
     // A missing table is `Scan::new`'s error to raise, with the message the
     // tests expect -- so fall through silently, as `index_path` does.
@@ -848,7 +1006,7 @@ fn meta_path<'a>(
                 // The argument has to be a bare column of the scan, and a
                 // predicate would mean the extreme is over a subset the
                 // bounds do not describe.
-                let field = a.args.first()?.as_column()?;
+                let field = *map.get(a.args.first()?.as_column()?)?;
                 MetaAgg::Extreme { col: *node.projection.get(field)?, max: a.func.name == "max" }
             }
             _ => return None,
@@ -860,6 +1018,48 @@ fn meta_path<'a>(
         meta_degree((0..snap.len()).map(|i| snap.part(i).granule_count()).sum())
     };
     Some(MetaPath { node, schema, aggs, what, preds, workers })
+}
+
+/// The scan under an aggregate, seen through the projections a derived table
+/// leaves behind, plus the map from the aggregate's input columns back to the
+/// scan's projected ones.
+///
+/// `SELECT count() FROM (SELECT k FROM t) u` binds to `Aggregate` over
+/// `Project` over `Scan`: the subquery is inlined, but its column list stays as
+/// a projection. That projection neither adds nor drops a row, so the part
+/// headers answer the count exactly as they do one level down -- and without
+/// this the commonest way to write a subquery loses the fold entirely.
+/// Measured through the SQL front end, A/B interleaved in one loop with a
+/// temporary switch, best-of-25 per side, 1M rows / 14 cores:
+///
+/// ```text
+///   count() FROM (SELECT k FROM t) u      1.048 ms -> 6.9 us   152x
+///   min(k)  FROM (SELECT k FROM t) u      1.310 ms -> 9.6 us   137x
+/// ```
+///
+/// **Bare column references only.** A computed projection cannot change the row
+/// count either, but it can *fail* on a row the fold would never look at, and
+/// turning a query that raises into one that answers is not a change this
+/// decision gets to make on its own. `Limit` and `Filter` are refused for the
+/// reasons the caller's own comment gives.
+fn meta_source(plan: &LogicalPlan) -> Option<(&ScanNode, Vec<usize>)> {
+    // One `Vec` per aggregate at plan time, and nothing per row. `map[c]` is
+    // where output column `c` lives in the plan currently in hand, so a
+    // projection composes into it by one indirection per column.
+    let mut map: Vec<usize> = (0..plan.schema().len()).collect();
+    let mut plan = plan;
+    loop {
+        match plan {
+            LogicalPlan::Scan(s) => return Some((s, map)),
+            LogicalPlan::Project { input, exprs, .. } => {
+                for c in map.iter_mut() {
+                    *c = exprs.get(*c)?.as_column()?;
+                }
+                plan = input;
+            }
+            _ => return None,
+        }
+    }
 }
 
 /// Threads for a filtered fold's granule walk.
@@ -932,6 +1132,134 @@ fn negate(op: CmpOp) -> CmpOp {
         CmpOp::Gt => CmpOp::LtEq,
         CmpOp::GtEq => CmpOp::Lt,
     }
+}
+
+// ------------------------------------------------------- 5. sorted reads
+
+/// Does the stored order already answer this `ORDER BY`?
+///
+/// A `MergeTree` part *is* a sorted run, and `Scan` walks parts in set order
+/// and granules in part order, so for the right `ORDER BY` the sort operator is
+/// being asked to reproduce the order its own input arrived in.
+///
+/// Exactly **one** ascending key, and it has to be [`Table::sort_col`].
+///
+/// * *One* key, not a prefix of the sort key. A part is built sorted by the
+///   whole `order_by` tuple, but `Table::merge_parts` merges runs on the
+///   leading sort lane alone and breaks ties by part index -- so a *merged*
+///   part is sorted by `order_by[0]` and by nothing after it, and compaction
+///   runs off `flush`, which runs off every read. A prefix rule would be right
+///   until the first merge and silently wrong after it.
+/// * *Ascending*, because storage reads one way. A `DESC` read needs the scan
+///   to walk granules and rows backwards; that is a storage change, and the
+///   measured 0.5 ms this shape costs today is waiting for it.
+/// * `sort_col`, which already excludes an unsorted engine, a nullable key and
+///   a string key -- and being non-nullable is what makes `NULLS FIRST/LAST`
+///   vacuous here rather than a fourth condition to get wrong.
+///
+/// [`Table::sort_col`]: crate::storage::Table::sort_col
+fn read_in_order(input: &LogicalPlan, keys: &[SortKey], catalog: &Catalog) -> bool {
+    let [key] = keys else { return false };
+    if !key.asc {
+        return false;
+    }
+    let Some(field) = key.expr.as_column() else { return false };
+    let Some((node, col)) = ordered_source(input, field) else { return false };
+    let Ok(table) = catalog.table_by_path(&node.table) else { return false };
+    if table.sort_col() != Some(col) {
+        return false;
+    }
+    if table.has_pending_writes() {
+        return false;
+    }
+    // The PREWHERE list has to be one the *sort column* decides, or not exist.
+    //
+    // This is the gate, and it is the same one `meta_path` has for the same
+    // reason. Dropping the sort also drops the `Exchange` that was wrapped
+    // round it, so the scan underneath goes from 14 workers to one. That is
+    // paid back many times over when the ordered read touches fewer rows --
+    // but a predicate the zone maps cannot decide prunes nothing, so the read
+    // walks the whole table either way and the only thing that changed is that
+    // it lost 13 cores. Measured, A/B interleaved in one loop with a temporary
+    // switch, best-of-25 per side, 300k rows / 14 cores:
+    //
+    // ```text
+    //   ORDER BY k LIMIT 5                      0.378 -> 0.009   42.8x
+    //   ORDER BY k                              0.633 -> 0.155    4.1x
+    //   WHERE k >= <99% cut> ORDER BY k LIMIT 5 0.072 -> 0.010    7.6x
+    //   WHERE v = 42 ORDER BY k LIMIT 5         0.156 -> 0.354    0.44x
+    //   WHERE v = 42 ORDER BY k                 0.162 -> 0.352    0.46x
+    // ```
+    //
+    // and at 1M rows the same off-key shape is **0.34 -> 1.16 ms, 0.29x**: the
+    // loss grows with the table because it is the parallel scan that was
+    // carrying it. `v = 42` matches 300 of 300k rows, so the sort it replaces
+    // was sorting 300 rows and cost nothing to begin with.
+    //
+    // The one shape this gate gives up is a *wide* off-key filter with no
+    // limit -- `WHERE v < 900 ORDER BY k` measured 1.29x, because there the
+    // sort really was the cost. 1.29x on a machine that swings 30% is not
+    // worth the 0.29x next to it.
+    match meta_preds(&node.filters, &node.projection) {
+        Some(ps) if ps.iter().all(|p| p.pred.col == col) => {}
+        _ => return false,
+    }
+    parts_concatenate_in_order(&table.snapshot(), col)
+}
+
+/// The scan a column of `plan` comes from, and its **table** column index --
+/// provided every operator in between emits its rows in the order they arrived.
+///
+/// `Filter`, `Project` and `Limit` all do: they drop rows, rename them or cut
+/// the stream short, and none of them reorders. Everything else either shuffles
+/// (`Aggregate`, `Join`, `Distinct`, `Union`) or has no single scan under it,
+/// and falls through to `None`.
+///
+/// Iterative rather than recursive because it runs *before* `lower_at`'s depth
+/// guard has walked the subtree it is about to descend.
+fn ordered_source(mut plan: &LogicalPlan, mut col: usize) -> Option<(&ScanNode, usize)> {
+    loop {
+        match plan {
+            LogicalPlan::Scan(s) => return Some((s, *s.projection.get(col)?)),
+            LogicalPlan::Filter { input, .. } | LogicalPlan::Limit { input, .. } => plan = input,
+            LogicalPlan::Project { input, exprs, .. } => {
+                col = exprs.get(col)?.as_column()?;
+                plan = input;
+            }
+            _ => return None,
+        }
+    }
+}
+
+/// Do the parts, read back to back in set order, come out non-decreasing on
+/// lane `col`?
+///
+/// Each part is internally sorted, but the set is not: `PartSet::push` appends,
+/// and a merge appends its result, so part 0 can hold keys above part 1's. Two
+/// lane reads per part, capped at `AUTO_COMPACT_PARTS` parts, and the bounds
+/// are already cached on the granule for range pruning.
+///
+/// The bounds are *birth* bounds -- they describe the rows the part was built
+/// from, including any since deleted. That is the safe direction: a tombstone
+/// can only narrow the live range, so a set that concatenates in order by birth
+/// bounds still does with rows missing.
+fn parts_concatenate_in_order(snap: &crate::storage::part::Snapshot, col: usize) -> bool {
+    let mut prev: Option<u64> = None;
+    for p in snap.parts() {
+        // An empty part contributes no row, so it constrains nothing.
+        let (Some(lo), Some(hi)) = (p.granules.first(), p.granules.last()) else { continue };
+        // `sort_min`/`sort_max` are lanes of *this part's* sort column, so they
+        // mean nothing if that is not the column being asked about -- and a
+        // part built without one carries zeroes.
+        if p.sort_col != Some(col) {
+            return false;
+        }
+        if prev.is_some_and(|end| lo.sort_min < end) {
+            return false;
+        }
+        prev = Some(hi.sort_max);
+    }
+    true
 }
 
 // ------------------------------------------------------------------ EXPLAIN
@@ -1219,13 +1547,66 @@ mod tests {
             "SELECT v FROM t",
             // key compared to another column, not a constant
             "SELECT v FROM t WHERE id = v",
-            // OR is not a conjunct, so it never reaches the scan's filter list
-            "SELECT v FROM t WHERE id = 1 OR id = 2",
+            // one disjunct that is not a key equality admits rows no probe
+            // would find, so the whole disjunction has to be scanned
+            "SELECT v FROM t WHERE id = 1 OR v = 2",
+            "SELECT v FROM t WHERE id = 1 OR id > 2",
+            "SELECT v FROM t WHERE id = 1 OR (id = 2 AND v = 3)",
+            "SELECT v FROM t WHERE NOT (id = 1 OR id = 2)",
         ] {
             let e = phys(&mut s, q);
             assert!(!e.contains("IndexLookup"), "{q} should scan:\n{e}");
             assert!(e.contains("Scan default.t"), "{q}:\n{e}");
         }
+    }
+
+    #[test]
+    fn an_or_of_key_equalities_is_an_in_list_written_differently() {
+        let mut s = session("UInt64", 20_000);
+        let e = phys(&mut s, "SELECT v FROM t WHERE id = 1 OR id = 2");
+        assert!(e.contains("IndexLookup"), "{e}");
+        assert!(e.contains("(2 keys)"), "{e}");
+        // Nested, flipped, repeated and mixed with an `IN` -- all one probe
+        // list, deduplicated.
+        let e = phys(&mut s, "SELECT v FROM t WHERE id IN (1, 2) OR 3 = id OR id = 1");
+        assert!(e.contains("(3 keys)"), "{e}");
+        // The disjunction is still the residual, so an over-eager probe list
+        // could not change the answer even if one got through.
+        assert!(e.contains("residual="), "{e}");
+        assert_eq!(
+            s.query("SELECT v FROM t WHERE id = 1 OR id = 2").unwrap().to_values(),
+            [[Value::Int(3)], [Value::Int(6)]]
+        );
+        // One key repeated is one probe, not two rows.
+        assert_eq!(s.query("SELECT v FROM t WHERE id = 5 OR id = 5").unwrap().rows(), 1);
+        // A disjunct whose literal does not name a stored key takes the whole
+        // path away, rather than probing for the ones that do and losing the
+        // rows the scan would have found for the one that does not.
+        let e = phys(&mut s, "SELECT v FROM t WHERE id = 1 OR id = 5.5");
+        assert!(!e.contains("IndexLookup"), "{e}");
+    }
+
+    #[test]
+    fn or_disjuncts_flattens_either_nesting() {
+        let lit = |i: i64| BoundExpr::lit(Value::Int(i));
+        let or = |l: BoundExpr, r: BoundExpr| BoundExpr::Binary {
+            left: Box::new(l),
+            op: BinaryOp::Or,
+            right: Box::new(r),
+            ty: DataType::Bool,
+        };
+        // Left-nested is what the parser builds; right-nested is what a
+        // rewrite could leave behind. Both are three leaves, in order.
+        for e in [or(or(lit(1), lit(2)), lit(3)), or(lit(1), or(lit(2), lit(3)))] {
+            let mut seen = Vec::new();
+            or_disjuncts(&e, &mut |d| seen.push(d.to_string()));
+            assert_eq!(seen, ["1", "2", "3"]);
+        }
+        // A non-`OR` is one disjunct, which is what makes the fold in
+        // `key_set` uniform.
+        let mut seen = 0;
+        or_disjuncts(&lit(7), &mut |_| seen += 1);
+        assert_eq!(seen, 1);
     }
 
     #[test]
@@ -1509,6 +1890,85 @@ mod tests {
         }
         // ... and one more row asked for is a whole pipeline again.
         assert!(phys(&mut s, "SELECT v FROM t LIMIT 1").contains("Scan default.t"));
+    }
+
+    // ---------------------------------------------------- 5. sorted reads
+
+    #[test]
+    fn the_sort_that_the_storage_order_already_did() {
+        let mut s = session("UInt64", 20_000);
+        let e = phys(&mut s, "SELECT v FROM t ORDER BY id LIMIT 5");
+        assert!(!e.contains("Sort") && !e.contains("TopK"), "{e}");
+        // ... and with the sort gone there is nothing blocking left to fan
+        // out, so the limit reaches the scan instead of a fleet.
+        assert!(!e.contains("Exchange"), "{e}");
+        assert!(e.contains("Scan default.t"), "{e}");
+        // A full sort of the same order is the same decision; it is the
+        // materialization that goes away rather than the early stop.
+        assert!(!phys(&mut s, "SELECT v FROM t ORDER BY id").contains("Sort"));
+    }
+
+    #[test]
+    fn the_orderings_that_must_still_sort() {
+        let mut s = session("UInt64", 20_000);
+        for q in [
+            // storage reads one way
+            "SELECT v FROM t ORDER BY id DESC LIMIT 5",
+            // not the sort column
+            "SELECT v FROM t ORDER BY v LIMIT 5",
+            // the sort column, but not leading
+            "SELECT v FROM t ORDER BY v, id LIMIT 5",
+            // a prefix is not enough: a merged part is sorted by `order_by[0]`
+            // and by nothing after it
+            "SELECT id, v FROM t ORDER BY id, v LIMIT 5",
+            // an expression, not a column
+            "SELECT v FROM t ORDER BY id + 0 LIMIT 5",
+            // a predicate no zone map decides: dropping the sort would drop
+            // the exchange doing the walk, measured 0.29x
+            "SELECT v FROM t WHERE v = 42 ORDER BY id LIMIT 5",
+            // rows the scan never produced in any order
+            "SELECT id, count() FROM t GROUP BY id ORDER BY id LIMIT 5",
+        ] {
+            let e = phys(&mut s, q);
+            assert!(e.contains("Sort") || e.contains("TopK"), "{q} must sort:\n{e}");
+        }
+    }
+
+    #[test]
+    fn parts_are_only_concatenated_when_they_do_not_overlap() {
+        // Two parts, the second entirely above the first: reading them back to
+        // back is key order.
+        let mut s = session("UInt64", 1_000);
+        {
+            let t = s.catalog.table_by_path_mut("default.t").unwrap();
+            t.insert(
+                Block::new(vec![
+                    Column::u64s(DataType::UInt64, (1_000..2_000).collect()),
+                    Column::i64s(DataType::Int64, (0..1_000).collect()),
+                ])
+                .unwrap(),
+            )
+            .unwrap();
+            t.flush().unwrap();
+        }
+        assert!(!phys(&mut s, "SELECT v FROM t ORDER BY id LIMIT 5").contains("Sort"));
+
+        // One more part straddling both: the set no longer concatenates in
+        // order, and no rule may pretend otherwise.
+        {
+            let t = s.catalog.table_by_path_mut("default.t").unwrap();
+            t.insert(
+                Block::new(vec![
+                    Column::u64s(DataType::UInt64, (5_000..6_000).map(|i| i % 1_500).collect()),
+                    Column::i64s(DataType::Int64, (0..1_000).collect()),
+                ])
+                .unwrap(),
+            )
+            .unwrap();
+            t.flush().unwrap();
+        }
+        let e = phys(&mut s, "SELECT v FROM t ORDER BY id LIMIT 5");
+        assert!(e.contains("TopK"), "an overlapping part needs the merge:\n{e}");
     }
 
     #[test]

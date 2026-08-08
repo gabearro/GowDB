@@ -72,11 +72,18 @@
 //!
 //! ## What is refused rather than approximated
 //!
-//! Scalar subqueries, `x IN (SELECT ...)` and `EXISTS` all need a query
-//! *result* at bind time, and the binder has no executor to get one from.
-//! They return `Error::unsupported` instead of a plan that silently means
-//! something else. `EXCEPT`/`INTERSECT` and `GROUP BY ... WITH TOTALS` have no
-//! corresponding `LogicalPlan` node and are refused for the same reason.
+//! A scalar subquery needs a query *result* at bind time and the binder has no
+//! executor to get one from, so it returns `Error::unsupported` instead of a
+//! plan that silently means something else. `EXCEPT`/`INTERSECT` and
+//! `GROUP BY ... WITH TOTALS` have no corresponding `LogicalPlan` node and are
+//! refused for the same reason.
+//!
+//! `x IN (SELECT ...)` and `EXISTS (SELECT ...)` need no result: as a whole
+//! `WHERE` conjunct they are a semi-join or an anti-join over the subquery's
+//! own plan (see [`LogicalPlan::in_subquery`]), and `split_membership` is what
+//! separates that position from the ones -- inside an `OR`, a `CASE`, a select
+//! item -- where the test really does have to produce a value per row and is
+//! still refused.
 //!
 //! `FINAL` is the one thing accepted and dropped: `ScanNode` has no slot for
 //! it, so a `ReplacingMergeTree` read is whatever the storage layer gives back.
@@ -94,7 +101,8 @@ use crate::sql::ast::{
 use crate::types::{parse_date, parse_datetime, DataType, Field, Schema, Value};
 
 use super::logical::{
-    BoundAgg, BoundExpr, LogicalPlan, MutationKind, MutationPlan, ScanNode, SortKey,
+    needs_null_census, BoundAgg, BoundExpr, LogicalPlan, MutationKind, MutationPlan, ScanNode,
+    SortKey,
 };
 
 /// Marker base for hoisted aggregate calls. Any real column index is bounded
@@ -866,9 +874,24 @@ impl<'a> Binder<'a> {
         }
 
         if let Some(w) = &sel.selection {
+            // A membership subquery at the top of the AND-spine is a *join*,
+            // not a predicate. Everything else in the spine binds as usual and
+            // lands **below** the joins, so each join builds over the rows that
+            // survived the ordinary filter rather than over the whole table --
+            // and pushdown still sinks those conjuncts into the scan, because
+            // nothing between them and it has changed.
+            let (rest, subs) = split_membership(w);
             let mut ctx = Ctx::new(&scope, &aliases, false);
-            let predicate = self.bind(w, &mut ctx)?;
-            plan = LogicalPlan::Filter { input: Box::new(plan), predicate };
+            let mut conjuncts = Vec::with_capacity(rest.len());
+            for r in rest {
+                conjuncts.push(self.bind(r, &mut ctx)?);
+            }
+            if let Some(predicate) = BoundExpr::join_conjuncts(conjuncts) {
+                plan = LogicalPlan::Filter { input: Box::new(plan), predicate };
+            }
+            for s in subs {
+                plan = self.membership(plan, s, &scope, &aliases, ctes)?;
+            }
         }
 
         // GROUP BY binds against the source scope, with aggregates banned:
@@ -1124,6 +1147,44 @@ impl<'a> Binder<'a> {
         }
 
         self.apply_limit(plan, q)
+    }
+
+    /// One `WHERE` conjunct that is a membership test, as a join over `left`.
+    ///
+    /// The subquery binds through [`Binder::query`] like any other, which is
+    /// what makes it a first-class relation: it gets the CTE stack, the depth
+    /// guard, projection narrowing, and every optimizer pass that runs on the
+    /// outer plan. Nothing here executes anything.
+    fn membership<'q>(
+        &self,
+        left: LogicalPlan,
+        e: &'q Expr,
+        scope: &Scope,
+        aliases: &[(String, Expr)],
+        ctes: &Ctes<'q>,
+    ) -> Result<LogicalPlan> {
+        match e {
+            Expr::InSubquery { expr, subquery, negated } => {
+                let mut ctx = Ctx::new(scope, aliases, false);
+                let probe = self.bind(expr, &mut ctx)?;
+                let sub = self.query(subquery, ctes)?;
+                // Cases 2 and 4 in `LogicalPlan::in_subquery`. Two types that
+                // cannot hold a NULL make the census -- and the second pass
+                // over the subquery it costs -- provably dead, which is the
+                // common case, because the subquery is usually a key.
+                let nulls = (*negated
+                    && sub.schema().len() == 1
+                    && needs_null_census(&probe.ty(), &sub.schema().fields()[0].ty))
+                .then(|| self.query(subquery, ctes))
+                .transpose()?;
+                LogicalPlan::in_subquery(left, probe, sub, nulls, *negated)
+            }
+            Expr::Exists { subquery, negated } => {
+                Ok(LogicalPlan::exists_subquery(left, self.query(subquery, ctes)?, *negated))
+            }
+            // `split_membership` selects the two arms above and nothing else.
+            other => Err(Error::bind(format!("`{other}` is not a membership test"))),
+        }
     }
 
     /// ORDER BY over a plan whose schema is already the output schema, so an
@@ -1446,8 +1507,8 @@ impl<'a> Binder<'a> {
                     let bi = self.bind(item, ctx)?;
                     let v = bi.as_literal().cloned().ok_or_else(|| {
                         Error::bind(format!(
-                            "IN list entries must be literals, got `{item}`; \
-                             `x IN (SELECT ...)` is not implemented"
+                            "IN list entries must be literals, got `{item}`; a \
+                             non-constant list is only expressible as `IN (SELECT ...)`"
                         ))
                     })?;
                     vals.push(coerce_literal(v, &target)?);
@@ -1455,9 +1516,13 @@ impl<'a> Binder<'a> {
                 Ok(BoundExpr::InList { expr: Box::new(b), list: vals, negated: *negated })
             }
 
+            // Reachable only *outside* a WHERE conjunct -- inside an OR, a
+            // CASE, a select item. There the test has to yield a value per row,
+            // and a semi-join yields rows; the mark join that would is not
+            // built. `split_membership` takes every position that is a join.
             Expr::InSubquery { .. } => Err(Error::unsupported(
-                "`x IN (SELECT ...)`: the binder has no executor to evaluate the \
-                 subquery with; rewrite it as a join",
+                "`x IN (SELECT ...)` is a semi-join and only binds as a whole WHERE \
+                 conjunct; here it would have to be a per-row value",
             )),
 
             // (x >= lo AND x <= hi), or its negation.
@@ -1510,7 +1575,8 @@ impl<'a> Binder<'a> {
             )),
 
             Expr::Exists { .. } => Err(Error::unsupported(
-                "EXISTS: the binder has no executor to evaluate the subquery with",
+                "EXISTS (SELECT ...) is a semi-join and only binds as a whole WHERE \
+                 conjunct; here it would have to be a per-row value",
             )),
 
             Expr::Interval { .. } => Err(Error::bind(
@@ -2214,6 +2280,35 @@ fn scope_schema(s: &Scope) -> Schema {
     )
 }
 
+/// Split a `WHERE` clause's AND-spine into ordinary conjuncts and membership
+/// tests, in written order.
+///
+/// Only the *top* of the spine qualifies. `a AND x IN (S)` is two nodes and one
+/// of them is a join; `a OR x IN (S)` is one predicate whose value must exist
+/// per row, which a semi-join cannot produce -- for those [`Binder::bind`]
+/// still refuses the expression, and the session layer's fold is what answers
+/// them. Reading the spine rather than recursing into it is what keeps that
+/// boundary a property of the shape instead of a guess.
+///
+/// Iterative for the same reason [`Expr::visit`] is: `a AND b AND c AND ...` is
+/// a loop in the parser and a left-deep tree here, so its depth is the user's
+/// to choose.
+fn split_membership(e: &Expr) -> (Vec<&Expr>, Vec<&Expr>) {
+    let (mut rest, mut subs) = (Vec::new(), Vec::new());
+    let mut todo = vec![e];
+    while let Some(e) = todo.pop() {
+        match e {
+            Expr::BinaryOp { left, op: BinaryOp::And, right } => {
+                todo.push(right);
+                todo.push(left);
+            }
+            Expr::InSubquery { .. } | Expr::Exists { .. } => subs.push(e),
+            other => rest.push(other),
+        }
+    }
+    (rest, subs)
+}
+
 /// Peel equi-join pairs out of an ON predicate. `on` indices are per-side
 /// (`(left index, right index)`); whatever is left over stays expressed
 /// against the concatenated schema, which is what the executor evaluates it
@@ -2476,6 +2571,18 @@ mod tests {
             table(
                 "users",
                 &[("user_id", "UInt64"), ("name", "String"), ("age", "UInt8")],
+                &[0],
+            ),
+            false,
+        )
+        .unwrap();
+        // The only nullable columns in the fixture, and the reason they exist:
+        // `NOT IN` grows a NULL census exactly when one side can hold a NULL,
+        // so a catalog without one cannot tell the two plans apart.
+        c.create_table(
+            table(
+                "notes",
+                &[("id", "UInt64"), ("n", "Nullable(Int64)"), ("tag", "Nullable(String)")],
                 &[0],
             ),
             false,
@@ -3211,10 +3318,82 @@ mod tests {
     fn subquery_expressions_are_refused_rather_than_faked() {
         let m = err("SELECT id FROM events WHERE ms = (SELECT max(age) FROM users)");
         assert!(m.contains("not implemented") && m.contains("scalar subqueries"), "{m}");
-        let m = err("SELECT id FROM events WHERE user_id IN (SELECT user_id FROM users)");
-        assert!(m.contains("not implemented"), "{m}");
-        let m = err("SELECT id FROM events WHERE EXISTS (SELECT 1 FROM users)");
-        assert!(m.contains("EXISTS"), "{m}");
+        // A membership test is refused only where it would have to be a value.
+        // As a whole WHERE conjunct it is a join, and has its own tests below.
+        let m = err("SELECT id FROM events WHERE user_id IN (SELECT user_id FROM users) OR id = 1");
+        assert!(m.contains("semi-join") && m.contains("per-row value"), "{m}");
+        let m = err("SELECT NOT EXISTS (SELECT 1 FROM users) FROM events");
+        assert!(m.contains("EXISTS") && m.contains("semi-join"), "{m}");
+    }
+
+    // ------------------------------------------------- membership subqueries
+
+    #[test]
+    fn in_subquery_binds_to_a_semi_join_over_the_subquery_plan() {
+        let e = explain("SELECT id FROM events WHERE user_id IN (SELECT user_id FROM users)");
+        // The subquery is a *relation* in the tree -- its own Scan, narrowed to
+        // its own column -- and not a literal list, which is the whole point.
+        assert!(e.contains("InnerJoin on [l#1 = r#0]"), "{e}");
+        assert!(e.contains("Distinct"), "{e}");
+        assert!(e.contains("Scan default.users [user_id]"), "{e}");
+        // No `Project` restoring the outer width: the binder's own projection
+        // drops the appended column.
+        assert_eq!(e.matches("Project").count(), 2, "{e}");
+    }
+
+    #[test]
+    fn not_in_over_a_non_nullable_column_needs_no_census() {
+        // `id` and `user_id` are both non-nullable here, so cases 2 and 4 in
+        // `LogicalPlan::in_subquery` cannot fire and the plan is a plain
+        // anti-join: one join, one pass over the subquery.
+        let e = explain("SELECT id FROM events WHERE user_id NOT IN (SELECT user_id FROM users)");
+        assert!(e.contains("LeftJoin on [l#1 = r#0]"), "{e}");
+        assert!(e.contains("Filter user_id#2 IS NULL"), "{e}");
+        assert_eq!(e.matches("Join").count(), 1, "no census join: {e}");
+        assert_eq!(e.matches("Scan default.users").count(), 1, "one pass: {e}");
+    }
+
+    #[test]
+    fn not_in_over_a_nullable_column_grows_the_census() {
+        let e = explain("SELECT id FROM notes WHERE n NOT IN (SELECT n FROM notes)");
+        assert!(e.contains("CrossJoin"), "{e}");
+        assert!(e.contains("aggs=[count(), count(n#0)]"), "{e}");
+        // Two passes over the subquery, which is what the census costs.
+        assert_eq!(e.matches("Scan default.notes").count(), 3, "{e}");
+    }
+
+    #[test]
+    fn exists_is_a_limit_one_probe_not_a_scan() {
+        let e = explain("SELECT id FROM events WHERE EXISTS (SELECT 1 FROM users)");
+        assert!(e.contains("CrossJoin"), "{e}");
+        assert!(e.contains("Limit 1 offset 0"), "{e}");
+        let e = explain("SELECT id FROM events WHERE NOT EXISTS (SELECT * FROM users)");
+        assert!(e.contains("LeftJoin on []"), "{e}");
+        assert!(e.contains("Limit 1 offset 0"), "{e}");
+        // `EXISTS (SELECT *)` is legal: existence does not care how wide a row
+        // is. The old fold refused it, because it read column 0 of a result it
+        // had already computed.
+        assert!(e.contains("Project [true AS exists]"), "{e}");
+    }
+
+    #[test]
+    fn a_membership_conjunct_leaves_the_others_below_the_join() {
+        // The ordinary predicate has to reach the scan, or the join builds over
+        // rows a filter was going to throw away.
+        let e =
+            explain("SELECT id FROM events WHERE ms > 5 AND user_id IN (SELECT user_id FROM users)");
+        assert!(e.contains("Filter (ms#2 > 5)"), "{e}");
+        let filter = e.find("Filter").expect("a filter");
+        let join = e.find("InnerJoin").expect("a join");
+        assert!(join < filter, "the filter must sit under the join:\n{e}");
+    }
+
+    #[test]
+    fn in_subquery_type_and_arity_are_still_checked() {
+        let m = err("SELECT id FROM events WHERE id IN (SELECT id, user_id FROM events)");
+        assert!(m.contains("exactly one column"), "{m}");
+        let m = err("SELECT id FROM events WHERE url IN (SELECT user_id FROM users)");
+        assert!(m.contains("String"), "{m}");
     }
 
     #[test]

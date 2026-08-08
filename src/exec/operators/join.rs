@@ -1,10 +1,57 @@
-//! Hash join, covering `INNER`, `LEFT`, `RIGHT`, `FULL` and `CROSS`.
+//! Join, covering `INNER`, `LEFT`, `RIGHT`, `FULL` and `CROSS`, by hash or by
+//! primary-key probe.
 //!
 //! Both sides are materialized, the **smaller** one becomes the build side,
 //! and the larger probes it. Building on the smaller side is what bounds the
 //! hash table by `min(|L|, |R|)` rather than by whichever relation the user
 //! happened to write first, and it is free to decide here because both sides
 //! are already in hand.
+//!
+//! ## When one side does not have to be read at all
+//!
+//! Materializing both sides is the wrong shape for the query a primary key
+//! exists to answer. `... FROM (SELECT * FROM a WHERE k = 150000) a JOIN b ON
+//! a.k = b.k` has **one row** on the left and a primary key on `b.k`, and a
+//! hash join still reads all 300 000 rows of `b` to answer it.
+//!
+//! So when the planner can see that one side is a primary-key scan on the join
+//! key, it attaches a [`JoinIndexSide`] and that side is *fetched by key*
+//! rather than read: the un-keyed side is drained, its key column converted to
+//! storage lanes, and one batched [`IndexLookup`] returns exactly the rows that
+//! can match. What comes back is handed to the same [`State`] the hash join
+//! uses, so the residual, the outer padding, duplicate keys, NULL keys and the
+//! build-side choice are the same code and not a second implementation.
+//!
+//! Measured through `Session::query`, A/B interleaved in one process with the
+//! planner's choice alternating inside one loop, best-of-7 per side:
+//!
+//! ```text
+//!                                            300k x 300k        1M x 1M
+//!   count(), point join, hand-pushed      3.09 -> 0.018 ms   12.77 -> 0.024 ms
+//!     "                                          175x               540x
+//!   count(), IN list of 3 keys            3.18 -> 0.015 ms   10.59 -> 0.018 ms
+//!   LEFT JOIN, point                      3.22 -> 0.014 ms   10.69 -> 0.019 ms
+//!   two projected columns, point          3.63 -> 0.013 ms   14.07 -> 0.026 ms
+//!
+//!   NEGATIVE -- the rule must not fire, and does not:
+//!   count() over the whole join          14.29 / 14.46 ms    67.6 / 67.9 ms
+//!   half of one side joined to all of    10.72 / 10.64 ms    43.4 / 42.4 ms
+//!   the other
+//! ```
+//!
+//! The win grows with the table because it is the *keyed side's scan* that
+//! stops happening: probing is flat in the table's size and reading it is not.
+//! The memory goes the same way -- `the_index_join_never_materializes_the_
+//! keyed_side` in `tests/plan_join_strategy.rs` measures the two strategies'
+//! charge against [`super::MemTracker`] and holds the index join to an eighth
+//! of the hash join's, on a shape where the difference is the whole keyed side.
+//!
+//! Which of the two runs is the planner's decision -- see [`choose`], which is
+//! pure and takes only what a planner with no statistics can actually know. The
+//! operator re-runs the same function against the row count it *measured* and
+//! falls back to the hash join when the estimate did not survive contact with
+//! the data, which is why the promise being wrong is a slower query rather than
+//! a worse plan.
 //!
 //! ## One pipeline for five join types
 //!
@@ -160,17 +207,30 @@
 //! block" -- a second probe implementation and a second outer-join argument, on
 //! the path that currently gets both right. It belongs behind its own test, not
 //! bolted onto this one.
+//!
+//! The index join is *not* that hybrid and does not make it unnecessary: it
+//! removes one side's materialization by never reading the side at all, which
+//! only works when that side is keyed and small once filtered. A star-schema
+//! fact table streaming past a resident dimension is still the shape above, and
+//! still to do.
 
 use std::mem::size_of;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use crate::catalog::Catalog;
 use crate::common::{BitSet, Error, Result, BLOCK_SIZE};
 use crate::exec::expr;
-use crate::planner::logical::BoundExpr;
+use crate::planner::logical::{BoundExpr, ScanNode};
+// `exact_lane` rather than a second conversion here: it decides whether the
+// index sees every row `Value`'s equality would call equal to a probe value,
+// and two spellings of that question that disagreed would drop join rows on
+// one path and not the other.
+use crate::planner::physical::{exact_lane, IndexPath};
 use crate::sql::ast::JoinOp;
 use crate::types::{Block, Column, ColumnBuilder, DataType, Schema, Value};
 
+use super::scan::IndexLookup;
 use super::sort::spill;
 use super::{hash_values, MemGuard, Operator, QueryContext, ScanStats};
 
@@ -186,12 +246,194 @@ pub struct Join<'a> {
     residual: Option<&'a BoundExpr>,
     schema: &'a Schema,
     ctx: &'a QueryContext,
+    /// The primary-key access path the planner offered for one side, if any.
+    /// The child operator for that side is still owned and is the fallback.
+    index: Option<JoinIndexSide<'a>>,
+    /// Which algorithm ran. `None` until the first `next()` decides.
+    strategy: Option<JoinStrategy>,
+    /// Rows an index-join attempt drained off the un-keyed side before it
+    /// declined; fed back to [`drain_side`] so the fallback still sees them.
+    pre: Option<Block>,
+    /// The fetch's own scan counters. The child operator that would have
+    /// reported them was never polled.
+    idx_stats: ScanStats,
     /// Built on the first `next()`, so `EXPLAIN` and the binder's throwaway
     /// pipelines never touch the inputs.
     state: Option<State>,
     /// Set instead of `state` when either side had to go to disk. `None` for
     /// every join that fits, which is the only case that costs anything.
     grace: Option<Grace>,
+}
+
+// ======================================================== strategy selection
+
+/// How many rows of the keyed side one index probe is worth.
+///
+/// The gate on the index join, and the answer to "when does probing lose".
+/// `n` probes fetch `n` rows out of an `m`-row table; the hash join they
+/// replace reads all `m` rows, materializes them into one block, indexes
+/// `min(n, m)` and probes `max(n, m)` times. Probing is linear in `n` and flat
+/// in `m`; hashing is linear in `m` and only weakly in `n`. So there is a
+/// crossover, it is a *ratio*, and it was measured rather than assumed.
+///
+/// A/B interleaved in one process, alternating strategies inside one loop,
+/// best-of-9 per side, `--release`. `INNER JOIN` of `n` distinct present keys
+/// against a keyed table of `m` rows, `m = 300 000`, one part:
+///
+/// ```text
+///   n            index      hash    ratio
+///   m/1024        0.04      6.03     161x
+///   m/64          0.50      6.16    12.3x
+///   m/32          1.11      7.09     6.4x
+///   m/16          2.32      9.31     4.0x
+///   m/8           5.05     10.61     2.1x
+///   m/4           9.97     12.28     1.2x
+///   m/3          13.81     15.67     1.1x
+///   m/2          20.25     15.05    0.74x   <-- probing loses
+///   m            37.74     20.56    0.54x
+/// ```
+///
+/// The ratio is what is stable, not the counts: the same sweep at `m = 50 000`
+/// and `m = 1 000 000` crosses between `m/3` (1.02x, 1.07x) and `m/2` (0.82x,
+/// 1.03x) as well. A probe costs ~84 ns and is flat in `m`, which is why.
+///
+/// **The part count is the second variable.** `IndexLookup` visits every part,
+/// so a table that has not compacted pays a bloom test and a `find` per part
+/// per key. The same sweep on a 9-part 300k table crosses three times sooner:
+///
+/// ```text
+///   m/16   2.66x     m/8   1.47x     m/4   0.83x     m/2   0.54x
+/// ```
+///
+/// So the honest crossover is `m/5.5`, not `m/2.7`, and 16 is ~3x inside it.
+/// The band that gives up -- `m/16` to `m/5.5` -- measured 1.5x to 2.1x, and on
+/// a machine that swings 30% on identical code that is not a number worth
+/// reaching for when the other side of it is 0.54x. Every configuration
+/// measured is a >=2.5x win at `m/16`.
+///
+/// Two things this constant is *not*. It is not `SCAN_ROWS_PER_PROBE` (256),
+/// which asks whether a probe beats a bare scan; this asks whether it beats a
+/// scan the join then has to materialize and hash, which is far more per row.
+/// And it is not the 45 ns `Table::locate`: the fetch resolves rows, gathers
+/// them and re-checks the delete mask, which is what makes a probe 84 ns.
+const JOIN_ROWS_PER_PROBE: usize = 16;
+
+/// What the planner can prove about one join input **without reading a row**.
+///
+/// Deliberately the whole vocabulary. There is no cost model and no statistics
+/// in this engine beyond "how many live rows does this table have", so a fact
+/// an estimator would have to guess is spelled `None` here and decides nothing.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SideFacts {
+    /// Upper bound on the rows this side can produce -- part metadata for a
+    /// scan, the key count for an index lookup. `None` is a refusal, not an
+    /// infinity: a side nobody can bound is never chosen as the probe side.
+    pub max_rows: Option<usize>,
+    /// This side is a scan of a table whose single-column primary key *is* the
+    /// join key, so its matching rows can be fetched instead of read.
+    pub keyed: bool,
+}
+
+/// The algorithm a join will run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JoinStrategy {
+    /// Materialize both sides, index the smaller, probe with the larger.
+    Hash,
+    /// Drain the un-keyed side, then fetch the keyed side's matching rows
+    /// through its primary-key index. `index_right` names the fetched side.
+    IndexNestedLoop { index_right: bool },
+}
+
+/// Name the cheapest algorithm for a join between these two sides.
+///
+/// Pure, and the only place the choice is made: the operator implements both
+/// strategies and asks this function which to run, so a real cost model
+/// replaces one function rather than reaching inside an operator. Called twice
+/// per join -- once by the planner with what it can bound, once by the operator
+/// with the row count it actually drained.
+///
+/// Three things have to hold at once, and each of them is a refusal to guess:
+///
+/// * **exactly one equi-key**, because the index is single-column. A composite
+///   `ON` would need every key column pinned, and the storage layer has no such
+///   index to offer;
+/// * **the keyed side is the side that may be dropped.** A `LEFT JOIN` must
+///   emit every left row, so the left side cannot be the one fetched by key --
+///   a key nobody probed for would silently lose its row. That leaves the right
+///   side for `LEFT`, the left for `RIGHT`, either for `INNER`, and *neither*
+///   for `FULL`, which preserves both. `CROSS` has no key at all;
+/// * **the probe side is small enough**, by [`JOIN_ROWS_PER_PROBE`]. One probe
+///   beats any scan worth the name, so only a batch has to justify itself.
+pub fn choose(op: JoinOp, on: &[(usize, usize)], left: SideFacts, right: SideFacts) -> JoinStrategy {
+    if on.len() != 1 {
+        return JoinStrategy::Hash;
+    }
+    // Which side is allowed to be the fetched one, most-preferred first. For
+    // `INNER` both are legal and the right is tried first only because it is
+    // where a dimension table is written by convention -- when both sides are
+    // keyed the two orders cost the same, and `worth` decides between them.
+    let allowed: &[bool] = match op {
+        JoinOp::Inner => &[true, false],
+        JoinOp::Left => &[true],
+        JoinOp::Right => &[false],
+        JoinOp::Full | JoinOp::Cross => &[],
+    };
+    for &index_right in allowed {
+        let (keyed, probe) = if index_right { (right, left) } else { (left, right) };
+        if keyed.keyed && worth(probe.max_rows, keyed.max_rows) {
+            return JoinStrategy::IndexNestedLoop { index_right };
+        }
+    }
+    JoinStrategy::Hash
+}
+
+/// Is fetching `keyed` rows one probe at a time cheaper than reading them all?
+#[inline]
+fn worth(probes: Option<usize>, keyed_rows: Option<usize>) -> bool {
+    let Some(n) = probes else { return false };
+    // An unbounded keyed side is one no metadata could size, and reading it is
+    // the thing being avoided; a single probe wins against any of them.
+    n <= 1 || n.saturating_mul(JOIN_ROWS_PER_PROBE) <= keyed_rows.unwrap_or(usize::MAX)
+}
+
+/// The most probes worth making against a keyed side of `rows` rows.
+///
+/// The inverse of [`worth`], and what stops the operator from draining a probe
+/// side it is only going to hand back: past this point the fallback is certain,
+/// so every row after it is work thrown away.
+#[inline]
+fn probe_budget(rows: usize) -> usize {
+    (rows / JOIN_ROWS_PER_PROBE).max(1)
+}
+
+/// One side of a join answered by the primary-key index instead of read.
+///
+/// Carries the scan node rather than the built operator because the fetch is a
+/// *different* access path over the same node: same projection, same output
+/// schema, same PREWHERE list, different rows. The child operator for the side
+/// stays in the join and is what runs when the index path declines.
+///
+/// # The one thing the planner must guarantee
+///
+/// **That side must lower to a bare `PhysicalPlan::Scan(node)`** -- no
+/// `Filter`, no `Project`, no `Limit` between the join and the scan. The fetch
+/// does not run the child operator, it *replaces* it, so anything the plan put
+/// between the two is silently skipped: a `Filter` above the scan would stop
+/// removing rows and a `Project` would stop renaming them.
+///
+/// This is the one invariant here the operator cannot check. It compares the
+/// child's width against the node's, which catches a projection that changes
+/// the column count, and it re-runs [`choose`] against the rows it drained --
+/// but a `Filter` preserves width, and no `&dyn Operator` can be asked what it
+/// is. Everything else about this struct is verified before it is used; this is
+/// a contract.
+#[derive(Clone, Copy)]
+pub struct JoinIndexSide<'a> {
+    /// `true` when this answers the join's **right** input.
+    pub right: bool,
+    /// The scan node that side lowered to.
+    pub node: &'a ScanNode,
+    pub catalog: &'a Catalog,
 }
 
 /// Which side is still being emitted.
@@ -241,12 +483,209 @@ impl<'a> Join<'a> {
         schema: &'a Schema,
         ctx: &'a QueryContext,
     ) -> Join<'a> {
-        Join { left, right, op, on, residual, schema, ctx, state: None, grace: None }
+        Join {
+            left,
+            right,
+            op,
+            on,
+            residual,
+            schema,
+            ctx,
+            index: None,
+            strategy: None,
+            pre: None,
+            idx_stats: ScanStats::default(),
+            state: None,
+            grace: None,
+        }
+    }
+
+    /// Offer one side a primary-key access path, as [`choose`] named it.
+    ///
+    /// A suggestion, not an instruction: the operator re-checks it against the
+    /// data and runs the hash join instead when it does not hold. Attaching it
+    /// costs nothing on a plan that never runs -- nothing here reads.
+    pub fn with_index(mut self, side: JoinIndexSide<'a>) -> Join<'a> {
+        self.index = Some(side);
+        self
+    }
+
+    /// Which algorithm ran, or `None` before the first `next()`.
+    pub fn strategy(&self) -> Option<JoinStrategy> {
+        self.strategy
     }
 
     /// Drain both sides, decide which one to index, and index it -- or, when
     /// either side will not fit, partition both to disk and set up [`Grace`].
     fn prepare(&mut self) -> Result<()> {
+        if self.index.is_some() {
+            if let Some(st) = self.try_index_join()? {
+                self.strategy = Some(JoinStrategy::IndexNestedLoop {
+                    index_right: self.index.expect("just checked").right,
+                });
+                self.state = Some(st);
+                return Ok(());
+            }
+        }
+        self.strategy = Some(JoinStrategy::Hash);
+        self.prepare_hash()
+    }
+
+    /// Fetch one side by primary key instead of reading it, or `None` to fall
+    /// back to the hash join.
+    ///
+    /// Every `None` below is a shape this cannot answer *correctly and
+    /// faster*, and each one hands the rows it drained back through `self.pre`
+    /// so the fallback still sees the whole side. The order matters: the checks
+    /// that read nothing come first, so a plan that was never eligible costs a
+    /// few comparisons.
+    fn try_index_join(&mut self) -> Result<Option<State>> {
+        let (ctx, op, ix) = (self.ctx, self.op, self.index.expect("caller checked"));
+        let want = JoinStrategy::IndexNestedLoop { index_right: ix.right };
+        // `choose` is the whole decision, asked twice: here with a probe side
+        // of zero rows, which passes the size test unconditionally and so
+        // leaves exactly the join-type gate -- and again below, once the probe
+        // side has been counted. A `FULL` join, a `CROSS` join, a composite
+        // `ON`, or an index offered for the side an outer join must preserve
+        // all stop here, before anything is read.
+        let facts = |rows: Option<usize>, keyed| SideFacts { max_rows: rows, keyed };
+        let sides = |probe: Option<usize>, keyed| {
+            if ix.right {
+                (facts(probe, false), facts(keyed, true))
+            } else {
+                (facts(keyed, true), facts(probe, false))
+            }
+        };
+        let (lf, rf) = sides(Some(0), None);
+        if choose(op, self.on, lf, rf) != want {
+            return Ok(None);
+        }
+        let &[(lk, rk)] = self.on else { return Ok(None) };
+        let (okey, ikey) = if ix.right { (lk, rk) } else { (rk, lk) };
+        let Some(&key_col) = ix.node.projection.get(ikey) else { return Ok(None) };
+        let Ok(table) = ix.catalog.table_by_path(&ix.node.table) else { return Ok(None) };
+        // `pk_col` is the whole "is this table keyed" predicate, and it is
+        // `Some` only for a single-column unique key that is also the sort key.
+        if table.pk_col() != Some(key_col) {
+            return Ok(None);
+        }
+        let ty = table.schema().ty(key_col).clone();
+        let snap = table.snapshot();
+        // A part built before the table had a key answers `find` with `None`
+        // for every probe: not a slow answer, a wrong one. The planner declines
+        // such a table as well; here it is the difference between falling back
+        // and losing rows.
+        if snap.parts().iter().any(|p| p.pk_col != Some(key_col) || p.sort_col != Some(key_col)) {
+            return Ok(None);
+        }
+        let keyed_rows = snap.live_rows();
+        drop(snap);
+
+        // Draining past the crossover is work the fallback throws away, so the
+        // cap is the point where `worth` flips rather than a constant.
+        let cap = probe_budget(keyed_rows);
+        let outer = if ix.right { &mut self.left } else { &mut self.right };
+        let mut guard = MemGuard::new(ctx, "the join's probe side");
+        let mut acc: Option<Block> = None;
+        let mut over = false;
+        loop {
+            ctx.check()?;
+            let Some(b) = outer.next()? else { break };
+            if b.rows() == 0 {
+                continue;
+            }
+            match &mut acc {
+                None => acc = Some(b),
+                Some(a) => a.extend(&b)?,
+            }
+            let a = acc.as_ref().expect("just filled");
+            guard.grow_to(a.bytes())?;
+            // Past the crossover the fallback is certain, so every further row
+            // is work thrown away. `choose` below is what actually decides;
+            // this only stops the drain from running to the end first.
+            if a.rows() > cap {
+                over = true;
+                break;
+            }
+        }
+        let probe = acc.unwrap_or_else(|| Block::empty(outer.schema()));
+        // The planner's `max_rows` is a bound, not a count -- it cannot see a
+        // `Filter`'s selectivity or a subquery's result -- so the decision is
+        // made again against the rows that actually arrived.
+        let (lf, rf) = sides(Some(probe.rows()), Some(keyed_rows));
+        // The fetch replaces the *other* side's operator, so the node and that
+        // operator must agree on what one of its rows looks like: `assemble`
+        // splits the output block by `l.width()`, and a fetch of the wrong
+        // width would shift every column of the other side.
+        let keyed_op = if ix.right { &self.right } else { &self.left };
+        let same_shape = keyed_op.schema().fields().len() == ix.node.schema.fields().len();
+        if over || !same_shape || okey >= probe.width() || choose(op, self.on, lf, rf) != want {
+            self.pre = Some(probe);
+            return Ok(None);
+        }
+
+        let mut keys = Vec::with_capacity(probe.rows());
+        let laned = {
+            let col = probe.column(okey);
+            (0..probe.rows()).all(|row| {
+                // NULL equals nothing, so it names no row to fetch -- and
+                // because the matched sets start empty it still falls out as an
+                // unmatched row for an outer join, exactly as in the hash path.
+                col.is_null(row)
+                    || match exact_lane(&col.value(row), &ty) {
+                        Some(lane) => {
+                            keys.push(lane);
+                            true
+                        }
+                        None => false,
+                    }
+            })
+        };
+        // A value that does not convert to a lane *losslessly* is the one case
+        // that cannot simply be skipped: `Int(-1)` against a `UInt64` key
+        // matches nothing, but `NaN` against a `Float64` key matches a stored
+        // NaN under `Value`'s equality, and nothing here can tell those two
+        // apart without reimplementing that equality. Falling back is the
+        // answer that is right for both.
+        if !laned {
+            self.pre = Some(probe);
+            return Ok(None);
+        }
+        // Sorted because a part is sorted by the same lane, so ascending keys
+        // resolve to ascending rows; deduplicated because a key fetched twice
+        // would join twice and nothing downstream can undo that.
+        keys.sort_unstable();
+        keys.dedup();
+
+        // No gate on a pending delta, deliberately: `IndexLookup` and `Scan`
+        // both read parts and nothing else (see the scan module's docs), so the
+        // two strategies see the same table whether or not the write buffer has
+        // been flushed. A gate here would only look prudent.
+        let mut fetch = IndexLookup::new(
+            IndexPath { node: ix.node, key_col, key_field: ikey, keys },
+            ix.catalog,
+        )?;
+        let mut fg = MemGuard::new(ctx, "the join's fetched side");
+        let mut got: Option<Block> = None;
+        while let Some(b) = fetch.next()? {
+            ctx.check()?;
+            match &mut got {
+                None => got = Some(b),
+                Some(a) => a.extend(&b)?,
+            }
+            fg.grow_to(got.as_ref().map_or(0, |a| a.bytes()))?;
+        }
+        // The child operator that would have reported these was never polled.
+        self.idx_stats = fetch.stats();
+        let got = got.unwrap_or_else(|| Block::empty(&ix.node.schema));
+
+        let (l, r, lg, rg) =
+            if ix.right { (probe, got, guard, fg) } else { (got, probe, fg, guard) };
+        State::build(l, r, self.on, op, ctx, [lg, rg]).map(Some)
+    }
+
+    /// The hash join: drain both sides, or spill them.
+    fn prepare_hash(&mut self) -> Result<()> {
         // Separate guards: the drain charges a running total per side, and one
         // guard cannot hold two independent totals.
         let lg = MemGuard::new(self.ctx, "the join's left input");
@@ -257,9 +696,20 @@ impl<'a> Join<'a> {
         let lcols: Vec<usize> = self.on.iter().map(|&(a, _)| a).collect();
         let rcols: Vec<usize> = self.on.iter().map(|&(_, b)| b).collect();
         let mut part: Option<Partitioner> = None;
+        // Whatever an index-join attempt drained before it declined. It belongs
+        // to the side the index did *not* answer, and starting the drain from
+        // it is what makes the attempt free: the rows are pulled once either
+        // way.
+        let (ls, rs) = match (self.index, self.pre.take()) {
+            (Some(ix), b) if ix.right => (b, None),
+            (Some(_), b) => (None, b),
+            _ => (None, None),
+        };
 
-        let l = drain_side(&mut self.left, self.ctx, lg, &lcols, 0, &mut part, forced, can_spill)?;
-        let r = drain_side(&mut self.right, self.ctx, rg, &rcols, 1, &mut part, forced, can_spill)?;
+        let l =
+            drain_side(&mut self.left, self.ctx, lg, &lcols, 0, &mut part, forced, can_spill, ls)?;
+        let r =
+            drain_side(&mut self.right, self.ctx, rg, &rcols, 1, &mut part, forced, can_spill, rs)?;
 
         let part = match part {
             // One side may still be resident: the trigger fires on whichever
@@ -314,6 +764,10 @@ impl<'a> Join<'a> {
 /// Returns `None` once anything has been partitioned; the guard is dropped on
 /// that path rather than returned, which is what gives the reservation back
 /// before the pair joins ask for it.
+///
+/// `seed` is rows already pulled off this side by an index-join attempt that
+/// declined; they are the front of the stream and are charged here, because the
+/// attempt's own guard was released with it.
 #[allow(clippy::too_many_arguments)]
 fn drain_side(
     op: &mut Box<dyn Operator + '_>,
@@ -324,8 +778,12 @@ fn drain_side(
     part: &mut Option<Partitioner>,
     forced: usize,
     can_spill: bool,
+    seed: Option<Block>,
 ) -> Result<Option<(Block, MemGuard)>> {
-    let mut acc: Option<Block> = None;
+    let mut acc: Option<Block> = seed;
+    if let Some(a) = &acc {
+        guard.grow_to(a.bytes())?;
+    }
     loop {
         ctx.check()?;
         let Some(b) = op.next()? else { break };
@@ -386,6 +844,10 @@ impl Operator for Join<'_> {
     fn stats(&self) -> ScanStats {
         let mut s = self.left.stats();
         s.merge(&self.right.stats());
+        // The fetch's counters. Zero unless the index path ran, and the child
+        // it replaced contributes zero because it was never polled -- so the
+        // two never double-count.
+        s.merge(&self.idx_stats);
         s
     }
 
@@ -425,6 +887,36 @@ impl State {
     ) -> Result<State> {
         // Ties build on the right so the probe (and therefore the output)
         // stays in left-row order, which is what a reader expects to see.
+        //
+        // **Building the *larger* side was tried and rejected.** It is not the
+        // absurdity it sounds like: build and probe do the same per-row work
+        // (`fill_key`, `hash_values`, a slot walk), so the two orders move the
+        // same number of rows through the same code, and which one is faster is
+        // a cache question rather than a work question. Measured A/B
+        // interleaved in one process, alternating inside one loop, best-of-11
+        // per side, 300k-row `big`, `--release` (ratio > 1 means building the
+        // larger side won):
+        //
+        // ```text
+        //   big JOIN small(1000)                    1.52x
+        //   big RIGHT JOIN small(1000)              1.56x
+        //   sum(big.v + small.v), same join         1.39x
+        //   big LEFT JOIN small(1000)               1.33x
+        //   big FULL JOIN small(1000)               1.31x
+        //   dup JOIN small(1000), 300k out          1.02x
+        //   big JOIN dup, 300k out                  0.95x
+        //   big JOIN tiny(10)                       0.88x
+        //   big JOIN fan(10 rows, 10 keys)          0.86x
+        // ```
+        //
+        // 1.5x on one family and 0.86x on another, non-monotonic in the small
+        // side's size, and no model here separates them -- so shipping it would
+        // be a rule that fires when it should not on every shape below it. The
+        // memory argument settles the tie anyway: the index is 32 B/row, so
+        // building the larger side sizes it by `max(|L|, |R|)` instead of
+        // `min`, which is 9.6 MB instead of 32 KB on the first row of that
+        // table and is also what [`Grace::fits`] budgets partitions against.
+        // Recorded so nobody has to run it again.
         let build_right = r.rows() <= l.rows();
         let (bcols, pcols): (Vec<usize>, Vec<usize>) = if build_right {
             (on.iter().map(|&(_, b)| b).collect(), on.iter().map(|&(a, _)| a).collect())
@@ -1183,6 +1675,7 @@ fn keys_equal(b: &Block, cols: &[usize], row: usize, key: &[Value]) -> bool {
         .zip(key)
         .all(|(&c, k)| b.column(c).value(row) == *k)
 }
+
 
 /// Gather one output block: left columns then right columns, NULL-padding
 /// wherever a side has no row.

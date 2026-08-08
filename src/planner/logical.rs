@@ -8,9 +8,9 @@
 //! never looks anything up by name.
 
 use crate::common::{Error, Result};
-use crate::exec::functions::{AggFn, ScalarFn};
+use crate::exec::functions::{aggregate, AggFn, ScalarFn};
 use crate::sql::ast::{BinaryOp, JoinOp, UnaryOp};
-use crate::types::{DataType, Schema, Value};
+use crate::types::{DataType, Field, Schema, Value};
 
 // -------------------------------------------------------------- expressions
 
@@ -88,10 +88,9 @@ pub enum BoundExpr {
     },
     /// `x IN (literals)`.
     ///
-    /// `x IN (SELECT ...)` never reaches the binder: [`crate::session`]
-    /// evaluates an uncorrelated subquery up front and folds its result into
-    /// this literal list, which runs it once instead of once per row.
-    /// Correlated subqueries are rejected — there is no semi-join operator.
+    /// Only literals. `x IN (SELECT ...)` binds to a semi-join over the
+    /// subquery's *plan* instead — see [`LogicalPlan::in_subquery`] — so a
+    /// subquery result is never spliced in here as a value list.
     InList {
         expr: Box<BoundExpr>,
         list: Vec<Value>,
@@ -586,6 +585,367 @@ impl LogicalPlan {
         for c in self.children() {
             c.explain_into(depth + 1, out);
         }
+    }
+}
+
+// -------------------------------------------------- set-membership subqueries
+
+/// `x IN (SELECT ...)` and `EXISTS (SELECT ...)`, with their negations, as a
+/// **semi-join** (keep a left row that has a match) or an **anti-join** (keep
+/// one that has none).
+///
+/// The subquery is a *relation* here, not a value. That is the whole point.
+/// The old shape ran the subquery before planning and spliced its result in as
+/// a literal [`BoundExpr::InList`], which meant a million-row subquery became a
+/// million `Value`s held in memory and re-projected into probe lanes once per
+/// block; `EXPLAIN` executed it; and the optimizer saw a list rather than a
+/// relation, so nothing about it could be pruned, reordered or indexed. As a
+/// join it streams, it prunes, and it is the node a decorrelation pass would
+/// rewrite -- there is no way to correlate a list that has already forgotten
+/// which table it came from.
+///
+/// ## The four cases set-membership implementations get wrong
+///
+/// `WHERE` keeps a row only when the predicate is TRUE, so UNKNOWN and FALSE
+/// are indistinguishable *there* -- but they are not the same predicate, and
+/// the difference surfaces the moment a NULL appears:
+///
+///   1. `x IN (S)` where `S` yields a NULL and nothing equal to `x`: the answer
+///      is **NULL**, not FALSE. A semi-join is exact for it anyway, because a
+///      NULL key matches nothing, so both answers drop the row.
+///   2. `x NOT IN (S)` with a NULL **anywhere** in `S`: the answer is NULL for
+///      *every* row, however unrelated that NULL is, so nothing survives. A
+///      plain anti-join would happily return every unmatched row.
+///   3. `EXISTS (S)` is **never NULL**. It is a pure existence test and ignores
+///      NULLs entirely, which is exactly the keyless shape: `S LIMIT 1`, cross
+///      joined on, with no key for a NULL to appear in.
+///   4. `S` empty: `IN` is FALSE, `NOT IN` is **TRUE**, `EXISTS` is FALSE.
+///      `NOT IN` is the trap -- it is TRUE *even for a NULL `x`*, vacuously,
+///      because with no `y` there is nothing to be unknown about. The literal
+///      splice got this wrong: `NULL NOT IN ()` became an empty `InList`, whose
+///      NULL input answered NULL and dropped the row. Measured against sqlite
+///      on four rows including one NULL, `count()` was 3 where it is 4.
+///
+/// Cases 2 and 4 are both properties of `S` as a whole rather than of any row,
+/// and 4 is the one that makes them a single problem: `x IS NOT NULL` is *not*
+/// the right guard, because an empty `S` admits a NULL `x`. So `NOT IN` keeps a
+/// row exactly when
+///
+/// ```text
+///   no y is NULL   AND   no y = x   AND   (x IS NOT NULL OR S is empty)
+/// ```
+///
+/// and the first and third clauses come from one keyless join against a
+/// two-aggregate census of `S` -- `count()` and `count(y)`, whose difference is
+/// "S has a NULL" and whose first is "S is empty". One extra pass, not two, and
+/// none at all when neither side is nullable, which is the usual case because
+/// the subquery is usually a key.
+///
+/// ## Shape
+///
+/// ```text
+///   x IN (S)         Join Inner on [x = s#0]     left, Distinct(S)
+///   EXISTS (S)       Join Cross                  left, Limit 1 (S -> true)
+///   NOT EXISTS (S)   Filter g IS NULL
+///                      Join Left                 left, Limit 1 (S -> true)
+///   x NOT IN (S)     Filter rows = nonnull AND (x IS NOT NULL OR rows = 0)
+///                      Join Cross                anti, Aggregate [count(), count(y)] S
+///                    where anti is
+///                      Filter s#0 IS NULL
+///                        Join Left on [x = s#0]  left, Distinct(S)
+/// ```
+///
+/// The census sits *above* the anti-join rather than below it because the
+/// hash join materializes both its inputs: feeding it the anti-join's output
+/// costs the rows that survived, where feeding the anti-join a widened `left`
+/// costs all of them.
+///
+/// `Distinct` is what a real semi-join operator would not need: without it an
+/// inner join multiplies a left row by its number of matches. It also bounds
+/// the build side by the subquery's *distinct* count rather than its row count,
+/// which is the memory the literal list could not bound at all.
+///
+/// ## Measured, and where it is not a win
+///
+/// Two 1M-row `UInt64` tables on disk, `k` the primary key, A/B interleaved
+/// against the literal splice in one loop, best of 5 per side:
+///
+/// ```text
+///   SELECT count() FROM a WHERE k IN     (SELECT k FROM b)   2513.9 ->  177.3 ms  14.2x
+///   SELECT count() FROM a WHERE k NOT IN (SELECT k FROM b)   2420.3 ->  189.0 ms  12.8x
+///     ... the same with a Nullable(UInt64) subquery column   2444.3 ->  187.9 ms  13.0x
+///   peak RSS of that first query                              245.3 ->  173.8 MB
+///   EXPLAIN PIPELINE of it                                   75.192 ->  0.060 ms  1253x
+///   peak RSS of the EXPLAIN                                   162.5 ->   15.8 MB
+/// ```
+///
+/// The EXPLAIN figure is the point of the change rather than a side effect:
+/// 15.8 MB is the process floor (16.7 MB with the data mapped), so describing
+/// the plan now allocates nothing measurable where it used to run the query.
+///
+/// It is **not** a win for a small subquery, and the reason is the join
+/// operator rather than the rewrite: it materializes both its inputs, so a
+/// cross join of a 1M-row left against a *one-row* right already costs 15.9 ms
+/// (16 ns/row), where the same scan probing a 9-element literal list costs
+/// 2.78 ms and `pk IN (9 literals)` lowers to an `IndexLookup` and costs
+/// 0.335 ms. Sweeping the subquery's size against a 1M-row outer:
+///
+/// ```text
+///   rows in the subquery      1     10    100     1k    10k   100k   200k   400k   700k     1M
+///   probe is the primary key  .02x  .02x  .01x   .01x   .05x   .26x   .78x  1.14x  9.67x  14.2x
+///   probe is not indexed      .14x        .12x                2.97x
+/// ```
+///
+/// So the crossover is ~300k rows when the probe column is the outer table's
+/// primary key -- because that is what the literal list buys, an index probe --
+/// and ~30k when it is not. Below it the fold is the better plan and the place
+/// to choose between them is the fold itself, which is the only code that knows
+/// how many rows the subquery produced; above it the list is 300k `Value`s held
+/// in memory and re-projected into probe lanes once per block, which is the
+/// 2.5 s. The structural fix is the index-nested-loop strategy already in
+/// `exec::operators::join::choose` -- `Scan a` is keyed and the subquery is the
+/// probe side, which is exactly the shape it fetches by key -- once the planner
+/// attaches it; that removes the fold's only remaining advantage.
+///
+/// `EXISTS` has no such crossover and loses outright when it is uncorrelated
+/// and the outer is large: 0.198 -> 14.876 ms for `WHERE EXISTS (SELECT k FROM
+/// b WHERE k = 5)` over 1M rows, because the old plan folded it to `true`, the
+/// filter vanished and `count()` came out of part metadata. It wins by 32x
+/// (4.16 -> 0.13 ms) when the outer is small and the subquery is not, because
+/// `LIMIT 1` answers an existence test the fold drains a whole table for. The
+/// node is still the right thing to *have* -- a correlated `EXISTS` has no
+/// constant to fold to -- but for the uncorrelated case a fold capped at one
+/// row dominates it, and that cap belongs in the fold.
+impl LogicalPlan {
+    /// `probe IN (sub)`, or its negation.
+    ///
+    /// `sub_nulls` is a **second binding of the same subquery**, required when
+    /// [`needs_null_census`] says so and ignored otherwise. It is a separate
+    /// plan rather than a clone because `LogicalPlan` is deliberately not
+    /// `Clone`; binding twice is a planner-time cost, the cheap kind, and the
+    /// executor still makes one streaming pass per plan.
+    pub fn in_subquery(
+        left: LogicalPlan,
+        probe: BoundExpr,
+        sub: LogicalPlan,
+        sub_nulls: Option<LogicalPlan>,
+        negated: bool,
+    ) -> Result<LogicalPlan> {
+        if sub.schema().len() != 1 {
+            return Err(Error::bind(format!(
+                "IN (SELECT ...) must select exactly one column, got {}",
+                sub.schema().len()
+            )));
+        }
+        let sub_ty = sub.schema().fields()[0].ty.clone();
+        // Not a real promotion, only the compatibility check the literal splice
+        // used to get from `coerce_literal`: the join matches through `Value`'s
+        // cross-representation equality, so `Int64 IN (Float64)` is fine and
+        // needs no cast, while `String IN (Int64)` must stay the bind error it
+        // has always been rather than become a silently empty answer.
+        DataType::promote(&probe.ty(), &sub_ty)?;
+        if !negated {
+            return Ok(semi(left, Some(probe), distinct(sub)));
+        }
+        let probe_ty = probe.ty();
+        let (left, k) = keyed(left, probe);
+        let key = col_at(&left, k);
+        let plan = anti(left, Some(k), distinct(sub));
+        match sub_nulls {
+            Some(n) => census_guard(plan, key, n, &probe_ty, &sub_ty),
+            None => Ok(plan),
+        }
+    }
+
+    /// `EXISTS (sub)`, or its negation.
+    pub fn exists_subquery(left: LogicalPlan, sub: LogicalPlan, negated: bool) -> LogicalPlan {
+        let one = exists_probe(sub);
+        if negated {
+            anti(left, None, one)
+        } else {
+            semi(left, None, one)
+        }
+    }
+}
+
+/// Does `probe NOT IN (sub)` need the census join -- cases 2 and 4 -- or is it
+/// a plain anti-join?
+pub fn needs_null_census(probe: &DataType, sub: &DataType) -> bool {
+    probe.is_nullable() || sub.is_nullable()
+}
+
+/// `sub` reduced to "did it produce a row": one non-NULL column, one row at
+/// most. `LIMIT 1` is what makes an existence test cost a granule rather than a
+/// table, and the literal `true` is what keeps case 3 out of NULL territory --
+/// the probed column cannot be NULL, so the anti-join's `IS NULL` test means
+/// "no row" and nothing else.
+fn exists_probe(sub: LogicalPlan) -> LogicalPlan {
+    let one = BoundExpr::lit(Value::Bool(true));
+    let schema = Schema::new_unchecked(vec![Field::new("exists", one.ty())]);
+    LogicalPlan::Limit {
+        input: Box::new(LogicalPlan::Project {
+            input: Box::new(sub),
+            exprs: vec![one],
+            schema,
+        }),
+        limit: Some(1),
+        offset: 0,
+    }
+}
+
+fn distinct(sub: LogicalPlan) -> LogicalPlan {
+    LogicalPlan::Distinct { input: Box::new(sub) }
+}
+
+/// Cases 2 and 4 as one row above an anti-join: `[count(), count(y)]` over the
+/// subquery, cross joined on, then tested.
+///
+/// An empty group list is what makes the cross join safe -- an aggregate with
+/// no `GROUP BY` emits exactly one row even over no input, which is precisely
+/// the "S is empty" fact case 4 needs and which a `LIMIT 1` marker could not
+/// deliver (an empty S produces no marker row to test).
+fn census_guard(
+    left: LogicalPlan,
+    key: BoundExpr,
+    sub: LogicalPlan,
+    probe_ty: &DataType,
+    sub_ty: &DataType,
+) -> Result<LogicalPlan> {
+    let func = aggregate("count").expect("`count` is a registry builtin");
+    let y = col_at(&sub, 0);
+    let agg = |args: Vec<BoundExpr>, name: &str| -> Result<BoundAgg> {
+        let tys: Vec<DataType> = args.iter().map(|a| a.ty()).collect();
+        Ok(BoundAgg {
+            func,
+            ty: (func.ret)(&tys, &[])?,
+            args,
+            params: Vec::new(),
+            distinct: false,
+            name: name.into(),
+        })
+    };
+    let aggs = vec![agg(Vec::new(), "rows")?, agg(vec![y], "nonnull")?];
+    let schema = Schema::new_unchecked(
+        aggs.iter().map(|a| Field::new(a.name.clone(), a.ty.clone())).collect(),
+    );
+    let census =
+        LogicalPlan::Aggregate { input: Box::new(sub), group: Vec::new(), aggs, schema };
+
+    let n = left.schema().len();
+    let joined = append_join(left, census, Vec::new(), JoinOp::Cross);
+    let (rows, nonnull) = (col_at(&joined, n), col_at(&joined, n + 1));
+    let cmp = |l: BoundExpr, op: BinaryOp, r: BoundExpr| BoundExpr::Binary {
+        left: Box::new(l),
+        op,
+        right: Box::new(r),
+        ty: DataType::Bool,
+    };
+    let mut conj = Vec::new();
+    if sub_ty.is_nullable() {
+        conj.push(cmp(rows.clone(), BinaryOp::Eq, nonnull));
+    }
+    if probe_ty.is_nullable() {
+        // Not `x IS NOT NULL`: case 4 says an empty subquery admits a NULL `x`.
+        // Both operands are counts or an `IS NULL`, so neither can be NULL and
+        // the OR is two-valued.
+        conj.push(cmp(
+            BoundExpr::IsNull { expr: Box::new(key), negated: true },
+            BinaryOp::Or,
+            cmp(rows, BinaryOp::Eq, BoundExpr::lit(Value::UInt(0))),
+        ));
+    }
+    Ok(match BoundExpr::join_conjuncts(conj) {
+        Some(predicate) => LogicalPlan::Filter { input: Box::new(joined), predicate },
+        // `needs_null_census` is the caller's gate and it is the disjunction of
+        // the two tests above, so this is unreachable -- but a census whose
+        // every clause folded away is still a correct, if pointless, plan.
+        None => joined,
+    })
+}
+
+fn col_at(plan: &LogicalPlan, i: usize) -> BoundExpr {
+    let f = &plan.schema().fields()[i];
+    BoundExpr::Column { index: i, ty: f.ty.clone(), name: f.name.clone() }
+}
+
+/// Make `probe` a column of `left`, so the join can name it in `on`.
+///
+/// A bare column -- `WHERE k IN (...)`, which is nearly every real query -- is
+/// already one and costs nothing. Anything else buys one `Project`, whose
+/// pass-through columns the executor hands on by reference.
+fn keyed(left: LogicalPlan, probe: BoundExpr) -> (LogicalPlan, usize) {
+    if let Some(i) = probe.as_column() {
+        return (left, i);
+    }
+    let n = left.schema().len();
+    let mut exprs: Vec<BoundExpr> = (0..n).map(|i| col_at(&left, i)).collect();
+    let mut fields = left.schema().fields().to_vec();
+    fields.push(Field::new("in", probe.ty()));
+    exprs.push(probe);
+    let schema = Schema::new_unchecked(fields);
+    (LogicalPlan::Project { input: Box::new(left), exprs, schema }, n)
+}
+
+/// `left` joined to a one-column `right`, right's column appended.
+///
+/// The extra column is left in the output on purpose. Every operator above a
+/// `SELECT`'s `WHERE` was bound against the source scope, so indices `0..n`
+/// still mean what they meant, and the projection the binder puts on top drops
+/// the appendage for free -- where a `Project` inserted here to restore the
+/// width would be an operator per row for nothing.
+fn append_join(
+    left: LogicalPlan,
+    right: LogicalPlan,
+    on: Vec<(usize, usize)>,
+    op: JoinOp,
+) -> LogicalPlan {
+    let mut fields = left.schema().fields().to_vec();
+    // A LEFT join invents a NULL for every unmatched row and the anti-join's
+    // entire test is `IS NULL` on exactly that column, so its declared type has
+    // to admit one.
+    let pads = matches!(op, JoinOp::Left);
+    fields.extend(right.schema().fields().iter().map(|f| {
+        Field::new(f.name.clone(), if pads { f.ty.to_nullable() } else { f.ty.clone() })
+    }));
+    let schema = Schema::new_unchecked(fields);
+    LogicalPlan::Join {
+        left: Box::new(left),
+        right: Box::new(right),
+        op,
+        on,
+        residual: None,
+        schema,
+    }
+}
+
+/// Keep left rows that have a match. `None` probe is the keyless existence
+/// test, where "a match" means `right` produced any row at all.
+fn semi(left: LogicalPlan, probe: Option<BoundExpr>, right: LogicalPlan) -> LogicalPlan {
+    match probe {
+        Some(p) => {
+            let (left, k) = keyed(left, p);
+            append_join(left, right, vec![(k, 0)], JoinOp::Inner)
+        }
+        None => append_join(left, right, Vec::new(), JoinOp::Cross),
+    }
+}
+
+/// Keep left rows that have none -- an outer join plus "the padding fired".
+///
+/// The mark column is `right`'s only column, which the LEFT join set to NULL
+/// for exactly the unmatched rows. That needs `right` never to yield a NULL of
+/// its own where it matters, and it does not: for `NOT EXISTS` the column is a
+/// literal `true`, and for `NOT IN` a NULL on the right cannot have matched
+/// anything, so a row carrying one is a matched row and would fail the test
+/// anyway. A `NULL` *probe* is the case this cannot see, and `census_guard` is
+/// where that is settled.
+fn anti(left: LogicalPlan, key: Option<usize>, right: LogicalPlan) -> LogicalPlan {
+    let mark = left.schema().len();
+    let on = key.map(|k| vec![(k, 0)]).unwrap_or_default();
+    let joined = append_join(left, right, on, JoinOp::Left);
+    LogicalPlan::Filter {
+        predicate: BoundExpr::IsNull { expr: Box::new(col_at(&joined, mark)), negated: false },
+        input: Box::new(joined),
     }
 }
 

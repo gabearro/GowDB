@@ -26,6 +26,13 @@ name = "engine"
 path = "benches/engine.rs"
 harness = false
 
+# Measures the planner rather than the machinery: every shape races the plan
+# the optimizer chose against the best plan available for the same answer.
+[[bench]]
+name = "planner"
+path = "benches/planner.rs"
+harness = false
+
 [profile.release]
 opt-level = 3
 lto = "fat"

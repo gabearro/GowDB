@@ -888,7 +888,16 @@ pub(crate) fn merge_runs(
         for (r, c) in rs.iter_mut().zip(&cur) {
             if c.pos >= c.end && r.b.rows() > 0 {
                 r.b = r.b.slice(0, 0);
-                r.kx.clear();
+                // Sliced to empty, NOT cleared. `key_col` indexes `kx` by the
+                // key's position, so dropping the elements makes a later probe
+                // of a spent run index out of bounds -- which only shows up on
+                // a computed sort key, because `KeyAt::Col` reads `r.b`, and
+                // slicing a block keeps its columns while clearing a Vec does
+                // not. Slicing frees the same rows and keeps the indexing
+                // contract. Found by `ORDER BY id + 0` in the exchange tests.
+                for c in &mut r.kx {
+                    *c = c.slice(0, 0);
+                }
             }
         }
     }

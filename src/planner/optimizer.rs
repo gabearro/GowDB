@@ -1,26 +1,49 @@
 //! Logical plan rewrites.
 //!
-//! Four passes, in the order that makes each one see the most opportunity:
+//! Five passes, in the order that makes each one see the most opportunity:
 //!
 //! 1. **constant folding** -- collapses literal arithmetic so later passes see
 //!    `x > 100` rather than `x > 50 + 50`, and turns `WHERE 1 = 1` into
 //!    nothing at all;
-//! 2. **predicate pushdown** -- sinks each conjunct as close to the scan as it
-//!    can legally go. This is the single highest-value rewrite in a columnar
-//!    engine, because a predicate that reaches the scan filters rows *before*
-//!    the other columns are decoded;
-//! 3. **zone-filter extraction** -- turns `col <op> literal` conjuncts into
+//! 2. **predicate shaping** -- rewrites a conjunct into the form the passes
+//!    below it can read: `NOT` pushed inward, an OR-chain of equalities folded
+//!    into an `IN`, an arithmetic identity dropped off a column;
+//! 3. **predicate pushdown** -- sinks each conjunct as close to the scan as it
+//!    can legally go, through joins, aggregates, unions and set operators as
+//!    well as the trivial cases. This is the single highest-value rewrite in a
+//!    columnar engine, because a predicate that reaches the scan filters rows
+//!    *before* the other columns are decoded -- and because below a join it
+//!    decides the size of the hash table rather than the size of the answer;
+//! 4. **zone-filter extraction** -- turns `col <op> literal` conjuncts into
 //!    granule-level pruning tests. This is what makes a selective query touch
 //!    a handful of granules instead of the whole table;
-//! 4. **projection pruning** -- narrows each scan to the columns actually
+//! 5. **projection pruning** -- narrows each scan to the columns actually
 //!    read, so unreferenced columns are never touched at all.
+//!
+//! Passes 2 and 3 are one story told twice: pass 2 exists because pushdown,
+//! the zone maps and the index path all recognize predicates by *shape*, and a
+//! predicate written in a shape none of them recognize is a predicate that
+//! reaches none of them. `NOT (k > 5)` and `k = 5 OR k = 6` are each worth
+//! ~20x on this machine purely for being spelled the other way (see
+//! `normalize_predicates`).
 //!
 //! Every pass is a pure `LogicalPlan -> LogicalPlan` function, so they compose
 //! and can be tested in isolation.
+//!
+//! What the two new passes cost a query no rule fires on, since planning runs
+//! once per query and the rules do not: `EXPLAIN` over six shapes chosen so
+//! nothing moves (a point lookup, a four-conjunct WHERE, a HAVING over an
+//! aggregate result, and outer joins with unsinkable conjuncts), best-of-8 x
+//! 3000, three rounds, against a HEAD build. 4.9-5.7 us/plan becomes
+//! 5.2-5.7 us on the cheapest and 8.5-10.8 becomes 10.0-11.4 on the rest --
+//! one to two microseconds of extra tree walking, per query, against wins
+//! measured in milliseconds. Cross-process rather than interleaved, because
+//! the switch that made the interleaved measurements has been deleted; only a
+//! difference this size or larger is meaningful.
 
 use crate::common::{Error, Result};
-use crate::sql::ast::{BinaryOp, UnaryOp};
-use crate::types::{DataType, Value};
+use crate::sql::ast::{BinaryOp, JoinOp, UnaryOp};
+use crate::types::{DataType, Schema, Value};
 
 use super::logical::{BoundExpr, CmpOp, LogicalPlan, ZoneFilter};
 
@@ -51,6 +74,7 @@ fn too_deep(what: &str) -> Error {
 
 pub fn optimize(plan: LogicalPlan) -> Result<LogicalPlan> {
     let plan = fold_constants(plan)?;
+    let plan = normalize_predicates(plan)?;
     let plan = push_down_filters(plan)?;
     let plan = extract_zone_filters(plan)?;
     prune_projections(plan)
@@ -436,7 +460,297 @@ fn fold_constants(plan: LogicalPlan) -> Result<LogicalPlan> {
     }, 0)
 }
 
-// -------------------------------------------------------- 2. filter pushdown
+// ------------------------------------------------------ 2. predicate shaping
+
+/// Rewrite every predicate into the shape the passes below can read.
+///
+/// Nothing here changes *which rows* a predicate admits. What it changes is
+/// whether the rest of the planner can see that: pushdown splits on `AND`, the
+/// zone maps read `col <op> literal`, and the index path reads `pk = c` and
+/// `pk IN (...)`. A predicate spelled any other way reaches none of them and
+/// is evaluated per row over the whole table.
+///
+/// Measured on this machine, 300k rows, `SELECT count() FROM a WHERE <p>`,
+/// A/B interleaved best-of-9 through a temporary switch, three runs:
+///
+/// ```text
+///   NOT (k > 299990)          0.38 ms -> 0.017 ms   21-25x  -> k <= 299990
+///   NOT (k > hi OR k < lo)    0.23 ms -> 0.021 ms   10-12x  -> two conjuncts
+///   k = 1 OR k = 2 OR k = 3   0.25 ms -> 0.010 ms   23-29x  -> k IN (..), and
+///                                                              an index probe
+///   s + 0 = 150000            0.21 ms -> 0.056 ms   3.3-3.9x
+/// ```
+///
+/// `CAST(5 AS UInt64)` needs nothing here: constant folding above already
+/// collapses a cast over a literal, and the measurement agrees (0.95-0.99x,
+/// i.e. noise, against the bare literal). Recorded so nobody adds a rule for
+/// it.
+///
+/// Only predicate positions are rewritten -- a `Filter`, a scan's PREWHERE and
+/// a join residual. A projection is a value context, where `NOT NOT x` and
+/// `x + 0` are not the same expression as `x` for every `x`, and there is
+/// nothing downstream that would read the rewritten shape anyway.
+fn normalize_predicates(plan: LogicalPlan) -> Result<LogicalPlan> {
+    map_plan(
+        plan,
+        &mut |p| {
+            Ok(match p {
+                LogicalPlan::Filter { input, predicate } => {
+                    LogicalPlan::Filter { input, predicate: norm(predicate)? }
+                }
+                LogicalPlan::Scan(mut s) => {
+                    s.filters = s.filters.into_iter().map(norm).collect::<Result<_>>()?;
+                    LogicalPlan::Scan(s)
+                }
+                LogicalPlan::Join { left, right, op, on, residual, schema } => LogicalPlan::Join {
+                    left,
+                    right,
+                    op,
+                    on,
+                    residual: residual.map(norm).transpose()?,
+                    schema,
+                },
+                other => other,
+            })
+        },
+        0,
+    )
+}
+
+fn norm(e: BoundExpr) -> Result<BoundExpr> {
+    norm_at(e, 0)
+}
+
+/// Walks only the boolean skeleton -- `AND`, `OR`, `NOT` and the comparison
+/// leaves. A predicate buried inside a `CASE` arm or a function argument is
+/// left alone: no pass below reads into one, so rewriting it would be work
+/// nobody collects on.
+fn norm_at(e: BoundExpr, depth: usize) -> Result<BoundExpr> {
+    if depth > MAX_PLAN_DEPTH {
+        return Err(too_deep("expression"));
+    }
+    let d = depth + 1;
+    Ok(match e {
+        BoundExpr::Unary { op: UnaryOp::Not, expr, ty } => {
+            let inner = norm_at(*expr, d)?;
+            match negate(&inner) {
+                // Re-normalized because the rewrite exposes more of it: the
+                // `AND` a De Morgan step just produced has two fresh operands
+                // that may each fold into an `IN`.
+                Some(n) => norm_at(n, d)?,
+                None => BoundExpr::Unary { op: UnaryOp::Not, expr: Box::new(inner), ty },
+            }
+        }
+        BoundExpr::Binary { left, op, right, ty } if op.is_logical() => {
+            let e = BoundExpr::Binary {
+                left: Box::new(norm_at(*left, d)?),
+                op,
+                right: Box::new(norm_at(*right, d)?),
+                ty,
+            };
+            if op == BinaryOp::Or {
+                or_to_in(e)
+            } else {
+                e
+            }
+        }
+        BoundExpr::Binary { left, op, right, ty } if op.is_comparison() => BoundExpr::Binary {
+            left: Box::new(strip_identity(*left)),
+            op,
+            right: Box::new(strip_identity(*right)),
+            ty,
+        },
+        other => other,
+    })
+}
+
+/// `NOT e` written without the `NOT`, or `None` when there is no such form.
+///
+/// Every arm is an identity of **Kleene** three-valued logic, not two-valued
+/// logic, which is the only reason this is safe: `NOT (k > 5)` is `k <= 5`
+/// *including* when `k` is NULL, because both are UNKNOWN there rather than
+/// one being true and the other false. De Morgan holds in Kleene logic too
+/// (`NOT (U OR F)` and `NOT U AND NOT F` are both UNKNOWN), and that is the
+/// arm worth having: `NOT (a OR b)` becomes two conjuncts, which pushdown can
+/// then move to two different places.
+///
+/// `NOT (x LIKE p)` -> `x NOT LIKE p` and `NOT (x IN l)` -> `x NOT IN l` are
+/// exact rather than approximate: `like_const` (exec/functions/scalar.rs) XORs
+/// the match with `negated` and carries the subject's null mask through
+/// untouched, and `eval_in_list` answers UNKNOWN for a NULL probe whichever
+/// way `negated` is set.
+fn negate(e: &BoundExpr) -> Option<BoundExpr> {
+    Some(match e {
+        // `NOT NOT x` is `x` only when `x` is already boolean. `NOT NOT 5` is
+        // TRUE and 5 is not, and this file has to hand the same value to the
+        // vectorized evaluator that the evaluator would have computed itself.
+        BoundExpr::Unary { op: UnaryOp::Not, expr, .. }
+            if expr.ty().base() == &DataType::Bool =>
+        {
+            (**expr).clone()
+        }
+        BoundExpr::Binary { left, op, right, ty } if op.is_logical() => BoundExpr::Binary {
+            left: Box::new(negate(left)?),
+            op: if *op == BinaryOp::And { BinaryOp::Or } else { BinaryOp::And },
+            right: Box::new(negate(right)?),
+            ty: ty.clone(),
+        },
+        BoundExpr::Binary { left, op, right, ty } if op.is_comparison() => BoundExpr::Binary {
+            left: left.clone(),
+            op: negate_cmp(*op),
+            right: right.clone(),
+            ty: ty.clone(),
+        },
+        BoundExpr::InList { expr, list, negated } => BoundExpr::InList {
+            expr: expr.clone(),
+            list: list.clone(),
+            negated: !negated,
+        },
+        BoundExpr::Like { expr, pattern, negated, case_insensitive } => BoundExpr::Like {
+            expr: expr.clone(),
+            pattern: pattern.clone(),
+            negated: !negated,
+            case_insensitive: *case_insensitive,
+        },
+        BoundExpr::IsNull { expr, negated } => {
+            BoundExpr::IsNull { expr: expr.clone(), negated: !negated }
+        }
+        _ => return None,
+    })
+}
+
+fn negate_cmp(op: BinaryOp) -> BinaryOp {
+    match op {
+        BinaryOp::Eq => BinaryOp::NotEq,
+        BinaryOp::NotEq => BinaryOp::Eq,
+        BinaryOp::Lt => BinaryOp::GtEq,
+        BinaryOp::LtEq => BinaryOp::Gt,
+        BinaryOp::Gt => BinaryOp::LtEq,
+        BinaryOp::GtEq => BinaryOp::Lt,
+        other => other,
+    }
+}
+
+/// `k = 1 OR k = 2 OR k = 3` -> `k IN (1, 2, 3)`.
+///
+/// The `IN` is what the index path and the zone maps read; a chain of ORs
+/// reaches neither, because both recognize one conjunct at a time and an OR is
+/// one conjunct that mentions three values.
+///
+/// Truth-table identical in three-valued logic, which is why the NULL cases
+/// are refused rather than handled: `k = NULL` is UNKNOWN for every `k` and a
+/// NULL *in* the list makes a miss UNKNOWN, so both forms still agree -- but
+/// `as_zone_filter` and `key_set` then each have to reason about it for a
+/// shape no query writes.
+fn or_to_in(e: BoundExpr) -> BoundExpr {
+    let mut col: Option<(usize, DataType, String)> = None;
+    let mut list: Vec<Value> = Vec::new();
+    if !collect_in(&e, &mut col, &mut list) {
+        return e;
+    }
+    match col {
+        // One disjunct is not an OR-chain; two is the smallest one that had to
+        // be written as an OR.
+        Some((index, ty, name)) if list.len() > 1 => BoundExpr::InList {
+            expr: Box::new(BoundExpr::Column { index, ty, name }),
+            list,
+            negated: false,
+        },
+        _ => e,
+    }
+}
+
+/// Every disjunct is `col = literal` or `col IN (...)` on the *same* column.
+///
+/// Fails as soon as one is not, so a mixed `k = 1 OR v > 2` costs one walk and
+/// no rewrite. Accepting an `IN` as a disjunct is what makes the chain
+/// associativity-blind: `norm_at` folds bottom-up, so by the time the outer OR
+/// of `k = 1 OR k = 2 OR k = 3` is reached its left operand is already
+/// `k IN (1, 2)`.
+fn collect_in(
+    e: &BoundExpr,
+    col: &mut Option<(usize, DataType, String)>,
+    list: &mut Vec<Value>,
+) -> bool {
+    let mut same = |c: &BoundExpr| match (c, &*col) {
+        (BoundExpr::Column { index, .. }, Some((i, ..))) => index == i,
+        (BoundExpr::Column { index, ty, name }, None) => {
+            *col = Some((*index, ty.clone(), name.clone()));
+            true
+        }
+        _ => false,
+    };
+    match e {
+        BoundExpr::Binary { left, op: BinaryOp::Or, right, .. } => {
+            collect_in(left, col, list) && collect_in(right, col, list)
+        }
+        BoundExpr::Binary { left, op: BinaryOp::Eq, right, .. } => {
+            let (c, v) = match (left.as_literal(), right.as_literal()) {
+                (None, Some(v)) => (&**left, v),
+                (Some(v), None) => (&**right, v),
+                _ => return false,
+            };
+            if v.is_null() || !same(c) {
+                return false;
+            }
+            list.push(v.clone());
+            true
+        }
+        BoundExpr::InList { expr, list: l, negated: false } => {
+            if l.iter().any(Value::is_null) || !same(expr) {
+                return false;
+            }
+            list.extend(l.iter().cloned());
+            true
+        }
+        _ => false,
+    }
+}
+
+/// `x + 0`, `0 + x`, `x - 0`, `x * 1`, `1 * x` and a cast to the type `x`
+/// already has, all of which leave a bare column where the zone maps and the
+/// index want one.
+///
+/// **The type guard is the whole rule.** `k + 0` on a `UInt64` column binds to
+/// `Int64` -- `promote` (types/datatype.rs) picks the signed type as soon as
+/// either side is signed, and the literal `0` is signed -- so on this machine
+/// `SELECT k + 0 FROM a` renders `18446744073709551615` as `-1`. Dropping the
+/// `+ 0` would not merely re-plan that query, it would change its answer.
+/// Requiring the node's own declared type to equal its operand's is what makes
+/// the rewrite an identity instead of a silent widening.
+///
+/// Applied to the top of a comparison operand only. `(k + 0) * 2 = 4` would
+/// simplify to `k * 2 = 4`, which is still not a shape any pass below reads,
+/// so descending would be work with no collector.
+fn strip_identity(e: BoundExpr) -> BoundExpr {
+    // An *integer* literal, deliberately: `x + 0.0` is not the identity on
+    // `-0.0`, and `x * Decimal(1, 0)` rescales.
+    let unit = |e: &BoundExpr, want: u64| {
+        matches!(e.as_literal(), Some(Value::Int(v)) if *v == want as i64)
+            || matches!(e.as_literal(), Some(Value::UInt(v)) if *v == want)
+    };
+    match e {
+        BoundExpr::Cast { expr, ty } if expr.ty() == ty => strip_identity(*expr),
+        BoundExpr::Binary { left, op, right, ty } => {
+            // `0 - x` is negation, not identity, so `Minus` only sheds a
+            // right-hand zero.
+            let shed_right = matches!(op, BinaryOp::Plus | BinaryOp::Minus) && unit(&right, 0)
+                || op == BinaryOp::Multiply && unit(&right, 1);
+            let shed_left = op == BinaryOp::Plus && unit(&left, 0)
+                || op == BinaryOp::Multiply && unit(&left, 1);
+            if shed_right && left.ty() == ty {
+                return strip_identity(*left);
+            }
+            if shed_left && right.ty() == ty {
+                return strip_identity(*right);
+            }
+            BoundExpr::Binary { left, op, right, ty }
+        }
+        other => other,
+    }
+}
+
+// -------------------------------------------------------- 3. filter pushdown
 
 fn push_down_filters(plan: LogicalPlan) -> Result<LogicalPlan> {
     sink_filter(plan, 0)
@@ -527,11 +841,302 @@ fn sink_filter(plan: LogicalPlan, depth: usize) -> Result<LogicalPlan> {
                     }
                     let proj =
                         LogicalPlan::Project { input: Box::new(new_input), exprs, schema };
-                    match BoundExpr::join_conjuncts(keep) {
-                        Some(p) => LogicalPlan::Filter { input: Box::new(proj), predicate: p },
-                        None => proj,
-                    }
+                    above(proj, keep)
                 }
+
+                // ------------------------------------------------ through join
+                //
+                // The legality table, because someone will need it. "sinks"
+                // means the conjunct moves into that input; "stays" means it
+                // remains a `Filter` over the join.
+                //
+                // ```text
+                //   join    left-only conjunct   right-only conjunct   spanning
+                //   INNER   sinks                sinks                 join cond
+                //   CROSS   sinks                sinks                 join cond
+                //   LEFT    sinks                STAYS                 stays
+                //   RIGHT   STAYS                sinks                 stays
+                //   FULL    STAYS                STAYS                 stays
+                // ```
+                //
+                // The two STAYS on the outer rows are the classic bug. A LEFT
+                // JOIN emits a NULL-padded row for every left row with no
+                // match; a right-side conjunct evaluated *above* the join sees
+                // those NULLs and answers UNKNOWN, so the row is dropped, but
+                // the same conjunct evaluated *inside* the right input never
+                // sees them at all and the row survives NULL-padded. Sinking
+                // it silently converts the join to an INNER join. FULL has
+                // that hazard on both sides at once.
+                //
+                // What each conjunct costs where is the reason to bother: a
+                // predicate above the join filters the *answer*, one below it
+                // decides how many rows the hash table is built over. A/B
+                // interleaved best-of-9 through a temporary switch, three runs
+                // each, `SELECT count() FROM a JOIN b ON a.k = b.k WHERE
+                // a.k = <mid>`:
+                //
+                // ```text
+                //     rows        pushdown off   on         ratio
+                //   300k x 300k    13-15 ms      0.022 ms   537-637x
+                //     1M x 1M      61-154 ms     0.045 ms   1028-2436x
+                // ```
+                //
+                // The ratio grows with the row count because what is removed
+                // is a hash build over a whole input and what remains is one
+                // index probe.
+                LogicalPlan::Join { left, right, op, mut on, residual, schema } => {
+                    // The operator emits `left.columns ++ right.columns`
+                    // (`assemble`, exec/operators/join.rs), so the left width
+                    // is where one side's indices stop and the other's begin.
+                    // If the declared schema disagrees with that sum the split
+                    // point is a guess, and a guess here rewrites answers.
+                    //
+                    // Not a theoretical guard. A *nested* `USING` join is
+                    // narrower than the concatenation: `merge_using_key`
+                    // (planner/binder.rs) shadows the two per-side copies of
+                    // the key and pushes one merged entry, so the enclosing
+                    // join's schema is one column shorter than its inputs put
+                    // together. `(p JOIN q USING (id)) JOIN s USING (id)`
+                    // reaches here with `flat` false and nothing moves, which
+                    // is the right answer at the wrong speed rather than the
+                    // other way round.
+                    let ln = left.schema().len();
+                    let flat = ln + right.schema().len() == schema.len();
+                    let (to_left, to_right) = match op {
+                        JoinOp::Inner | JoinOp::Cross => (true, true),
+                        JoinOp::Left => (true, false),
+                        JoinOp::Right => (false, true),
+                        JoinOp::Full => (false, false),
+                    };
+                    let (mut lp, mut rp, mut keep) = (Vec::new(), Vec::new(), Vec::new());
+                    for c in conjuncts {
+                        let cols = c.referenced_columns();
+                        let side = if !flat || !deterministic(&c) {
+                            None
+                        } else if cols.iter().all(|&i| i < ln) {
+                            Some(false)
+                        } else if cols.iter().all(|&i| i >= ln) {
+                            Some(true)
+                        } else {
+                            None
+                        };
+                        match side {
+                            Some(false) if to_left => lp.push(c),
+                            Some(true) if to_right => {
+                                let mut c = c;
+                                c.remap_columns(&|i| Some(i - ln))
+                                    .expect("every column of a right-only conjunct is >= ln");
+                                rp.push(c);
+                            }
+                            _ => keep.push(c),
+                        }
+                    }
+
+                    // A spanning `l.x = r.y` in the WHERE is the ON clause
+                    // written somewhere else, for an inner join: both reject a
+                    // NULL on either side, and an inner join applies its
+                    // condition to exactly the rows a filter above it would
+                    // have seen. Moving it is transformative rather than
+                    // tidy -- `FROM a, b WHERE a.k = b.k` is otherwise a full
+                    // cross product materialized one block at a time before
+                    // anything looks at it, and `CROSS JOIN` with a condition
+                    // *is* `INNER JOIN` (`padding_wanted` agrees they are the
+                    // same join; the operator picks hash over nested-loop on
+                    // `on.is_empty()`, not on the op).
+                    //
+                    // Only the equi-column shape moves. Folding the rest into
+                    // `residual` was tried and is not obviously a win: the
+                    // residual runs inside `assemble` over the same rows the
+                    // filter above would have seen, so it saves one block
+                    // round-trip and nothing else.
+                    if matches!(op, JoinOp::Inner | JoinOp::Cross) && flat {
+                        let mut stays = Vec::with_capacity(keep.len());
+                        for c in keep {
+                            if let BoundExpr::Binary { left: a, op: BinaryOp::Eq, right: b, .. } =
+                                &c
+                            {
+                                match (a.as_column(), b.as_column()) {
+                                    (Some(x), Some(y)) if x < ln && y >= ln => {
+                                        on.push((x, y - ln));
+                                        continue;
+                                    }
+                                    (Some(x), Some(y)) if y < ln && x >= ln => {
+                                        on.push((y, x - ln));
+                                        continue;
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            stays.push(c);
+                        }
+                        keep = stays;
+                    }
+
+                    // TRANSITIVE INFERENCE. `on` says the two key columns are
+                    // equal in every row the join *matches*, and equal by SQL
+                    // equality -- a NULL key matches nothing, in this operator
+                    // as in the standard ("NULL keys", exec/operators/join.rs)
+                    // -- so both are non-NULL and interchangeable in any
+                    // predicate that reads nothing else. `a.k = 150000` on one
+                    // side therefore implies `b.k = 150000` on the other, and
+                    // pushing both is the difference between pruning one input
+                    // and pruning two. On the query above, with one-sided
+                    // pushdown already on: 3.2-3.4 ms against 0.015 ms at
+                    // 300k x 300k (213-251x), and 10.3-10.7 ms against
+                    // 0.018 ms at 1M x 1M. One-sided pushdown alone is 4.2x,
+                    // so nearly all of the 537x above is this.
+                    //
+                    // The legality table for the *inferred* copy is the mirror
+                    // image of the one for an original conjunct, and reads the
+                    // other way round on the outer joins:
+                    //
+                    // ```text
+                    //   join    inferred into LEFT input   into RIGHT input
+                    //   INNER   legal                      legal
+                    //   CROSS   legal                      legal
+                    //   LEFT    NO                         legal
+                    //   RIGHT   legal                      NO
+                    //   FULL    NO                         NO
+                    // ```
+                    //
+                    // An inferred predicate only ever removes rows that could
+                    // not have matched anything, so the one question is whether
+                    // this join emits a row for an input row that matches
+                    // nothing. A LEFT JOIN does for the left input, which is
+                    // why nothing may be inferred *into* it -- and does not for
+                    // the right, which is why a right-side conjunct that may
+                    // not be written by hand (it would drop the NULL-padded
+                    // rows) may still be inferred.
+                    //
+                    // Known boundary: only conjuncts crossing *this* join seed
+                    // it. A predicate already sitting inside a subquery on the
+                    // join key --
+                    // `(SELECT k FROM a WHERE k = c) a JOIN b ON a.k = b.k` --
+                    // is not mirrored, and measures 2.5 ms at 300k x 300k
+                    // against 0.012 ms for the same query written without the
+                    // subquery. Closing it needs a walk of the child subtree
+                    // for single-column filters, mapped up through whatever
+                    // projections lie between; `equal_columns` below is half of
+                    // that machinery. Not built, because the shape only arises
+                    // when somebody hand-pushes a predicate this pass would
+                    // have pushed for them.
+                    let (ls, rs) = (left.schema(), right.schema());
+                    let (into_l, into_r) = match op {
+                        JoinOp::Inner | JoinOp::Cross => (true, true),
+                        JoinOp::Left => (false, true),
+                        JoinOp::Right => (true, false),
+                        JoinOp::Full => (false, false),
+                    };
+                    // Both directions are read off the *pre-extension* lists,
+                    // so an inferred conjunct is never itself re-inferred back
+                    // across the join it came from.
+                    let add_r =
+                        into_r.then(|| mirrored(&lp, &on, ls, rs, &left, false, &rp));
+                    if into_l {
+                        let add_l = mirrored(&rp, &on, rs, ls, &right, true, &lp);
+                        lp.extend(add_l);
+                    }
+                    rp.extend(add_r.into_iter().flatten());
+
+                    let op = match op {
+                        JoinOp::Cross if !on.is_empty() => JoinOp::Inner,
+                        other => other,
+                    };
+
+                    let join = LogicalPlan::Join {
+                        left: Box::new(below(*left, lp, depth)?),
+                        right: Box::new(below(*right, rp, depth)?),
+                        op,
+                        on,
+                        residual,
+                        schema,
+                    };
+                    above(join, keep)
+                }
+
+                // ------------------------------------------- through aggregate
+                //
+                // A conjunct over GROUP BY keys alone selects whole groups, so
+                // running it on the input rows instead removes exactly the
+                // groups it would have removed and leaves every surviving
+                // group's aggregates untouched. One over an aggregate *result*
+                // cannot move -- that is what HAVING is, and the binder
+                // already put it here rather than in the WHERE.
+                //
+                // So the work left is real: the binder lowers
+                // `GROUP BY k HAVING k = 5` to a `Filter` above the
+                // `Aggregate`, and nothing moved it down. 300k rows, A/B
+                // interleaved best-of-9, three runs: 15.6-16.6 ms ->
+                // 0.036-0.042 ms, 370-430x. A *computed* group key
+                // (`GROUP BY k + 1 HAVING g = c`) is 55x rather than 400x --
+                // the substituted expression is not a bare column, so it
+                // reaches the PREWHERE but not the zone maps.
+                //
+                // The output schema is `[group..., agg...]`, so a conjunct
+                // qualifies iff every column it reads is below `group.len()`.
+                // Column `i` is then replaced by `group[i]` -- the whole
+                // expression, not a renumbering, because `GROUP BY toYear(ts)`
+                // names a column that only exists above this node.
+                LogicalPlan::Aggregate { input, group, aggs, schema } => {
+                    let (down, keep): (Vec<BoundExpr>, Vec<BoundExpr>) =
+                        conjuncts.into_iter().partition(|c| {
+                            deterministic(c)
+                                && c.referenced_columns().iter().all(|&i| {
+                                    group.get(i).is_some_and(deterministic)
+                                })
+                        });
+                    let mut inner = *input;
+                    if !down.is_empty() {
+                        let mapped: Vec<BoundExpr> = down
+                            .into_iter()
+                            .map(|mut c| {
+                                subst_columns(&mut c, &|i| group[i].clone());
+                                c
+                            })
+                            .collect();
+                        inner = below(inner, mapped, depth)?;
+                    }
+                    let agg =
+                        LogicalPlan::Aggregate { input: Box::new(inner), group, aggs, schema };
+                    above(agg, keep)
+                }
+
+                // ----------------------------------------------- through union
+                //
+                // Filtering a concatenation is filtering each branch. Every
+                // branch has the union's arity by construction, so a conjunct
+                // means the same thing in each one and needs no rewriting --
+                // only a clone, which is planning-time memory for a per-row
+                // saving. Distinct-union is unaffected: dedup then filter and
+                // filter then dedup are the same set.
+                //
+                // 300k + 300k rows, `WHERE k = 150000` outside the union:
+                // 0.75-0.83 ms -> 0.015 ms, 51-52x. Outside a DISTINCT over
+                // the same data it is 17.5-19.2 ms -> 0.035 ms, 495-540x --
+                // the dedup is what made that one expensive.
+                LogicalPlan::Union { inputs, all, schema } => {
+                    let (down, keep) = movable(conjuncts);
+                    let mut branches = Vec::with_capacity(inputs.len());
+                    for b in inputs {
+                        branches.push(below(b, down.clone(), depth)?);
+                    }
+                    above(LogicalPlan::Union { inputs: branches, all, schema }, keep)
+                }
+
+                // Through DISTINCT unchanged: filtering before dedup and after
+                // it select the same set, and doing it first is strictly less
+                // to dedup.
+                LogicalPlan::Distinct { input } => {
+                    let (down, keep) = movable(conjuncts);
+                    let d = LogicalPlan::Distinct { input: Box::new(below(*input, down, depth)?) };
+                    above(d, keep)
+                }
+
+                // `Limit`, `LimitBy` and `Window` end the descent, and all
+                // three for the same reason: they choose rows by *position*
+                // among their input, so removing input rows changes which ones
+                // they choose. `LIMIT 5` after a filter is not `LIMIT 5`
+                // before it.
                 other => LogicalPlan::Filter {
                     input: Box::new(other),
                     predicate: BoundExpr::join_conjuncts(conjuncts).unwrap(),
@@ -542,7 +1147,215 @@ fn sink_filter(plan: LogicalPlan, depth: usize) -> Result<LogicalPlan> {
     })
 }
 
-// ---------------------------------------------------- 3. zone-map extraction
+/// `preds` as a `Filter` under `child`, sunk one level further, or `child`
+/// itself when there is nothing left to filter with.
+fn below(child: LogicalPlan, preds: Vec<BoundExpr>, depth: usize) -> Result<LogicalPlan> {
+    match BoundExpr::join_conjuncts(preds) {
+        Some(p) => sink_filter(LogicalPlan::Filter { input: Box::new(child), predicate: p }, depth),
+        None => Ok(child),
+    }
+}
+
+/// The conjuncts that could not move, put back over the node they stopped at.
+fn above(child: LogicalPlan, preds: Vec<BoundExpr>) -> LogicalPlan {
+    match BoundExpr::join_conjuncts(preds) {
+        Some(p) => LogicalPlan::Filter { input: Box::new(child), predicate: p },
+        None => child,
+    }
+}
+
+/// Split conjuncts into (may move, must stay) on determinism alone, for the
+/// operators where that is the only question.
+fn movable(cs: Vec<BoundExpr>) -> (Vec<BoundExpr>, Vec<BoundExpr>) {
+    cs.into_iter().partition(deterministic)
+}
+
+/// Functions whose value is not decided by their arguments.
+///
+/// Sinking a conjunct changes how many rows it runs over and in what order --
+/// below a union it sees one branch at a time, below a join it sees a whole
+/// input rather than the matches -- so a predicate mentioning any of these
+/// would return a different number of rows in its new home. `rand()` is a
+/// counter-based splitmix and `now()` is read once per block, so neither is
+/// even stable within one query.
+///
+/// [`ScalarFn`](crate::exec::functions::ScalarFn) carries no purity flag, so
+/// this is a list of names and a new impure function has to be added to it.
+/// `const_eval` takes the blunter version of the same precaution and folds no
+/// scalar call at all.
+const IMPURE: [&str; 4] = ["now", "today", "rand", "rand64"];
+
+fn deterministic(e: &BoundExpr) -> bool {
+    let mut ok = true;
+    e.visit(&mut |n| {
+        if let BoundExpr::Scalar { func, .. } = n {
+            ok &= !IMPURE.contains(&func.name);
+        }
+    });
+    ok
+}
+
+/// Replace every `Column` with whatever `f` says stands in its place.
+///
+/// Wider than [`BoundExpr::remap_columns`], which can only renumber: a
+/// conjunct sinking below an aggregate substitutes a whole GROUP BY expression
+/// for the output column that names it, and one mirrored across an equi-join
+/// pair has to restate the column's type and name as well as its index.
+///
+/// Unguarded recursion, like [`BoundExpr::visit`] and `remap_columns` next to
+/// it: the binder caps expression depth at the same 200 these passes do, and
+/// every tree reaching here was built by the binder.
+fn subst_columns(e: &mut BoundExpr, f: &dyn Fn(usize) -> BoundExpr) {
+    match e {
+        BoundExpr::Column { index, .. } => *e = f(*index),
+        BoundExpr::Unary { expr, .. }
+        | BoundExpr::Cast { expr, .. }
+        | BoundExpr::InList { expr, .. }
+        | BoundExpr::Like { expr, .. }
+        | BoundExpr::IsNull { expr, .. } => subst_columns(expr, f),
+        BoundExpr::Binary { left, right, .. } => {
+            subst_columns(left, f);
+            subst_columns(right, f);
+        }
+        BoundExpr::Scalar { args, .. } => args.iter_mut().for_each(|a| subst_columns(a, f)),
+        BoundExpr::Case { when_then, else_result, .. } => {
+            for (w, t) in when_then.iter_mut() {
+                subst_columns(w, f);
+                subst_columns(t, f);
+            }
+            if let Some(x) = else_result {
+                subst_columns(x, f);
+            }
+        }
+        BoundExpr::Literal { .. } => {}
+    }
+}
+
+/// Every conjunct of `src` restated against the other side of an equi-join
+/// pair. See the call site for why this is legal.
+///
+/// Three guards, all narrow on purpose:
+///
+///   * the conjunct must read *exactly one* column, and some column equal to it
+///     must be a key of an `on` pair. `a.k = 150000` qualifies, `a.k = a.v`
+///     does not -- `a.v` has no counterpart to restate it against;
+///   * the two key columns must share a base type. `on` compares them through
+///     the join's own key extraction, but the mirrored *predicate* would be
+///     compared under whatever rule its literal and the new column imply, and
+///     `k = -1` does not mean the same thing to a `UInt64` lane as to an
+///     `Int64` one;
+///   * `have` is the target side's existing conjuncts. An inferred duplicate of
+///     one the query already wrote costs a per-row evaluation forever and buys
+///     nothing.
+///
+/// "some column equal to it" is what makes a star schema work. In
+/// `x JOIN y ON x.k = y.k JOIN z ON y.k = z.k`, the conjunct sinking into the
+/// outer join's left input is written on `x.k`, but the outer `on` pair names
+/// `y.k`; without the closure over [`equal_columns`] the third table is the
+/// only one that still gets scanned, and the query stays two orders of
+/// magnitude off: at 300k, one hop is 27-29 ms -> 3.95 ms (8.8x) and the
+/// closure is 27-29 ms -> 0.040-0.051 ms (614-672x).
+fn mirrored(
+    src: &[BoundExpr],
+    pairs: &[(usize, usize)],
+    from: &Schema,
+    to: &Schema,
+    from_plan: &LogicalPlan,
+    from_right: bool,
+    have: &[BoundExpr],
+) -> Vec<BoundExpr> {
+    let mut out: Vec<BoundExpr> = Vec::new();
+    if pairs.is_empty() || src.is_empty() {
+        return out;
+    }
+    let mut same = Vec::new();
+    equal_columns(from_plan, &mut same);
+    for c in src {
+        let cols = c.referenced_columns();
+        let [k] = cols[..] else { continue };
+        // The equivalence class of `k`, grown to a fixpoint. Both lists are a
+        // handful of entries -- one per equi-join pair in the subtree -- so the
+        // quadratic sweep is cheaper than any index over them, and it runs once
+        // per conjunct at plan time.
+        let mut class = vec![k];
+        let mut i = 0;
+        while i < class.len() {
+            let c = class[i];
+            for &(a, b) in &same {
+                for (x, y) in [(a, b), (b, a)] {
+                    if x == c && !class.contains(&y) {
+                        class.push(y);
+                    }
+                }
+            }
+            i += 1;
+        }
+        let Some(&(l, r)) = pairs
+            .iter()
+            .find(|(l, r)| class.contains(if from_right { r } else { l }))
+        else {
+            continue;
+        };
+        let (s, t) = if from_right { (r, l) } else { (l, r) };
+        if from.ty(s).base() != to.ty(t).base() {
+            continue;
+        }
+        let mut m = c.clone();
+        subst_columns(&mut m, &|_| BoundExpr::Column {
+            index: t,
+            ty: to.ty(t).clone(),
+            name: to.name(t).to_string(),
+        });
+        let text = m.to_string();
+        if !have.iter().chain(out.iter()).any(|e| e.to_string() == text) {
+            out.push(m);
+        }
+    }
+    out
+}
+
+/// Pairs of output columns this subtree guarantees are equal, and non-NULL, in
+/// **every** row it emits.
+///
+/// Only an inner join's own condition qualifies. An outer join's `on` pair says
+/// nothing about its output: the NULL-padded rows are exactly the ones where
+/// the two keys are not equal, which is the whole point of the padding. What
+/// does survive an outer join is whatever its never-padded side already
+/// guaranteed, so the recursion follows the same side the padding does not.
+///
+/// `Filter`, `Sort`, `Limit`, `LimitBy` and `Distinct` only drop or reorder
+/// rows, so a guarantee over their input is a guarantee over their output.
+/// Everything else -- projections that compute, aggregates, unions, windows --
+/// answers nothing rather than a rule with a caveat, because a wrong pair here
+/// mirrors a predicate onto a column that does not satisfy it.
+fn equal_columns(p: &LogicalPlan, out: &mut Vec<(usize, usize)>) {
+    match p {
+        LogicalPlan::Join { left, right, op, on, .. } => {
+            let ln = left.schema().len();
+            if matches!(op, JoinOp::Inner | JoinOp::Cross) {
+                out.extend(on.iter().map(|&(l, r)| (l, ln + r)));
+            }
+            if matches!(op, JoinOp::Inner | JoinOp::Cross | JoinOp::Left) {
+                equal_columns(left, out);
+            }
+            if matches!(op, JoinOp::Inner | JoinOp::Cross | JoinOp::Right) {
+                let at = out.len();
+                equal_columns(right, out);
+                for e in out[at..].iter_mut() {
+                    *e = (e.0 + ln, e.1 + ln);
+                }
+            }
+        }
+        LogicalPlan::Filter { input, .. }
+        | LogicalPlan::Sort { input, .. }
+        | LogicalPlan::Limit { input, .. }
+        | LogicalPlan::LimitBy { input, .. }
+        | LogicalPlan::Distinct { input } => equal_columns(input, out),
+        _ => {}
+    }
+}
+
+// ---------------------------------------------------- 4. zone-map extraction
 
 /// Turn `col <op> literal` (either operand order) into a granule pruning test.
 fn as_zone_filter(e: &BoundExpr) -> Option<ZoneFilter> {
@@ -608,7 +1421,7 @@ fn extract_zone_filters(plan: LogicalPlan) -> Result<LogicalPlan> {
     }, 0)
 }
 
-// ------------------------------------------------------ 4. projection pruning
+// ------------------------------------------------------ 5. projection pruning
 
 /// Narrow each scan to the columns something above it actually reads.
 ///
@@ -1453,5 +2266,306 @@ mod tests {
         let out =
             optimize(LogicalPlan::Filter { input: Box::new(scan()), predicate: pred }).unwrap();
         assert!(matches!(out, LogicalPlan::Empty { .. }), "got {}", out.explain());
+    }
+
+    // ------------------------------------------------- predicate shaping
+    //
+    // The end-to-end proof that these keep the answer is tests/plan_pushdown.rs,
+    // which runs every rewritten predicate and its hand-written equivalent over
+    // a NULL-heavy fixture. What is pinned here is the *shape*: a rule that
+    // stops firing is invisible to an answer test.
+
+    fn shaped(e: BoundExpr) -> String {
+        norm(e).unwrap().to_string()
+    }
+
+    fn not(e: BoundExpr) -> BoundExpr {
+        BoundExpr::Unary { op: UnaryOp::Not, expr: Box::new(e), ty: DataType::Bool }
+    }
+
+    fn lit(v: i64) -> BoundExpr {
+        BoundExpr::lit(Value::Int(v))
+    }
+
+    #[test]
+    fn not_is_pushed_inward_until_it_disappears() {
+        // The whole point of the De Morgan arm: one conjunct becomes two, and
+        // pushdown moves conjuncts.
+        let both = bin(bin(col(0), BinaryOp::Gt, lit(5)), BinaryOp::Or,
+                       bin(col(1), BinaryOp::Lt, lit(1)));
+        assert_eq!(shaped(not(both)), "((a#0 <= 5) AND (b#1 >= 1))");
+        assert_eq!(norm(not(bin(col(0), BinaryOp::Gt, lit(5)))).unwrap()
+                       .split_conjuncts().len(), 1);
+        assert_eq!(shaped(not(bin(col(0), BinaryOp::Eq, lit(5)))), "(a#0 != 5)");
+        assert_eq!(
+            shaped(not(BoundExpr::IsNull { expr: Box::new(col(0)), negated: false })),
+            "a#0 IS NOT NULL"
+        );
+        assert_eq!(
+            shaped(not(BoundExpr::InList {
+                expr: Box::new(col(0)),
+                list: vec![Value::Int(1)],
+                negated: false,
+            })),
+            "a#0 NOT IN (1)"
+        );
+        // `NOT NOT x` collapses for a boolean `x` and must not for anything
+        // else: `NOT NOT 5` is TRUE, and 5 is not.
+        let b = bin(col(0), BinaryOp::Gt, lit(5));
+        assert_eq!(shaped(not(not(b))), "(a#0 > 5)");
+        assert_eq!(shaped(not(not(col(0)))), "NOT (NOT (a#0))");
+    }
+
+    #[test]
+    fn an_or_chain_on_one_column_becomes_an_in_list() {
+        let eq = |v: i64| bin(col(0), BinaryOp::Eq, lit(v));
+        let chain = bin(bin(eq(1), BinaryOp::Or, eq(2)), BinaryOp::Or, eq(3));
+        assert_eq!(shaped(chain), "a#0 IN (1, 2, 3)");
+        // Right-associated, and with the literal on the left, and merging into
+        // an `IN` that is already there.
+        let flipped = bin(eq(1), BinaryOp::Or, bin(lit(2), BinaryOp::Eq, col(0)));
+        assert_eq!(shaped(flipped), "a#0 IN (1, 2)");
+        let merged = bin(
+            BoundExpr::InList {
+                expr: Box::new(col(0)),
+                list: vec![Value::Int(1), Value::Int(2)],
+                negated: false,
+            },
+            BinaryOp::Or,
+            eq(3),
+        );
+        assert_eq!(shaped(merged), "a#0 IN (1, 2, 3)");
+
+        // ...and the three shapes that must stay an OR. Two columns is not a
+        // chain on one; a NULL probe would need `as_zone_filter` and `key_set`
+        // to grow a rule for a shape no query writes; and a disjunct that is
+        // not an equality at all cannot join the list.
+        let two_cols = bin(eq(1), BinaryOp::Or, bin(col(1), BinaryOp::Eq, lit(2)));
+        assert_eq!(shaped(two_cols), "((a#0 = 1) OR (b#1 = 2))");
+        let nul = bin(eq(1), BinaryOp::Or, bin(col(0), BinaryOp::Eq, BoundExpr::lit(Value::Null)));
+        assert_eq!(shaped(nul), "((a#0 = 1) OR (a#0 = NULL))");
+        let ranged = bin(eq(1), BinaryOp::Or, bin(col(0), BinaryOp::Gt, lit(9)));
+        assert_eq!(shaped(ranged), "((a#0 = 1) OR (a#0 > 9))");
+    }
+
+    #[test]
+    fn an_arithmetic_identity_is_shed_only_when_the_type_survives() {
+        // `a` is Int64 and so is the literal, so `a + 0` really is `a`.
+        let p = bin(bin(col(0), BinaryOp::Plus, lit(0)), BinaryOp::Gt, lit(5));
+        assert_eq!(shaped(p), "(a#0 > 5)");
+        for (l, op, r) in [
+            (lit(0), BinaryOp::Plus, col(0)),
+            (col(0), BinaryOp::Minus, lit(0)),
+            (col(0), BinaryOp::Multiply, lit(1)),
+            (lit(1), BinaryOp::Multiply, col(0)),
+        ] {
+            let p = bin(bin(l, op, r), BinaryOp::Gt, lit(5));
+            assert_eq!(shaped(p), "(a#0 > 5)", "{op:?}");
+        }
+        // Nested, and on the literal side too.
+        let inner = bin(bin(col(0), BinaryOp::Plus, lit(0)), BinaryOp::Plus, lit(0));
+        assert_eq!(shaped(bin(inner, BinaryOp::Gt, lit(5))), "(a#0 > 5)");
+
+        // `0 - a` is negation, not identity.
+        let neg = bin(bin(lit(0), BinaryOp::Minus, col(0)), BinaryOp::Gt, lit(5));
+        assert_eq!(shaped(neg), "((0 - a#0) > 5)");
+        // A widening `+ 0` keeps its node. Spelled by hand because the binder
+        // is what normally computes the mismatch: `UInt64 + Int64` promotes to
+        // `Int64`, and `18446744073709551615 + 0` is -1 there.
+        let widened = BoundExpr::Binary {
+            left: Box::new(BoundExpr::Column {
+                index: 0,
+                ty: DataType::UInt64,
+                name: "a".into(),
+            }),
+            op: BinaryOp::Plus,
+            right: Box::new(lit(0)),
+            ty: DataType::Int64,
+        };
+        assert_eq!(shaped(bin(widened, BinaryOp::Gt, lit(5))), "((a#0 + 0) > 5)");
+    }
+
+    #[test]
+    fn only_a_purely_boolean_skeleton_is_reshaped() {
+        // A predicate inside a CASE arm is a value context and is left alone --
+        // nothing below reads into one, so rewriting it collects nothing.
+        let case = BoundExpr::Case {
+            when_then: vec![(not(bin(col(0), BinaryOp::Gt, lit(5))), lit(1))],
+            else_result: None,
+            ty: DataType::Int64,
+        };
+        assert_eq!(shaped(case.clone()), case.to_string());
+    }
+
+    // ------------------------------------------------------ pushdown legality
+
+    /// The join legality table, asserted rather than only commented. The
+    /// end-to-end version, over NULLs on both sides of all five join types, is
+    /// `every_join_type_and_predicate_answers_what_a_nested_loop_says` in
+    /// tests/plan_pushdown.rs; this is the plan shape it rests on.
+    #[test]
+    fn a_conjunct_sinks_into_exactly_the_sides_the_table_allows() {
+        use crate::types::Field;
+        let side = || {
+            LogicalPlan::Scan(Box::new(ScanNode {
+                table: "default.t".into(),
+                projection: vec![0],
+                schema: Schema::new(vec![Field::new("a", DataType::Int64)]).unwrap(),
+                filters: vec![],
+                zone_filters: vec![],
+            }))
+        };
+        let joined = Schema::new(vec![
+            Field::new("a", DataType::Int64),
+            Field::new("b", DataType::Int64),
+        ])
+        .unwrap();
+        // `left#0 = 5` and `right#1 = 5`, over `t JOIN t ON l#0 = r#0`.
+        for (op, want_left, want_right) in [
+            (JoinOp::Inner, "both", "both"),
+            (JoinOp::Left, "both", "none"),
+            (JoinOp::Right, "none", "both"),
+            (JoinOp::Full, "none", "none"),
+        ] {
+            for (at, want) in [(0usize, want_left), (1, want_right)] {
+                let pred = BoundExpr::Binary {
+                    left: Box::new(BoundExpr::Column {
+                        index: at,
+                        ty: DataType::Int64,
+                        name: "a".into(),
+                    }),
+                    op: BinaryOp::Eq,
+                    right: Box::new(lit(5)),
+                    ty: DataType::Bool,
+                };
+                let out = optimize(LogicalPlan::Filter {
+                    input: Box::new(LogicalPlan::Join {
+                        left: Box::new(side()),
+                        right: Box::new(side()),
+                        op,
+                        on: vec![(0, 0)],
+                        residual: None,
+                        schema: joined.clone(),
+                    }),
+                    predicate: pred,
+                })
+                .unwrap();
+                let e = out.explain();
+                let got = match (e.contains("Filter"), e.matches("prewhere").count()) {
+                    (true, 0) => "none",
+                    (false, 2) => "both",
+                    _ => "other",
+                };
+                assert_eq!(got, want, "{op:?}, conjunct on column {at}:\n{e}");
+            }
+        }
+    }
+
+    /// The inference is what makes "both": one written conjunct, two pruned
+    /// inputs. Without the `on` pair there is nothing to mirror it across.
+    #[test]
+    fn without_an_equi_pair_there_is_nothing_to_infer() {
+        use crate::types::Field;
+        let side = || {
+            LogicalPlan::Scan(Box::new(ScanNode {
+                table: "default.t".into(),
+                projection: vec![0],
+                schema: Schema::new(vec![Field::new("a", DataType::Int64)]).unwrap(),
+                filters: vec![],
+                zone_filters: vec![],
+            }))
+        };
+        let joined = Schema::new(vec![
+            Field::new("a", DataType::Int64),
+            Field::new("b", DataType::Int64),
+        ])
+        .unwrap();
+        let out = optimize(LogicalPlan::Filter {
+            input: Box::new(LogicalPlan::Join {
+                left: Box::new(side()),
+                right: Box::new(side()),
+                op: JoinOp::Cross,
+                on: vec![],
+                residual: None,
+                schema: joined,
+            }),
+            predicate: bin(col(0), BinaryOp::Eq, lit(5)),
+        })
+        .unwrap();
+        let e = out.explain();
+        assert_eq!(e.matches("prewhere").count(), 1, "only the side it was written on:\n{e}");
+    }
+
+    /// `equal_columns` is the difference between a two-table join and a star
+    /// schema. It must report only what survives to the *output*: an outer
+    /// join's own condition does not, because the NULL-padded rows are exactly
+    /// the ones where it fails.
+    #[test]
+    fn only_an_inner_joins_condition_is_an_output_equality() {
+        use crate::types::Field;
+        let leaf = |n: usize| {
+            LogicalPlan::Scan(Box::new(ScanNode {
+                table: "default.t".into(),
+                projection: (0..n).collect(),
+                schema: Schema::new(
+                    (0..n).map(|i| Field::new(format!("c{i}"), DataType::Int64)).collect(),
+                )
+                .unwrap(),
+                filters: vec![],
+                zone_filters: vec![],
+            }))
+        };
+        let sch = |n: usize| {
+            Schema::new((0..n).map(|i| Field::new(format!("c{i}"), DataType::Int64)).collect())
+                .unwrap()
+        };
+        let join = |l: LogicalPlan, r: LogicalPlan, op, on: Vec<(usize, usize)>, w| {
+            LogicalPlan::Join {
+                left: Box::new(l),
+                right: Box::new(r),
+                op,
+                on,
+                residual: None,
+                schema: sch(w),
+            }
+        };
+        let mut v = Vec::new();
+        equal_columns(&join(leaf(1), leaf(1), JoinOp::Inner, vec![(0, 0)], 2), &mut v);
+        assert_eq!(v, vec![(0, 1)]);
+
+        for op in [JoinOp::Left, JoinOp::Right, JoinOp::Full] {
+            let mut v = Vec::new();
+            equal_columns(&join(leaf(1), leaf(1), op, vec![(0, 0)], 2), &mut v);
+            assert!(v.is_empty(), "{op:?} pads, so its keys are not equal in the output");
+        }
+
+        // Nested: the inner join's pair has to come back shifted by the outer
+        // left width, and only from a side the outer join does not pad.
+        let inner = join(leaf(1), leaf(1), JoinOp::Inner, vec![(0, 0)], 2);
+        let mut v = Vec::new();
+        equal_columns(&join(leaf(1), inner, JoinOp::Inner, vec![(0, 0)], 3), &mut v);
+        assert_eq!(v, vec![(0, 1), (1, 2)], "own pair, then the child's shifted by 1");
+
+        let inner = join(leaf(1), leaf(1), JoinOp::Inner, vec![(0, 0)], 2);
+        let mut v = Vec::new();
+        equal_columns(&join(leaf(1), inner, JoinOp::Left, vec![(0, 0)], 3), &mut v);
+        assert!(v.is_empty(), "the child is on the padded side, so nothing survives");
+    }
+
+    #[test]
+    fn an_impure_predicate_never_moves() {
+        let rand = BoundExpr::Scalar {
+            func: crate::exec::functions::scalar::lookup("rand").unwrap(),
+            args: vec![],
+            ty: DataType::UInt64,
+        };
+        assert!(!deterministic(&bin(col(0), BinaryOp::Eq, rand)));
+        assert!(deterministic(&bin(col(0), BinaryOp::Eq, lit(5))));
+        let lower = BoundExpr::Scalar {
+            func: crate::exec::functions::scalar::lookup("lower").unwrap(),
+            args: vec![col(2)],
+            ty: DataType::String,
+        };
+        assert!(deterministic(&lower), "an ordinary function is not impure");
     }
 }
