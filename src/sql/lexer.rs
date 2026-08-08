@@ -17,11 +17,24 @@
 //! quoted word never compares equal to a keyword.
 //!
 //! **Literals are narrowed here.** An integer becomes `Value::Int` when it fits
-//! in `i64` and `Value::UInt` otherwise, floats become `Value::Float`. Doing it
-//! in the lexer means the parser never re-reads source text, and the AST holds
-//! a real [`Value`] the planner can constant-fold without another parse step.
-//! Note that a leading `-` is *not* part of a numeric token -- the parser folds
-//! `-<literal>` back into the literal, because `a-1` must lex as three tokens.
+//! in `i64` and `Value::UInt` otherwise. Doing it in the lexer means the parser
+//! never re-reads source text, and the AST holds a real [`Value`] the planner
+//! can constant-fold without another parse step. Note that a leading `-` is
+//! *not* part of a numeric token -- the parser folds `-<literal>` back into the
+//! literal, because `a-1` must lex as three tokens.
+//!
+//! **A decimal point makes an exact literal; an exponent does not.** `0.1` is
+//! `Value::Decimal(1, 1)` and `1.5e3` is `Value::Float(1500.0)`. This is the
+//! single decision behind `SELECT 0.1 + 0.2` answering `0.3` instead of
+//! `0.30000000000000004`, and it is Postgres's rule: an unsuffixed decimal
+//! constant is `numeric`, and only combining it with a float makes it one.
+//!
+//! The exponent form has to stay a float, and not only for compatibility. It is
+//! what `toString` of a double produces (`1e-7`, `2.5e22`), so it is the
+//! spelling that means "this came out of a binary float" -- and it is also the
+//! only spelling that can name a magnitude no `Decimal64` has. Keeping it
+//! inexact leaves every user of this dialect a way to *ask* for a float, which
+//! a rule with no exceptions would have taken away.
 //!
 //! **Byte offsets, not line/column.** `Error::parse` carries a byte offset for
 //! caret rendering; converting to line/column is the caller's job and only
@@ -350,17 +363,20 @@ fn read_quoted(sql: &str, start: usize, quote: u8, what: &str) -> Result<(String
 }
 
 /// Read a numeric literal starting at `start` (guaranteed to be a digit).
+///
+/// The point/exponent split is the whole of the decimal-literal rule; see the
+/// module header for why the exponent form has to stay a float.
 fn read_number(sql: &str, start: usize) -> Result<(Token, usize)> {
     let b = sql.as_bytes();
     let mut i = start;
-    let mut is_float = false;
+    let (mut point, mut exp) = (false, false);
     while i < b.len() && b[i].is_ascii_digit() {
         i += 1;
     }
     // A `.` only continues the number when a digit follows, so `t.1` and a
     // trailing `1.` still lex as separate tokens instead of eating the dot.
     if i + 1 < b.len() && b[i] == b'.' && b[i + 1].is_ascii_digit() {
-        is_float = true;
+        point = true;
         i += 1;
         while i < b.len() && b[i].is_ascii_digit() {
             i += 1;
@@ -372,7 +388,7 @@ fn read_number(sql: &str, start: usize) -> Result<(Token, usize)> {
             j += 1;
         }
         if j < b.len() && b[j].is_ascii_digit() {
-            is_float = true;
+            exp = true;
             i = j;
             while i < b.len() && b[i].is_ascii_digit() {
                 i += 1;
@@ -392,20 +408,32 @@ fn read_number(sql: &str, start: usize) -> Result<(Token, usize)> {
         ));
     }
     let text = &sql[start..i];
-    let v = if is_float {
-        Value::Float(
-            text.parse::<f64>()
-                .map_err(|_| Error::parse(format!("invalid float literal `{text}`"), start))?,
-        )
-    } else if let Ok(n) = text.parse::<i64>() {
-        Value::Int(n)
-    } else if let Ok(n) = text.parse::<u64>() {
-        Value::UInt(n)
-    } else {
-        return Err(Error::parse(
-            format!("integer literal `{text}` does not fit in 64 bits"),
-            start,
-        ));
+    let float = |v: &str| {
+        v.parse::<f64>()
+            .map_err(|_| Error::parse(format!("invalid float literal `{v}`"), start))
+    };
+    let v = match (point, exp) {
+        // The exact case. `Value::decimal_literal` declines a literal wider
+        // than an `i64` lane, which then falls back to the float it has always
+        // been rather than becoming an error: a number nobody asked to be exact
+        // must not stop parsing.
+        (true, false) => match Value::decimal_literal(text) {
+            Some(v) => v,
+            None => Value::Float(float(text)?),
+        },
+        (_, true) => Value::Float(float(text)?),
+        (false, false) => {
+            if let Ok(n) = text.parse::<i64>() {
+                Value::Int(n)
+            } else if let Ok(n) = text.parse::<u64>() {
+                Value::UInt(n)
+            } else {
+                return Err(Error::parse(
+                    format!("integer literal `{text}` does not fit in 64 bits"),
+                    start,
+                ));
+            }
+        }
     };
     Ok((Token::Number(v), i))
 }
@@ -474,6 +502,10 @@ mod tests {
         assert_eq!(toks("'héllo'"), vec![Token::Str("héllo".into())]);
     }
 
+    /// Inverted when decimal literals landed: `1.5` used to be
+    /// `Value::Float(1.5)` here, which is what made `SELECT 0.1 + 0.2` answer
+    /// `0.30000000000000004`. The exponent forms below are the other half of
+    /// the rule and did *not* change.
     #[test]
     fn numeric_literals_narrow_to_the_right_value() {
         assert_eq!(toks("42"), vec![Token::Number(Value::Int(42))]);
@@ -481,7 +513,7 @@ mod tests {
             toks("9223372036854775808"),
             vec![Token::Number(Value::UInt(9_223_372_036_854_775_808))]
         );
-        assert_eq!(toks("1.5"), vec![Token::Number(Value::Float(1.5))]);
+        assert_eq!(toks("1.5"), vec![Token::Number(Value::Decimal(15, 1))]);
         assert_eq!(toks("1e3"), vec![Token::Number(Value::Float(1000.0))]);
         assert_eq!(toks("1.5E-3"), vec![Token::Number(Value::Float(0.0015))]);
         // a leading minus is a separate token: `a-1` must stay three tokens
@@ -489,6 +521,42 @@ mod tests {
             toks("a-1"),
             vec![word("a"), Token::Minus, Token::Number(Value::Int(1))]
         );
+    }
+
+    /// The variant matters here and `Value`'s `Eq` is blind to it -- every
+    /// spelling of 1.5 compares equal -- so these assert on `variant()` and on
+    /// the unit/scale pair rather than with `assert_eq!` on a `Value`.
+    #[test]
+    fn a_point_makes_an_exact_literal_and_an_exponent_does_not() {
+        let num = |s: &str| match toks(s).remove(0) {
+            Token::Number(v) => v,
+            other => panic!("{s} lexed as {other:?}"),
+        };
+        // The headline case: these two are what `0.1 + 0.2` is made of.
+        assert_eq!(num("0.1").decimal_parts(), Some((1, 1)));
+        assert_eq!(num("0.2").decimal_parts(), Some((2, 1)));
+        // The scale is the digits written, trailing zeros and all, exactly as
+        // for a `Decimal64(S)` column.
+        assert_eq!(num("1.50").decimal_parts(), Some((150, 2)));
+        assert_eq!(num("1.5").decimal_parts(), Some((15, 1)));
+        assert_eq!(num("00.5").decimal_parts(), Some((5, 1)));
+        assert_eq!(num("12.34").decimal_parts(), Some((1234, 2)));
+        // 18 significant digits is the lane, and both edges of it are here:
+        // the widest exact literal, then the first one that is not.
+        assert_eq!(
+            num("0.999999999999999999").decimal_parts(),
+            Some((999_999_999_999_999_999, 18))
+        );
+        assert_eq!(num("999999999999999999.9").variant(), "Float");
+        assert_eq!(num("0.0000000000000000001").variant(), "Float");
+        // ...and the fallback is the float it always was, not an error.
+        assert_eq!(num("999999999999999999.9").as_f64(), Some(1e18));
+        // An exponent keeps the literal a float whether or not it has a point.
+        for s in ["1.5e3", "1.5E-3", "1e3", "0.1e0", "1.0e18"] {
+            assert_eq!(num(s).variant(), "Float", "{s}");
+        }
+        // An integer has no point, so it is untouched.
+        assert_eq!(num("42").variant(), "Int");
     }
 
     #[test]

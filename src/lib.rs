@@ -83,7 +83,16 @@ pub mod catalog;
 pub mod sort;
 pub mod sql;
 pub mod storage;
+pub mod system;
 pub mod types;
+
+/// Backup, restore and verify. The source lives beside the rest of the on-disk
+/// format, in `persist/`, because that is what it is a part of; it is declared
+/// here only so that `persist/mod.rs` needs no edit. Move the declaration to
+/// `pub mod backup;` there whenever that file is next touched -- the path
+/// attribute is the only thing holding the module one level too high.
+#[path = "persist/backup.rs"]
+pub mod backup;
 
 pub use common::{Error, Result};
 pub use session::{Cursor, Db, Reader, ResultSet, Session, StreamItem, Writer};

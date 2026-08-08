@@ -38,8 +38,32 @@
 //! error kinds (`Bind`, `Unsupported`); those are remapped to `Corruption`
 //! here, because "this file is damaged" is the true statement, and callers
 //! (and tests) distinguish on the error kind.
+//!
+//! ## What happens *after* detection: quarantine
+//!
+//! Detection is not the interesting half. A part file that fails its checksum
+//! used to travel up through [`read_table_image`] and `store::load_catalog` as
+//! an ordinary `Err`, which meant one bad block took the whole instance
+//! offline: `SELECT` on an unrelated table, `SHOW TABLES`, even `CREATE TABLE`
+//! all failed, because the process could not finish opening the directory.
+//!
+//! So [`read_table_image`] now *quarantines* rather than propagates: the parts
+//! that decode are returned, the ones that do not are recorded as
+//! [`DamagedPart`], and the damage is handed to the catalog, which refuses
+//! every read and every write of that table by name. The distinction that
+//! matters is per table, not per database.
+//!
+//! **The table is refused, not served short.** Returning the rows that did
+//! decode would be the worst of the three options -- the caller gets a
+//! plausible answer that is missing however many rows lived in the bad file,
+//! with nothing in the result to say so. A refusal naming the file is an
+//! answer an operator can act on. There is deliberately no "read what you can"
+//! switch here; if one is ever added it belongs where a user has to type it,
+//! not where a default can drift onto it.
 
-use std::path::Path;
+use std::cell::RefCell;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use crate::common::{BitSet, Error, Result, GRANULE_SIZE};
@@ -532,39 +556,188 @@ fn bounded(v: u64, max: u64, what: &str) -> Result<usize> {
 // tables
 // ---------------------------------------------------------------------------
 
+/// A part file the reader refused, and why.
+///
+/// The unit is the *file* and not the granule the damage was found in: a
+/// granule is not something anyone can restore from a backup, and a part file
+/// is. `why` is the reader's own diagnosis, which already names the granule,
+/// the field and the offset.
+#[derive(Clone, Debug)]
+pub struct DamagedPart {
+    /// File name inside the table directory, e.g. `part_000003.gpart`.
+    pub file: String,
+    pub why: String,
+}
+
 /// Everything a committed table directory holds.
 pub struct TableImage {
     pub def: TableDef,
+    /// The parts that decoded. **Not** necessarily every part the commit
+    /// record names -- see `damaged`, and never hand these to a reader without
+    /// consulting it.
     pub parts: Vec<Part>,
     /// The part file names, in commit order.
     pub part_files: Vec<String>,
     /// WAL byte offset the parts already cover.
     pub wal_committed: u64,
+    /// Part files the commit record names that could not be decoded. Empty on
+    /// a healthy table, which is the only shape most callers ever see.
+    pub damaged: Vec<DamagedPart>,
 }
 
 /// Load the table named `name` from the database directory `dir`.
+///
+/// Refuses a damaged table outright. This entry point hands back a bare
+/// [`Table`] with nowhere to record a quarantine, so serving one with parts
+/// missing would be exactly the silent short answer the module docs refuse;
+/// the catalog's loader is the caller that can hold the damage instead.
 pub fn read_table(dir: &Path, name: &str) -> Result<Table> {
     let img = read_table_image(&dir.join(name))?;
+    // Claimed on every path, error included: a record nobody claims would sit
+    // in the hand-off until a later load of the same directory replaced it.
+    claim_damage(&dir.join(&img.def.name));
     if img.def.name != name {
         return Err(bad(format!(
             "directory `{name}` holds the definition of table `{}`",
             img.def.name
         )));
     }
+    if let Some(d) = img.damaged.first() {
+        return Err(bad(format!(
+            "table `{name}` cannot be loaded: {} of its {} part files are damaged, \
+             starting with {} ({})",
+            img.damaged.len(),
+            img.part_files.len(),
+            d.file,
+            d.why
+        )));
+    }
     Ok(Table::from_parts(img.def, img.parts, store::delta_limit()))
 }
 
 /// Read a table directory's commit record and every part it names.
+///
+/// A part that fails to decode is quarantined, not propagated: it lands in
+/// `damaged` and in the hand-off [`claim_damage`] reads, and the rest of the
+/// table -- and every other table in the database -- still opens. The commit
+/// record itself is not optional, though: without it there is no schema and no
+/// part list, so nothing about the table is knowable and the error stands.
 pub fn read_table_image(tdir: &Path) -> Result<TableImage> {
     let path = tdir.join(store::TABLE_FILE);
     let bytes = store::read_file(&path)?;
     let (def, part_files, wal_committed) =
         table_parts_from_bytes(&bytes).map_err(|e| store::prefix(&path, e))?;
     let mut parts = Vec::with_capacity(cap(part_files.len()));
+    let mut damaged = Vec::new();
     for n in &part_files {
-        parts.push(read_part(&tdir.join(n))?);
+        match read_part(&tdir.join(n)) {
+            Ok(p) => parts.push(p),
+            // The healthy parts are kept rather than dropped on the floor.
+            // They are what a repair tool -- or an explicit, typed-out
+            // "read what you can" -- would need, and they bound the damage an
+            // accidental rewrite of this table could do to the one file.
+            Err(e) => damaged.push(DamagedPart { file: n.clone(), why: e.to_string() }),
+        }
     }
-    Ok(TableImage { def, parts, part_files, wal_committed })
+    // Keyed by the directory the *definition* names, because that is the path
+    // the catalog reconstructs from the `TableDef` it is handed. The two are
+    // the same directory for every commit record this writer produces; a
+    // record naming some other table is the one case where they differ, and
+    // following the definition is what keeps a record and its claim in step.
+    //
+    // A clean table still has to *clear* an earlier load's record, but only if
+    // there is one to clear -- so the guard is what keeps the healthy open
+    // path free of even the `PathBuf` this join would allocate per table.
+    if !damaged.is_empty() || any_pending_damage() {
+        set_pending(&sibling(tdir, &def.name), damaged.clone());
+    }
+    Ok(TableImage { def, parts, part_files, wal_committed, damaged })
+}
+
+fn sibling(tdir: &Path, name: &str) -> PathBuf {
+    tdir.parent().map_or_else(|| PathBuf::from(name), |p| p.join(name))
+}
+
+// ---------------------------------------------------------------------------
+// the loader -> catalog hand-off
+// ---------------------------------------------------------------------------
+
+thread_local! {
+    /// Damage found by [`read_table_image`] and not yet claimed by a catalog.
+    ///
+    /// `store::load_catalog` hands each table to the catalog as a `TableDef`
+    /// and a `Vec<Part>`, and neither has room for the files that did not
+    /// decode. The reader leaves the record here instead, and
+    /// `Catalog::table_by_path_mut` claims it on the loader's own resolve --
+    /// the next thing that happens to that table, and the last one that is
+    /// allowed to succeed.
+    ///
+    /// Thread-local rather than global on purpose: a load runs start to finish
+    /// on the thread that called it, so the deposit and the claim are one
+    /// sequence with nothing of another session's interleaved. Keyed by the
+    /// table directory, so a claim can only pick up its own table's damage.
+    ///
+    /// It is a stand-in, not a design: the moment `load_catalog` passes the
+    /// image's `damaged` list to [`crate::catalog::Catalog::quarantine`]
+    /// itself, everything under this heading can go.
+    static PENDING: RefCell<Vec<(PathBuf, Vec<DamagedPart>)>> = const { RefCell::new(Vec::new()) };
+}
+
+/// How many entries are outstanding across all threads.
+///
+/// The catalog tests this before touching the thread-local at all, because it
+/// tests it on the resolve path -- once per INSERT block -- and a relaxed load
+/// of a never-written cache line is a branch the predictor gets right every
+/// time on an undamaged database, while a TLS access is not free.
+static PENDING_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+pub(crate) fn any_pending_damage() -> bool {
+    PENDING_COUNT.load(Ordering::Relaxed) != 0
+}
+
+fn set_pending(tdir: &Path, damaged: Vec<DamagedPart>) {
+    if damaged.is_empty() {
+        clear_pending(tdir);
+        return;
+    }
+    PENDING.with(|p| {
+        let mut v = p.borrow_mut();
+        match v.iter_mut().find(|(k, _)| k == tdir) {
+            Some(slot) => slot.1 = damaged,
+            None => {
+                v.push((tdir.to_path_buf(), damaged));
+                PENDING_COUNT.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    });
+}
+
+fn clear_pending(tdir: &Path) {
+    if !any_pending_damage() {
+        return;
+    }
+    PENDING.with(|p| {
+        let mut v = p.borrow_mut();
+        if let Some(i) = v.iter().position(|(k, _)| k == tdir) {
+            v.swap_remove(i);
+            PENDING_COUNT.fetch_sub(1, Ordering::Relaxed);
+        }
+    });
+}
+
+/// Take the damage recorded for `tdir`, if any. Taking is what keeps the
+/// hand-off from being sticky: a table that is dropped and re-created under
+/// the same name finds nothing here.
+pub(crate) fn claim_damage(tdir: &Path) -> Option<Vec<DamagedPart>> {
+    if !any_pending_damage() {
+        return None;
+    }
+    PENDING.with(|p| {
+        let mut v = p.borrow_mut();
+        let i = v.iter().position(|(k, _)| k == tdir)?;
+        PENDING_COUNT.fetch_sub(1, Ordering::Relaxed);
+        Some(v.swap_remove(i).1)
+    })
 }
 
 /// Just the definition and the part list, for a commit-record rewrite.
@@ -1812,6 +1985,105 @@ mod tests {
             }
         }
     }
+
+    // ---- quarantine -------------------------------------------------------
+
+    /// A three-part table on disk, with part `which` (0-based) bit-flipped in
+    /// the middle. Hands back the scratch, the table directory and the name of
+    /// the file that was damaged.
+    fn damaged_table(tag: &str, which: usize) -> (Scratch, PathBuf, String) {
+        let s = Scratch::new(tag);
+        let t = sample_table("hits", &[1_500, 800, 2_000]);
+        writer::write_table(s.path(), &t).unwrap();
+        let tdir = s.join("hits");
+        let files = store::list_part_files(&tdir).unwrap();
+        assert_eq!(files.len(), 3, "fixture must write three parts");
+        let name = files[which].1.clone();
+        let p = tdir.join(&name);
+        let mut bytes = std::fs::read(&p).unwrap();
+        let mid = bytes.len() / 2;
+        bytes[mid] ^= 0x20;
+        std::fs::write(&p, &bytes).unwrap();
+        (s, tdir, name)
+    }
+
+    /// The change this module exists for: one bad file is a quarantined part,
+    /// not a failed open. The other two parts still decode, and the damage is
+    /// reported rather than swallowed.
+    #[test]
+    fn a_damaged_part_is_quarantined_not_propagated() {
+        for which in 0..3 {
+            let (_s, tdir, name) = damaged_table("quarantine", which);
+            let img = read_table_image(&tdir).expect("a damaged part must not fail the open");
+            assert_eq!(img.part_files.len(), 3, "the commit record still names three");
+            assert_eq!(img.parts.len(), 2, "the healthy parts must still decode");
+            assert_eq!(img.damaged.len(), 1);
+            assert_eq!(img.damaged[0].file, name);
+            assert!(img.damaged[0].why.contains(&name), "the reason must name the file");
+            assert!(
+                img.damaged[0].why.contains("checksum"),
+                "the reason must be the reader's own: {}",
+                img.damaged[0].why
+            );
+            claim_damage(&tdir);
+        }
+    }
+
+    /// The hand-off is a queue of one per table directory: the loader claims
+    /// it once, and nothing claims it twice.
+    #[test]
+    fn damage_is_handed_over_exactly_once() {
+        let (_s, tdir, name) = damaged_table("handoff", 1);
+        read_table_image(&tdir).unwrap();
+        let claimed = claim_damage(&tdir).expect("the loader must find the record");
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].file, name);
+        assert!(claim_damage(&tdir).is_none(), "a claimed record must not be claimable again");
+    }
+
+    /// ...and a table that reads clean clears whatever an earlier read of the
+    /// same directory left, or a repaired database would stay quarantined.
+    #[test]
+    fn a_clean_reload_clears_an_earlier_record() {
+        let (s, tdir, name) = damaged_table("repair", 2);
+        assert_eq!(read_table_image(&tdir).unwrap().damaged.len(), 1);
+
+        // Put the file back the way `write_table` had it.
+        let good = sample_table("hits", &[1_500, 800, 2_000]);
+        let s2 = Scratch::new("repair-src");
+        writer::write_table(s2.path(), &good).unwrap();
+        std::fs::copy(s2.join("hits").join(&name), tdir.join(&name)).unwrap();
+
+        let img = read_table_image(&tdir).unwrap();
+        assert!(img.damaged.is_empty(), "the repaired table must read clean");
+        assert!(claim_damage(&tdir).is_none(), "a stale record survived the repair");
+        drop(s);
+    }
+
+    /// `read_table` has nowhere to put a quarantine -- it returns a bare
+    /// `Table` -- so it must refuse rather than hand back one short of a part.
+    #[test]
+    fn read_table_refuses_a_damaged_table() {
+        let (s, tdir, name) = damaged_table("read-table", 0);
+        let e = must_err(read_table(s.path(), "hits"));
+        assert!(is_corrupt(&e), "{e}");
+        assert!(e.to_string().contains(&name), "must name the part file: {e}");
+        // Drained even though the call failed: a record nobody claims would
+        // outlive the load that produced it.
+        assert!(claim_damage(&tdir).is_none(), "the refusal must still drain the hand-off");
+    }
+
+    /// An undamaged table leaves nothing behind at all: the healthy path must
+    /// not so much as touch the hand-off.
+    #[test]
+    fn a_healthy_table_records_no_damage() {
+        let s = Scratch::new("healthy-image");
+        writer::write_table(s.path(), &sample_table("hits", &[900])).unwrap();
+        let img = read_table_image(&s.join("hits")).unwrap();
+        assert!(img.damaged.is_empty());
+        assert_eq!(img.parts.len(), 1);
+        assert!(claim_damage(&s.join("hits")).is_none());
+    }
 }
 
 #[cfg(test)]
@@ -1960,5 +2232,6 @@ mod mapped {
             assert!(read_part(&p).is_err(), "accepted a file cut to {cut}");
         }
     }
+
 }
 

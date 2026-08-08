@@ -747,6 +747,182 @@ impl Query {
             limit_by: None,
         }
     }
+
+    /// Rewrite every *unqualified* table reference to `db.<name>`.
+    ///
+    /// This is what makes a stored view mean the same thing from any session.
+    /// A view body is written against whatever database was current when it
+    /// was created, and it is expanded, later, into somebody else's query --
+    /// so `CREATE VIEW reports.recent AS SELECT * FROM events` has to keep
+    /// meaning `sales.events` after a `USE analytics`, or the view silently
+    /// answers from a different table with the same name. Binding it once at
+    /// creation is not enough: the binder resolves names against the *current*
+    /// database at each use, and the expansion is an AST splice.
+    ///
+    /// Two things are deliberately left alone. A name that already carries a
+    /// qualifier is not touched, and a bare name that matches a CTE in scope
+    /// is not either -- `WITH e AS (...) SELECT * FROM e` names the CTE, and
+    /// `Binder::table_ref` only consults the CTE stack for a *single*-component
+    /// name, so qualifying one would silently redirect it to a base table.
+    pub fn qualify_tables(&mut self, db: &str) {
+        let mut ctes: Vec<String> = Vec::new();
+        qual_query(self, db, &mut ctes);
+    }
+}
+
+/// `scope` is the CTE names visible here, innermost last. It is grown and
+/// truncated in place rather than copied per level: a query nests a handful of
+/// levels and this runs once per view, at creation and at load.
+fn qual_query(q: &mut Query, db: &str, scope: &mut Vec<String>) {
+    let mark = scope.len();
+    for cte in q.with.iter_mut() {
+        // A CTE may reference the ones declared before it, and not itself:
+        // exactly the rule `Binder::table_ref` applies with `&ctes[..pos]`.
+        qual_query(&mut cte.query, db, scope);
+        scope.push(cte.name.clone());
+    }
+    qual_setexpr(&mut q.body, db, scope);
+    for o in q.order_by.iter_mut() {
+        qual_expr(&mut o.expr, db, scope);
+    }
+    for e in q.limit.iter_mut().chain(q.offset.iter_mut()) {
+        qual_expr(e, db, scope);
+    }
+    if let Some((n, keys)) = q.limit_by.as_mut() {
+        qual_expr(n, db, scope);
+        for k in keys.iter_mut() {
+            qual_expr(k, db, scope);
+        }
+    }
+    scope.truncate(mark);
+}
+
+fn qual_setexpr(s: &mut SetExpr, db: &str, scope: &mut Vec<String>) {
+    match s {
+        SetExpr::Select(sel) => {
+            for item in sel.projection.iter_mut() {
+                if let SelectItem::Expr { expr, .. } = item {
+                    qual_expr(expr, db, scope);
+                }
+            }
+            if let Some(f) = sel.from.as_mut() {
+                qual_tableref(f, db, scope);
+            }
+            for e in sel
+                .prewhere
+                .iter_mut()
+                .chain(sel.selection.iter_mut())
+                .chain(sel.having.iter_mut())
+            {
+                qual_expr(e, db, scope);
+            }
+            for g in sel.group_by.iter_mut() {
+                qual_expr(g, db, scope);
+            }
+        }
+        SetExpr::Query(q) => qual_query(q, db, scope),
+        SetExpr::SetOperation { left, right, .. } => {
+            qual_setexpr(left, db, scope);
+            qual_setexpr(right, db, scope);
+        }
+        SetExpr::Values(rows) => {
+            for e in rows.iter_mut().flatten() {
+                qual_expr(e, db, scope);
+            }
+        }
+    }
+}
+
+fn qual_tableref(t: &mut TableRef, db: &str, scope: &mut Vec<String>) {
+    match t {
+        TableRef::Table { name, .. } => {
+            if name.0.len() == 1
+                && !scope.iter().any(|c| c.eq_ignore_ascii_case(name.last()))
+            {
+                name.0.insert(0, db.to_string());
+            }
+        }
+        TableRef::Subquery { query, .. } => qual_query(query, db, scope),
+        TableRef::Join { left, right, constraint, .. } => {
+            qual_tableref(left, db, scope);
+            qual_tableref(right, db, scope);
+            if let JoinConstraint::On(e) = constraint {
+                qual_expr(e, db, scope);
+            }
+        }
+    }
+}
+
+/// Exhaustive on purpose -- no wildcard arm. A subquery hiding in an `Expr`
+/// variant nobody remembered to walk is a table reference resolved against the
+/// reader's database instead of the view's, which is a wrong answer rather than
+/// a missed optimization, so a new variant must fail to compile here.
+fn qual_expr(e: &mut Expr, db: &str, scope: &mut Vec<String>) {
+    match e {
+        Expr::Literal(_) | Expr::Column(_) | Expr::Wildcard => {}
+        Expr::UnaryOp { expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::IsNull { expr, .. }
+        | Expr::Interval { value: expr, .. } => qual_expr(expr, db, scope),
+        Expr::BinaryOp { left, right, .. } => {
+            qual_expr(left, db, scope);
+            qual_expr(right, db, scope);
+        }
+        Expr::Function { args, params, .. } => {
+            for a in args.iter_mut().chain(params.iter_mut()) {
+                qual_expr(a, db, scope);
+            }
+        }
+        Expr::Window { args, params, spec, .. } => {
+            for a in args.iter_mut().chain(params.iter_mut()) {
+                qual_expr(a, db, scope);
+            }
+            for p in spec.partition_by.iter_mut() {
+                qual_expr(p, db, scope);
+            }
+            for o in spec.order_by.iter_mut() {
+                qual_expr(&mut o.expr, db, scope);
+            }
+        }
+        Expr::Case { operand, when_then, else_result } => {
+            for o in operand.iter_mut() {
+                qual_expr(o, db, scope);
+            }
+            for (w, t) in when_then.iter_mut() {
+                qual_expr(w, db, scope);
+                qual_expr(t, db, scope);
+            }
+            for x in else_result.iter_mut() {
+                qual_expr(x, db, scope);
+            }
+        }
+        Expr::InList { expr, list, .. } => {
+            qual_expr(expr, db, scope);
+            for i in list.iter_mut() {
+                qual_expr(i, db, scope);
+            }
+        }
+        Expr::Between { expr, low, high, .. } => {
+            qual_expr(expr, db, scope);
+            qual_expr(low, db, scope);
+            qual_expr(high, db, scope);
+        }
+        Expr::Like { expr, pattern, .. } => {
+            qual_expr(expr, db, scope);
+            qual_expr(pattern, db, scope);
+        }
+        Expr::Tuple(items) => {
+            for i in items.iter_mut() {
+                qual_expr(i, db, scope);
+            }
+        }
+        Expr::Subquery(q) => qual_query(q, db, scope),
+        Expr::InSubquery { expr, subquery, .. } => {
+            qual_expr(expr, db, scope);
+            qual_query(subquery, db, scope);
+        }
+        Expr::Exists { subquery, .. } => qual_query(subquery, db, scope),
+    }
 }
 
 // --------------------------------------------------------------- statements
@@ -757,6 +933,23 @@ pub struct ColumnDef {
     pub ty: DataType,
     pub default: Option<Expr>,
     pub codec: Option<String>,
+    /// `UNIQUE` on the column. Kept per column rather than folded into
+    /// `CreateTable::checks` because it is not an expression: the session
+    /// enforces it against the unique-key machinery, or refuses the
+    /// declaration outright when there is no key to enforce it with.
+    pub unique: bool,
+}
+
+/// One `CHECK` constraint, however it was spelled: `CHECK (p)` after a column,
+/// `CHECK (p)` as its own element of the column list, or
+/// `CONSTRAINT c CHECK (p)`. All three end up here, because all three mean the
+/// same thing to a write -- a table-wide predicate every row must satisfy.
+#[derive(Clone, PartialEq, Debug)]
+pub struct CheckDef {
+    /// `CONSTRAINT <name>`, or `None` for an unnamed one. Only ever used to
+    /// name the constraint in the rejection message and in the catalog.
+    pub name: Option<String>,
+    pub expr: Expr,
 }
 
 #[derive(Clone, PartialEq, Debug)]
@@ -768,6 +961,8 @@ pub struct CreateTable {
     pub order_by: Vec<Expr>,
     pub primary_key: Vec<Expr>,
     pub partition_by: Option<Expr>,
+    /// Every `CHECK` the statement declared, in source order.
+    pub checks: Vec<CheckDef>,
     /// `AS SELECT ...`
     pub as_query: Option<Box<Query>>,
 }
@@ -850,6 +1045,39 @@ pub enum Statement {
     AlterDropColumn {
         table: ObjectName,
         column: String,
+        if_exists: bool,
+    },
+    /// `ALTER TABLE t MODIFY COLUMN c <type>`: retype a column in place.
+    ///
+    /// Only the type changes. `MODIFY COLUMN c <type> DEFAULT x` and the other
+    /// per-column clauses are refused by the parser rather than accepted and
+    /// dropped -- see `Parser::alter`.
+    AlterModifyColumn {
+        table: ObjectName,
+        column: String,
+        ty: DataType,
+    },
+    /// `RENAME TABLE a TO b`, and its `ALTER TABLE a RENAME TO b` spelling.
+    RenameTable {
+        from: ObjectName,
+        to: ObjectName,
+    },
+    /// `CREATE VIEW v AS SELECT ...`.
+    ///
+    /// `body_sql` is the *source text* of the query, sliced out by the parser,
+    /// and it is what the catalog stores: this AST has no `Display`, so a view
+    /// that round-trips through disk has to round-trip as text. Keeping both
+    /// halves means the text is never the thing that gets bound -- the parsed
+    /// `query` is -- so the two cannot disagree about what the view means.
+    CreateView {
+        name: ObjectName,
+        query: Box<Query>,
+        body_sql: String,
+        or_replace: bool,
+        if_not_exists: bool,
+    },
+    DropView {
+        name: ObjectName,
         if_exists: bool,
     },
     /// Force a compaction. `final_` merges down to a single part.

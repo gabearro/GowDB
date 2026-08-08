@@ -122,6 +122,51 @@ impl Value {
         Ok(Value::Decimal(rescale_checked(units, scale, scale, &units)?, scale))
     }
 
+    /// The exact value of a **decimal-point literal** -- the `0.1` of
+    /// `SELECT 0.1 + 0.2`. `None` when the digits do not fit an `i64` lane and
+    /// only a float can hold them.
+    ///
+    /// `text` is a bare run of ASCII digits containing exactly one `.`: no
+    /// sign (the parser folds `-` in afterwards) and no exponent (an exponent
+    /// keeps the literal a `Float`, which is the boundary that makes this
+    /// change tractable at all). Anything else answers `None` rather than
+    /// guessing.
+    ///
+    /// **The scale is the digits the user wrote**, trailing zeros included, so
+    /// `1.50` is `Decimal(150, 2)` and renders back as `1.50`. That is the same
+    /// rule `Decimal64(S)` columns already follow, and it is what makes
+    /// `0.10 + 0.20` answer `0.30` while `0.1 + 0.2` answers `0.3` -- both
+    /// exact, each at the precision it was asked for.
+    ///
+    /// **Too many digits falls back to `Float` rather than erroring.** A
+    /// literal wider than [`MAX_DECIMAL_PRECISION`] has no `Decimal64` at all,
+    /// and refusing it would take a query that works today and break it for a
+    /// number the user never asked to be exact; Postgres has arbitrary-precision
+    /// `numeric` and never faces the choice. The fallback is not silent -- the
+    /// value comes back as an approximate float and renders as one.
+    pub fn decimal_literal(text: &str) -> Option<Value> {
+        let b = text.as_bytes();
+        let point = b.iter().position(|&c| c == b'.')?;
+        let scale = b.len() - point - 1;
+        if scale > MAX_DECIMAL_PRECISION as usize {
+            return None;
+        }
+        let mut units: i128 = 0;
+        for (i, &c) in b.iter().enumerate() {
+            if i == point {
+                continue;
+            }
+            units = units * 10 + i128::from(c.checked_sub(b'0').filter(|d| *d < 10)?);
+            // Bailing the moment the range is gone keeps `units` under 10^19
+            // however long the literal is, so the accumulate cannot overflow
+            // and a 400-digit literal costs 19 iterations.
+            if units > DECIMAL_MAX_UNITS {
+                return None;
+            }
+        }
+        Some(Value::Decimal(units as i64, scale as u8))
+    }
+
     /// `(units, scale)` when this is a decimal. The units are the *lane*, not
     /// the number: `Decimal(1234, 2).decimal_parts()` is `(1234, 2)`, worth 12.34.
     #[inline]
@@ -1169,6 +1214,37 @@ mod tests {
         assert!(c("1.004", 2).eq_exact(&dec(100, 2)));
         for bad in ["", "x", "1.2.3", "1,5", "--1", "."] {
             assert!(Value::str(bad).cast_to(&DataType::Decimal64(2)).is_err(), "{bad}");
+        }
+    }
+
+    /// What the lexer hands `SELECT 0.1 + 0.2`. The scale is the digits the
+    /// user wrote, and the 18-digit lane is the only thing that can decline.
+    #[test]
+    fn a_decimal_literal_is_its_digits_and_its_written_scale() {
+        let lit = |s: &str| Value::decimal_literal(s).map(|v| v.decimal_parts().unwrap());
+        assert_eq!(lit("0.1"), Some((1, 1)));
+        assert_eq!(lit("0.2"), Some((2, 1)));
+        assert_eq!(lit("12.34"), Some((1234, 2)));
+        // Trailing zeros are digits: `1.50` is scale 2 and renders `1.50`.
+        assert_eq!(lit("1.5"), Some((15, 1)));
+        assert_eq!(lit("1.50"), Some((150, 2)));
+        assert_eq!(lit("1.500"), Some((1500, 3)));
+        // Leading zeros are not.
+        assert_eq!(lit("00.5"), Some((5, 1)));
+        assert_eq!(lit("0.0"), Some((0, 1)));
+        // Both edges of the lane: 18 digits fits, 19 does not, and a scale past
+        // 18 has no `Decimal64` however few digits precede the point.
+        assert_eq!(lit("0.999999999999999999"), Some((999_999_999_999_999_999, 18)));
+        assert_eq!(lit("999999999999999999.0"), None, "19 digits");
+        assert_eq!(lit("0.0000000000000000001"), None, "scale 19");
+        // A literal far past the lane must decline rather than overflow the
+        // i128 accumulate on the way to finding out.
+        assert_eq!(lit(&"9".repeat(400)), None);
+        assert_eq!(lit(&format!("0.{}", "9".repeat(400))), None);
+        // Shapes the lexer never produces. `None`, never a guess: no point at
+        // all, a sign, an exponent, or anything that is not a digit.
+        for bad in ["1", "", "-1.5", "+1.5", "1.5e3", "1.5E3", "1..5", "1.5x", "x.y"] {
+            assert_eq!(Value::decimal_literal(bad), None, "{bad}");
         }
     }
 

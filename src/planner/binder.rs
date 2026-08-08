@@ -808,6 +808,9 @@ impl<'a> Binder<'a> {
         match v {
             Value::UInt(n) => Ok(*n as usize),
             Value::Int(n) if *n >= 0 => Ok(*n as usize),
+            // A `Decimal` falls through to the refusal with everything else:
+            // `LIMIT 2.5` is not a row count, and `2.5` reaching here exactly
+            // rather than as a float does not make it one.
             _ => Err(Error::bind(format!(
                 "{what} must be a non-negative integer, got {v}"
             ))),
@@ -1496,6 +1499,34 @@ impl<'a> Binder<'a> {
                     }
                 };
                 let ty = ty.ok_or_else(|| Error::bind("CASE needs at least one WHEN"))?;
+                // Every arm is cast to the promoted type, and this is a
+                // correctness fix rather than tidiness: `eval_case` gathers the
+                // arms' *lanes* into one column of `ty`, so an arm whose lane
+                // means something else under that type is copied verbatim and
+                // silently reinterpreted. A `Decimal64(1)` arm beside a
+                // `Float64` one made `CASE WHEN c THEN 1.0 ELSE float_col END`
+                // answer 10 -- the decimal's unit count, read as a double.
+                //
+                // Cast only on a real mismatch, for the reason `bind_update`
+                // gives: the arms of an ordinary CASE already agree, and a
+                // no-op `Cast` there would copy a whole column per block for
+                // nothing.
+                let wt = wt
+                    .into_iter()
+                    .map(|(w, t)| {
+                        if t.ty() == ty {
+                            (w, t)
+                        } else {
+                            (w, BoundExpr::Cast { expr: Box::new(t), ty: ty.clone() })
+                        }
+                    })
+                    .collect();
+                let else_result = match else_result {
+                    Some(e) if e.ty() != ty => {
+                        Some(Box::new(BoundExpr::Cast { expr: e, ty: ty.clone() }))
+                    }
+                    other => other,
+                };
                 Ok(BoundExpr::Case { when_then: wt, else_result, ty })
             }
 
@@ -2392,7 +2423,11 @@ fn ordinal(e: &Expr, what: &str) -> Result<Option<usize>> {
     match v {
         Value::UInt(n) => Ok(Some(*n as usize)),
         Value::Int(n) if *n >= 0 => Ok(Some(*n as usize)),
-        Value::Float(_) | Value::Int(_) => Err(Error::bind(format!(
+        // `Decimal` is here because a literal with a decimal point lexes as
+        // one: `ORDER BY 1.5` is a fractional position however exactly it is
+        // spelled, and truncating it to 1 is the silent answer this arm
+        // exists to refuse.
+        Value::Float(_) | Value::Int(_) | Value::Decimal(..) => Err(Error::bind(format!(
             "{what} position must be a whole positive number, got {v}"
         ))),
         _ => Ok(None),

@@ -92,6 +92,52 @@
 //! the log byte-identical to its pre-transaction state, which is sound exactly
 //! because writers serialize: nothing else can have appended in between.
 //!
+//! ## A transaction that spans several tables
+//!
+//! Logs are per table, so an N-table transaction has N commit markers and N
+//! `fsync`s, and a crash between two of them used to leave a *prefix* of the
+//! transaction durable: tables A and B committed, C lost, and no error to
+//! anyone. [`Wal::prepare`] and [`Wal::decide`] close that.
+//!
+//! The N-1 earlier participants log a **prepare** instead of a commit marker.
+//! A prepare names the group it would release, the log that holds the
+//! transaction's decision, and the sequence number of the decision inside it;
+//! [`Wal::replay`] releases the group only if that decision is really there.
+//! The last participant logs a **decision**, which is an ordinary commit
+//! marker for its own group and the citable outcome for everyone else's. So
+//! the whole transaction turns on one `fsync` -- the last one -- and a crash
+//! before it drops every participant, including the ones already `fsync`ed.
+//!
+//! The alternative was one log for the whole database. It is simpler to reason
+//! about and it was rejected on cost: an LSN here *is* a byte offset into a
+//! per-table log, which is what makes [`Wal::rewind_to`] and the checkpoint
+//! watermark the same number (see above), and a shared log would need a second
+//! navigation scheme for both. Two-phase commit keeps the file layout, keeps
+//! the byte-offset LSN, and -- because the decision doubles as the last
+//! participant's own marker -- costs exactly the same N `fsync`s the broken
+//! version did. A single-table transaction never writes a prepare at all and
+//! is byte-for-byte what it always was.
+//!
+//! Measured through the CLI against a git-worktree build of the unfixed
+//! engine, A/B interleaved, best-of-9 per side, 200 durable transactions per
+//! run: one table 216 -> 221 txn/s, three tables 74.3 -> 74.0 txn/s,
+//! autocommit `INSERT` 240 -> 242 stmt/s. All three are inside this machine's
+//! noise, which is the expected result: no path gained an `fsync`, and the
+//! only path that gained *anything* is a multi-table commit, which pays 14
+//! bytes per non-coordinating participant (a prepare frame is 25 bytes against
+//! a commit marker's 11, the difference being the citation).
+//!
+//! What that buys is paid for at [`Wal::truncate`]. A checkpoint recycles a
+//! log, and recycling the *decision* log would leave a participant unable to
+//! tell "the decision was never written" (abort) from "the decision was
+//! written and has since been folded into parts" (commit) -- the one
+//! ambiguity that turns a committed transaction into a silently lost one. So
+//! truncation carries its decision records forward, and drops them only once
+//! every other log in the database is covered by its table's parts, which is
+//! exactly when nothing can still cite them. A log that has never coordinated
+//! a multi-table transaction skips all of it and truncates to a bare header,
+//! as before.
+//!
 //! ## What replay does not do
 //!
 //! Nothing here interprets records. `replay` hands back `Insert`/`Delete` in
@@ -102,7 +148,7 @@
 
 use std::fs::{File, OpenOptions};
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use crate::common::{Error, Result};
 use crate::types::{Block, Schema};
@@ -114,9 +160,23 @@ const TAG_INSERT: u8 = 1;
 const TAG_DELETE: u8 = 2;
 /// Releases every staged record carrying the sequence number in its body.
 const TAG_COMMIT: u8 = 3;
+/// Releases a staged group only if another log holds the decision it names.
+/// Body: this log's sequence number, the decision's, then the path to the log
+/// that holds it, relative to *this* log's directory.
+const TAG_PREPARE: u8 = 4;
+/// A [`TAG_COMMIT`] that a [`TAG_PREPARE`] in another log may cite. Identical
+/// in effect where it sits; a distinct tag so [`Wal::truncate`] can tell the
+/// records it must carry forward from the ones it may drop, without keeping a
+/// second index of which markers somebody else depends on.
+const TAG_DECIDE: u8 = 5;
+/// Carries [`Wal::begin`]'s next sequence number across a truncation that kept
+/// decisions. Without it the counter would restart at zero and a fresh
+/// transaction could mint the number a surviving prepare still cites.
+const TAG_FENCE: u8 = 6;
 
 /// Set on an `INSERT`/`DELETE` tag to mark the record staged: durable, but not
-/// part of the log's history until a [`TAG_COMMIT`] names its sequence number.
+/// part of the log's history until a [`TAG_COMMIT`] -- or a [`TAG_DECIDE`], or
+/// a [`TAG_PREPARE`] whose citation resolves -- names its sequence number.
 ///
 /// A flag bit rather than two more tags, so the payload encoding is shared
 /// verbatim between the two forms and there is exactly one place that can get
@@ -139,10 +199,16 @@ pub enum WalRecord {
 }
 
 /// What one frame turned out to hold.
-enum Entry {
+enum Entry<'a> {
     /// A mutation. `Some(seq)` when it is staged and awaits a commit marker.
     Record(Option<u64>, WalRecord),
     Commit(u64),
+    /// Local group, the log holding the decision, and the decision's number.
+    Prepare(u64, &'a str, u64),
+    /// The sequence counter a truncation carried across. Read by the
+    /// open-time scan straight off the frame; by the time `replay` sees one
+    /// there is nothing left in it to do.
+    Fence,
 }
 
 pub struct Wal {
@@ -153,6 +219,12 @@ pub struct Wal {
     /// anything already in the file so that a commit marker written after a
     /// restart cannot release a group orphaned before it.
     next_seq: u64,
+    /// Whether the file holds a [`TAG_DECIDE`] record another log may cite.
+    /// Kept rather than rediscovered because it is the one thing
+    /// [`Wal::truncate`] has to know, and every log that has never coordinated
+    /// a multi-table transaction -- which is every log in a workload that
+    /// never opens one -- answers `false` without reading a byte.
+    decides: bool,
 }
 
 impl Wal {
@@ -176,6 +248,7 @@ impl Wal {
             .len();
 
         let mut next_seq = 0u64;
+        let mut decides = false;
         if len < format::HEADER_LEN as u64 {
             file.set_len(0).map_err(|e| store::io_err("truncate", path, e))?;
             write_header(&mut file, path)?;
@@ -193,8 +266,9 @@ impl Wal {
             // next replay would stop before it and silently lose an
             // acknowledged write. Find the last intact boundary and discard
             // everything after it, so the log is append-clean again.
-            let (good, seen) = Self::scan(&buf).map_err(|e| store::prefix(path, e))?;
+            let (good, seen, cited) = Self::scan(&buf).map_err(|e| store::prefix(path, e))?;
             next_seq = seen;
+            decides = cited;
             if good < len {
                 file.set_len(good)
                     .map_err(|e| store::io_err("truncate the torn tail of", path, e))?;
@@ -203,7 +277,7 @@ impl Wal {
                 len = good;
             }
         }
-        Ok(Wal { file, path: path.to_path_buf(), len, next_seq })
+        Ok(Wal { file, path: path.to_path_buf(), len, next_seq, decides })
     }
 
     /// Log an insert. Not durable until [`Wal::sync`]. Returns its LSN.
@@ -278,6 +352,43 @@ impl Wal {
         body.u8(TAG_COMMIT);
         body.varint(seq);
         self.append(&body.finish())
+    }
+
+    /// Release the group staged under `seq` **if** the log at `coordinator`
+    /// commits `coord_seq`. The earlier participants of a multi-table
+    /// transaction log this instead of [`Wal::commit`]; see the module docs.
+    ///
+    /// The transaction's fate is one record in one file, so a crash anywhere
+    /// in the sequence -- including after this record is `fsync`ed -- resolves
+    /// the same way for every participant. That is the whole guarantee, and it
+    /// is why the *order* matters: every prepare must be durable before the
+    /// decision is written, or the decision would commit a participant whose
+    /// rows are not on disk yet.
+    ///
+    /// `coordinator` is stored relative to this log's own directory, not
+    /// absolutely: a data directory that is copied, restored from a backup or
+    /// simply moved must still resolve, and an absolute path baked into a log
+    /// record is a path that stops being true the moment the tree is moved.
+    pub fn prepare(&mut self, seq: u64, coordinator: &Path, coord_seq: u64) -> Result<u64> {
+        let rel = relative_log(&self.path, coordinator)?;
+        let mut body = Writer::with_capacity(rel.len() + 24);
+        body.u8(TAG_PREPARE);
+        body.varint(seq);
+        body.varint(coord_seq);
+        body.str(&rel);
+        self.append(&body.finish())
+    }
+
+    /// The decision the prepares cite, and the last participant's own commit
+    /// marker. Not durable until [`Wal::sync`] -- and *that* `fsync`, the last
+    /// of the transaction, is the instant the whole thing commits.
+    pub fn decide(&mut self, seq: u64) -> Result<u64> {
+        let mut body = Writer::with_capacity(16);
+        body.u8(TAG_DECIDE);
+        body.varint(seq);
+        let at = self.append(&body.finish())?;
+        self.decides = true;
+        Ok(at)
     }
 
     /// Discard every record at or after `lsn`, durably.
@@ -406,13 +517,115 @@ impl Wal {
 
     /// Discard every record, durably, keeping the file (and its header) in
     /// place. Called by a checkpoint once the records are inside parts.
+    ///
+    /// Decision records are the exception: another table's log may still hold
+    /// a prepare that cites one, and losing it would make that prepare
+    /// unresolvable -- indistinguishable from a decision that was never
+    /// written, which is an abort, which would silently drop a transaction
+    /// that committed. They are carried into the fresh file, behind a fence
+    /// that stops the sequence counter restarting under them, and dropped only
+    /// once [`Wal::may_be_cited`] can prove nothing is left to cite them.
+    ///
+    /// A log that has never written a decision -- every log in a database that
+    /// never runs a multi-table transaction -- takes none of this: `decides`
+    /// is false, and the result is the same bare header it always was.
     pub fn truncate(&mut self) -> Result<()> {
-        self.file
-            .set_len(0)
-            .map_err(|e| store::io_err("truncate", &self.path, e))?;
-        write_header(&mut self.file, &self.path)?;
-        self.len = format::HEADER_LEN as u64;
+        let carry = if self.decides && self.may_be_cited() {
+            self.decisions()?
+        } else {
+            Vec::new()
+        };
+        if carry.is_empty() {
+            self.file
+                .set_len(0)
+                .map_err(|e| store::io_err("truncate", &self.path, e))?;
+            write_header(&mut self.file, &self.path)?;
+            self.len = format::HEADER_LEN as u64;
+            self.decides = false;
+            return Ok(());
+        }
+        // Rebuilt through a rename, not by emptying the file and writing the
+        // decisions back into it. The intermediate state of the second one --
+        // a log that has been emptied and whose decisions are not durable yet
+        // -- is a log that says "aborted" about transactions that committed,
+        // and a power cut in that window would silently drop them from every
+        // *other* table. A rename cannot be observed half-done.
+        let mut w = Writer::with_capacity(format::HEADER_LEN + 16 * (carry.len() + 1));
+        format::write_header(&mut w);
+        for (tag, v) in std::iter::once((TAG_FENCE, self.next_seq))
+            .chain(carry.iter().map(|&s| (TAG_DECIDE, s)))
+        {
+            let mut body = Writer::with_capacity(11);
+            body.u8(tag);
+            body.varint(v);
+            format::write_framed(&mut w, body.as_slice());
+        }
+        let bytes = w.finish();
+        store::atomic_write(&self.path, &bytes)?;
+        // The rename put a new inode behind the name, so the append handle
+        // still points at the file that used to be there.
+        self.file = OpenOptions::new()
+            .read(true)
+            .append(true)
+            .open(&self.path)
+            .map_err(|e| store::io_err("reopen", &self.path, e))?;
+        self.len = bytes.len() as u64;
         Ok(())
+    }
+
+    /// The sequence numbers this log has decided, ascending.
+    fn decisions(&self) -> Result<Vec<u64>> {
+        let buf = std::fs::read(&self.path).map_err(|e| store::io_err("read", &self.path, e))?;
+        let mut out = Vec::new();
+        walk(&buf, |body| {
+            if let Some(s) = tagged(body, TAG_DECIDE) {
+                out.push(s);
+            }
+        })
+        .map_err(|e| store::prefix(&self.path, e))?;
+        out.sort_unstable();
+        out.dedup();
+        Ok(out)
+    }
+
+    /// Whether some other table's log can still hold a prepare citing this
+    /// one's decisions.
+    ///
+    /// The test is "does any other log hold a record its table's parts do not
+    /// already cover", not "does any other log hold a prepare naming me". It
+    /// is coarser on purpose: reading every sibling log to find out would cost
+    /// the whole database's un-checkpointed bytes at every checkpoint, and the
+    /// coarse answer is exact where it matters. A full checkpoint writes every
+    /// table's parts -- and with them a watermark at the end of that table's
+    /// log -- *before* it truncates any of them, so by the time this runs every
+    /// sibling is covered and the decisions go. A single-table fold leaves the
+    /// others uncovered, and those are exactly the ones that can still cite us.
+    ///
+    /// Conservative in every direction it cannot see: a directory it cannot
+    /// read, a layout it does not recognise, or a data root with no `CATALOG`
+    /// (so a log opened as a bare file by a test can never send it walking the
+    /// filesystem) all answer "yes, keep them".
+    fn may_be_cited(&self) -> bool {
+        let Some(tdir) = self.path.parent() else { return true };
+        let Some(root) = tdir.parent().and_then(Path::parent) else { return true };
+        if !root.join(store::CATALOG_FILE).exists() {
+            return true;
+        }
+        let Ok(dbs) = std::fs::read_dir(root) else { return true };
+        for db in dbs.flatten() {
+            let Ok(tables) = std::fs::read_dir(db.path()) else { continue };
+            for t in tables.flatten() {
+                let dir = t.path();
+                if dir == tdir {
+                    continue;
+                }
+                let Ok(m) = std::fs::metadata(dir.join(store::WAL_FILE)) else { continue };
+                if m.len() > covered_prefix(&dir) {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     /// Current size in bytes, i.e. the offset the next record will start at.
@@ -452,33 +665,35 @@ impl Wal {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(e) => return Err(store::io_err("read", path, e)),
         };
-        Self::replay_entries(&buf, schema, from).map_err(|e| store::prefix(path, e))
+        Self::replay_entries(&buf, schema, from, Some(parent_of(path)))
+            .map_err(|e| store::prefix(path, e))
     }
 
-    /// End offset of the last structurally intact record, and the first
-    /// sequence number that is free to hand out.
+    /// End offset of the last structurally intact record, the first sequence
+    /// number that is free to hand out, and whether the file holds a decision
+    /// another log may cite.
     ///
     /// Framing only: a record whose frame is complete and whose checksum
     /// matches is a record we really wrote, whether or not its *body* still
     /// decodes against the current schema. Truncating on a body error would
     /// throw away durable data because of a schema mismatch, so body damage is
     /// left for `replay` to report.
-    fn scan(buf: &[u8]) -> Result<(u64, u64)> {
+    fn scan(buf: &[u8]) -> Result<(u64, u64, bool)> {
         if buf.len() < format::HEADER_LEN {
-            return Ok((format::HEADER_LEN as u64, 0));
+            return Ok((format::HEADER_LEN as u64, 0, false));
         }
         let mut r = Reader::new(buf);
         format::read_header(&mut r)?;
         let mut good = r.pos() as u64;
         let mut next_seq = 0u64;
+        let mut decides = false;
         while !r.is_empty() {
             let at = r.pos();
             match format::read_framed(&mut r) {
                 Ok(body) => {
                     good = r.pos() as u64;
-                    if let Some(s) = body_seq(body) {
-                        next_seq = next_seq.max(s.saturating_add(1));
-                    }
+                    next_seq = next_seq.max(body_next_seq(body));
+                    decides |= tagged(body, TAG_DECIDE).is_some();
                 }
                 // A torn tail is the normal shape of a crash: stop here.
                 Err(_) if is_tail(buf, at) => break,
@@ -487,7 +702,7 @@ impl Wal {
                 Err(e) => return Err(record_err(at, 0, e)),
             }
         }
-        Ok((good, next_seq))
+        Ok((good, next_seq, decides))
     }
 
     /// Every record at or after byte offset `from`.
@@ -502,13 +717,15 @@ impl Wal {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(e) => return Err(store::io_err("read", path, e)),
         };
-        Self::replay_bytes(&buf, schema, from).map_err(|e| store::prefix(path, e))
+        Self::replay_bytes(&buf, schema, from, Some(parent_of(path)))
+            .map_err(|e| store::prefix(path, e))
     }
 
     pub(crate) fn replay_bytes(
         buf: &[u8],
         schema: &Schema,
         from: u64,
+        dir: Option<&Path>,
     ) -> Result<Vec<WalRecord>> {
         // One extra pass moving the entries, against a recovery that then
         // *inserts every block into a table*. Carrying the LSN in the
@@ -516,17 +733,23 @@ impl Wal {
         // round would mean two nearly identical replay loops, and a second
         // implementation of the staged-record filter is exactly the thing that
         // would silently stop agreeing with the first.
-        Ok(Self::replay_entries(buf, schema, from)?
+        Ok(Self::replay_entries(buf, schema, from, dir)?
             .into_iter()
             .map(|(_, rec)| rec)
             .collect())
     }
 
     /// The replay primitive: records with their LSNs.
+    ///
+    /// `dir` is the log's own directory, and it is what a prepare record's
+    /// citation resolves against. `None` means "this buffer is not a file", so
+    /// no citation can be checked and every prepared group stays unreleased --
+    /// the conservative half, and the same answer a missing decision gives.
     fn replay_entries(
         buf: &[u8],
         schema: &Schema,
         from: u64,
+        dir: Option<&Path>,
     ) -> Result<Vec<(u64, WalRecord)>> {
         if buf.len() < format::HEADER_LEN {
             // Torn before the first record could exist.
@@ -545,6 +768,11 @@ impl Wal {
         // the *failures*, not by the length of the log. A log with no staged
         // records (every log this engine has written so far) never touches it.
         let mut staged: Vec<(u64, usize)> = Vec::new();
+        // The decisions of each cited log, read once. A transaction writes one
+        // prepare per participant log, so this holds one entry per *coordinator*
+        // this log ever prepared against -- and stays empty, unallocated and
+        // untouched for every log that has never been a participant.
+        let mut cited: Vec<(&str, Vec<u64>)> = Vec::new();
         let mut seen = 0usize;
         while !r.is_empty() {
             let at = r.pos();
@@ -564,6 +792,21 @@ impl Wal {
                 }
                 Entry::Record(None, rec) => out.push((at as u64, rec)),
                 Entry::Commit(seq) => staged.retain(|&(s, _)| s != seq),
+                Entry::Prepare(seq, rel, coord_seq) => {
+                    let i = match cited.iter().position(|&(r, _)| r == rel) {
+                        Some(i) => i,
+                        None => {
+                            let d = decisions_of(dir, rel).map_err(|e| record_err(at, seen, e))?;
+                            cited.push((rel, d));
+                            cited.len() - 1
+                        }
+                    };
+                    if cited[i].1.binary_search(&coord_seq).is_ok() {
+                        staged.retain(|&(s, _)| s != seq);
+                    }
+                }
+                // Bookkeeping a truncation left behind; it releases nothing.
+                Entry::Fence => {}
             }
             seen += 1;
         }
@@ -604,40 +847,196 @@ fn put_tag(w: &mut Writer, tag: u8, seq: Option<u64>) {
     }
 }
 
-/// The sequence number a frame body carries, for the open-time scan.
+/// The lower bound a frame body puts on [`Wal::begin`]'s next sequence
+/// number, for the open-time scan.
 ///
 /// Deliberately lenient where `decode_entry` is not: `scan` has already proved
 /// the frame checksum, and a body that will not parse against *some* schema is
 /// a problem for `replay` to report -- refusing to open the log over it would
 /// turn a schema mismatch into an outage.
-fn body_seq(body: &[u8]) -> Option<u64> {
+fn body_next_seq(body: &[u8]) -> u64 {
     let mut r = Reader::new(body);
-    let tag = r.u8().ok()?;
-    if tag == TAG_COMMIT || tag & STAGED != 0 {
-        r.varint().ok()
-    } else {
-        None
+    let Ok(tag) = r.u8() else { return 0 };
+    // A fence already *is* the next number; everything else carries a number
+    // that has been used.
+    let bump = tag != TAG_FENCE;
+    match tag {
+        TAG_COMMIT | TAG_DECIDE | TAG_PREPARE | TAG_FENCE => {}
+        t if t & STAGED != 0 => {}
+        _ => return 0,
     }
+    r.varint().map_or(0, |s| if bump { s.saturating_add(1) } else { s })
+}
+
+/// The number a single-`varint` record of `tag` carries, or `None` when the
+/// body is something else. Framing-level, like [`body_next_seq`].
+fn tagged(body: &[u8], tag: u8) -> Option<u64> {
+    let mut r = Reader::new(body);
+    (r.u8().ok()? == tag).then(|| r.varint().ok()).flatten()
+}
+
+/// Walk every intact frame in a log image, stopping at a torn tail.
+///
+/// The framing half of `replay`, with no schema and no record semantics: used
+/// where the question is about the log as a file (which decisions does it hold)
+/// rather than about the table it describes -- including on *another* table's
+/// log, whose schema this one has no business knowing.
+fn walk(buf: &[u8], mut f: impl FnMut(&[u8])) -> Result<()> {
+    if buf.len() < format::HEADER_LEN {
+        return Ok(());
+    }
+    let mut r = Reader::new(buf);
+    format::read_header(&mut r)?;
+    while !r.is_empty() {
+        let at = r.pos();
+        match format::read_framed(&mut r) {
+            Ok(body) => f(body),
+            Err(_) if is_tail(buf, at) => break,
+            Err(e) => return Err(record_err(at, 0, e)),
+        }
+    }
+    Ok(())
+}
+
+/// The sequence numbers the log cited by `rel` has decided, ascending.
+///
+/// A missing file is an empty set rather than an error, and so is an
+/// unresolvable citation: both mean "no decision found", which means abort,
+/// which is the answer that cannot invent rows. Damage *inside* the cited log
+/// is reported, because a decision that might be there and might not is the
+/// one thing this cannot guess at.
+fn decisions_of(dir: Option<&Path>, rel: &str) -> Result<Vec<u64>> {
+    let Some(dir) = dir else { return Ok(Vec::new()) };
+    let path = resolve_citation(dir, rel)?;
+    let buf = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(store::io_err("read", &path, e)),
+    };
+    let mut out = Vec::new();
+    walk(&buf, |body| {
+        if let Some(s) = tagged(body, TAG_DECIDE) {
+            out.push(s);
+        }
+    })
+    .map_err(|e| store::prefix(&path, e))?;
+    out.sort_unstable();
+    Ok(out)
+}
+
+/// The path from `from_log`'s directory to `to_log`, as a citation.
+///
+/// Refused rather than approximated when the two cannot be compared -- one
+/// absolute and one relative, or a component that is not UTF-8. A citation
+/// that resolves to the wrong file is worse than a transaction that cannot
+/// commit, because the wrong file may well contain a decision.
+fn relative_log(from_log: &Path, to_log: &Path) -> Result<String> {
+    let from = parent_of(from_log);
+    if from.is_absolute() != to_log.is_absolute() {
+        return Err(Error::storage(format!(
+            "cannot cite `{}` from `{}`: one path is absolute and the other is not",
+            to_log.display(),
+            from.display()
+        )));
+    }
+    let mut a = from.components().peekable();
+    let mut b = to_log.components().peekable();
+    while a.peek().is_some() && a.peek() == b.peek() {
+        a.next();
+        b.next();
+    }
+    let mut out = String::new();
+    for _ in a {
+        out.push_str("../");
+    }
+    for c in b {
+        let Component::Normal(s) = c else {
+            return Err(Error::storage(format!("cannot cite `{}`", to_log.display())));
+        };
+        let Some(s) = s.to_str() else {
+            return Err(Error::storage(format!("cannot cite `{}`", to_log.display())));
+        };
+        out.push_str(s);
+        out.push('/');
+    }
+    out.pop();
+    if out.is_empty() {
+        return Err(Error::storage("a log cannot cite itself".to_string()));
+    }
+    Ok(out)
+}
+
+/// Turn a citation read out of a log back into a path, or refuse.
+///
+/// The citation is a hostile input like everything else read from disk, and it
+/// is fed straight to `open`. Resolved lexically rather than by the
+/// filesystem, so a `..` cannot be pushed through a symlink into a tree this
+/// database does not own, and bounded to the shape a citation can legitimately
+/// have: relative, no root, ordinary names, and a final component that is a
+/// write-ahead log.
+fn resolve_citation(dir: &Path, rel: &str) -> Result<PathBuf> {
+    let bad = || Error::corruption(format!("`{rel}` is not a log citation"));
+    if rel.is_empty() || rel.len() > 4096 {
+        return Err(bad());
+    }
+    let mut out = dir.to_path_buf();
+    for c in Path::new(rel).components() {
+        match c {
+            Component::ParentDir if out.pop() => {}
+            Component::Normal(s) => match s.to_str() {
+                Some(s) if store::is_safe_name(s) => out.push(s),
+                _ => return Err(bad()),
+            },
+            _ => return Err(bad()),
+        }
+    }
+    if out.file_name() != Some(std::ffi::OsStr::new(store::WAL_FILE)) {
+        return Err(bad());
+    }
+    Ok(out)
+}
+
+/// How much of the table directory `dir`'s log its committed parts already
+/// cover. Zero -- "none of it" -- for anything that cannot be read, which is
+/// the answer that keeps a decision rather than dropping it.
+fn covered_prefix(dir: &Path) -> u64 {
+    std::fs::read(dir.join(store::TABLE_FILE))
+        .ok()
+        .and_then(|b| reader::table_parts_from_bytes(&b).ok())
+        .map_or(0, |(_, _, committed)| committed)
 }
 
 fn record_err(at: usize, index: usize, e: Error) -> Error {
     Error::corruption(format!("record {index} of the replay, at offset {at}: {e}"))
 }
 
-fn decode_entry(body: &[u8], schema: &Schema) -> Result<Entry> {
+fn decode_entry<'a>(body: &'a [u8], schema: &Schema) -> Result<Entry<'a>> {
     let mut br = Reader::new(body);
     let tag = br.u8()?;
-    let rec = if tag == TAG_COMMIT {
-        Entry::Commit(br.varint()?)
-    } else {
-        // The sequence number sits between the tag and the payload, so the
-        // staged and plain forms share one decoder for the part that matters.
-        let seq = if tag & STAGED != 0 { Some(br.varint()?) } else { None };
-        match tag & !STAGED {
-            TAG_INSERT => Entry::Record(seq, WalRecord::Insert(reader::get_block(&mut br, schema)?)),
-            TAG_DELETE => Entry::Record(seq, WalRecord::Delete(br.u64()?)),
-            // The raw tag, not the masked one: `0x83` is not "tag 3".
-            _ => return Err(Error::corruption(format!("unknown log record tag {tag}"))),
+    // The markers are matched on the whole byte, so `STAGED` over one of them
+    // falls through to the mutation arm and is reported as the tag it is.
+    let rec = match tag {
+        TAG_COMMIT | TAG_DECIDE => Entry::Commit(br.varint()?),
+        TAG_PREPARE => {
+            let (seq, coord_seq) = (br.varint()?, br.varint()?);
+            Entry::Prepare(seq, br.str()?, coord_seq)
+        }
+        TAG_FENCE => {
+            br.varint()?;
+            Entry::Fence
+        }
+        _ => {
+            // The sequence number sits between the tag and the payload, so the
+            // staged and plain forms share one decoder for the part that matters.
+            let seq = if tag & STAGED != 0 { Some(br.varint()?) } else { None };
+            match tag & !STAGED {
+                TAG_INSERT => {
+                    Entry::Record(seq, WalRecord::Insert(reader::get_block(&mut br, schema)?))
+                }
+                TAG_DELETE => Entry::Record(seq, WalRecord::Delete(br.u64()?)),
+                // The raw tag, not the masked one: `0x83` is not "tag 3".
+                _ => return Err(Error::corruption(format!("unknown log record tag {tag}"))),
+            }
         }
     };
     if !br.is_empty() {
@@ -851,7 +1250,7 @@ mod tests {
         let full = std::fs::read(&path).unwrap();
         let mut last_count = 0usize;
         for cut in 0..=full.len() {
-            let got = Wal::replay_bytes(&full[..cut], &schema(), format::HEADER_LEN as u64)
+            let got = Wal::replay_bytes(&full[..cut], &schema(), format::HEADER_LEN as u64, None)
                 .unwrap_or_else(|e| panic!("prefix {cut} of {} errored: {e}", full.len()));
             assert_eq!(got, want[..got.len()], "prefix {cut} must be a prefix of the log");
             assert!(got.len() >= last_count, "prefix {cut} lost records");
@@ -1298,7 +1697,7 @@ mod tests {
         let want = [WalRecord::Delete(1), WalRecord::Insert(b), WalRecord::Delete(2)];
         let mut last = 0usize;
         for cut in 0..=full.len() {
-            let got = Wal::replay_bytes(&full[..cut], &schema(), format::HEADER_LEN as u64)
+            let got = Wal::replay_bytes(&full[..cut], &schema(), format::HEADER_LEN as u64, None)
                 .unwrap_or_else(|e| panic!("prefix {cut} errored: {e}"));
             // Every prefix is a prefix of the committed history: the staged
             // insert only appears once the marker behind it is whole.
@@ -1474,6 +1873,246 @@ mod tests {
         w.append_delete(lane).unwrap();
         w.sync().unwrap();
         assert_eq!(Wal::replay(&path, &schema()).unwrap(), vec![WalRecord::Delete(lane)]);
+    }
+
+    // ---- two-phase commit -------------------------------------------------
+
+    /// A log in the layout `may_be_cited` and the citations understand:
+    /// `<root>/<db>/<table>/wal.log`, under a root with a `CATALOG`.
+    fn table_log(s: &Scratch, name: &str) -> PathBuf {
+        std::fs::write(s.join(store::CATALOG_FILE), b"not read here").unwrap();
+        let d = s.path().join("db").join(name);
+        std::fs::create_dir_all(&d).unwrap();
+        d.join(store::WAL_FILE)
+    }
+
+    /// Declare `name`'s parts to cover `covered` bytes of its log, which is
+    /// what a checkpoint records and what `may_be_cited` reads.
+    fn mark_covered(s: &Scratch, name: &str, covered: u64) {
+        let dir = s.path().join("db").join(name);
+        let doc = super::super::writer::table_doc(&table_def(name), &[], covered);
+        std::fs::write(dir.join(store::TABLE_FILE), doc).unwrap();
+    }
+
+    /// Two staged groups, one per log, committed with `b` prepared against
+    /// `a`'s decision. Returns the paths and the length each log had *before*
+    /// the commit sequence started.
+    fn two_phase(s: &Scratch) -> (PathBuf, PathBuf, u64, u64) {
+        let (pa, pb) = (table_log(s, "a"), table_log(s, "b"));
+        let (mut a, mut b) = (Wal::open(&pa).unwrap(), Wal::open(&pb).unwrap());
+        let (sa, sb) = (a.begin(), b.begin());
+        a.append_insert_staged(sa, &rows(&[10, 11])).unwrap();
+        b.append_delete_staged(sb, 77).unwrap();
+        let (la, lb) = (a.len(), b.len());
+        // Participants first, each durable before the decision exists; the
+        // coordinator's marker last, and it is the commit point.
+        b.prepare(sb, &pa, sa).unwrap();
+        b.sync().unwrap();
+        a.decide(sa).unwrap();
+        a.sync().unwrap();
+        (pa, pb, la, lb)
+    }
+
+    fn replayed(path: &Path) -> usize {
+        Wal::replay(path, &schema()).unwrap().len()
+    }
+
+    /// The point of the whole exercise: the transaction turns on one record in
+    /// one file, so a participant that is already `fsync`ed still drops.
+    #[test]
+    fn a_prepared_group_waits_for_the_decision_it_cites() {
+        let s = Scratch::new("wal-2pc");
+        let (pa, pb) = (table_log(&s, "a"), table_log(&s, "b"));
+        let (mut a, mut b) = (Wal::open(&pa).unwrap(), Wal::open(&pb).unwrap());
+        let (sa, sb) = (a.begin(), b.begin());
+        a.append_delete_staged(sa, 1).unwrap();
+        b.append_delete_staged(sb, 2).unwrap();
+        b.prepare(sb, &pa, sa).unwrap();
+        b.sync().unwrap();
+
+        // A crash here has fsynced the participant and not the coordinator.
+        assert_eq!(replayed(&pb), 0, "a prepare with no decision must not commit");
+        assert_eq!(replayed(&pa), 0);
+
+        a.decide(sa).unwrap();
+        a.sync().unwrap();
+        assert_eq!(Wal::replay(&pb, &schema()).unwrap(), vec![WalRecord::Delete(2)]);
+        assert_eq!(
+            Wal::replay(&pa, &schema()).unwrap(),
+            vec![WalRecord::Delete(1)],
+            "the decision is also the coordinator's own commit marker"
+        );
+    }
+
+    /// Every crash point in the commit sequence, byte by byte, over both logs
+    /// at once. The writes happen in program order -- the participant's
+    /// prepare, then the coordinator's decision -- so a crash is exactly a
+    /// prefix of that stream, and every prefix has to leave both tables on the
+    /// same side of the boundary.
+    #[test]
+    fn every_prefix_of_a_two_phase_commit_is_all_or_nothing() {
+        let s = Scratch::new("wal-2pc-sweep");
+        let (pa, pb, la, lb) = two_phase(&s);
+        let (fa, fb) = (std::fs::read(&pa).unwrap(), std::fs::read(&pb).unwrap());
+        let mut committed = 0usize;
+        // Phase 1: the participant's prepare is landing; the coordinator is
+        // still at its pre-commit length.
+        for cut in lb as usize..=fb.len() {
+            std::fs::write(&pb, &fb[..cut]).unwrap();
+            std::fs::write(&pa, &fa[..la as usize]).unwrap();
+            assert_eq!(replayed(&pb), 0, "b at {cut} committed without a decision");
+            assert_eq!(replayed(&pa), 0, "a at {cut} committed early");
+        }
+        // Phase 2: the participant is whole and the decision is landing.
+        std::fs::write(&pb, &fb).unwrap();
+        for cut in la as usize..=fa.len() {
+            std::fs::write(&pa, &fa[..cut]).unwrap();
+            let (ra, rb) = (replayed(&pa), replayed(&pb));
+            assert_eq!(
+                ra > 0,
+                rb > 0,
+                "a cut to {cut} of {}: a={ra} records, b={rb} -- a prefix of the transaction",
+                fa.len()
+            );
+            committed += usize::from(ra > 0);
+        }
+        assert!(committed > 0, "no cut committed: the fixture never wrote a decision");
+    }
+
+    /// A checkpoint recycles a log. If it recycled the decisions with it, a
+    /// prepare somewhere else would become unresolvable -- which reads as
+    /// "never committed" and silently drops a transaction that did.
+    #[test]
+    fn truncating_the_coordinator_keeps_the_decisions_a_prepare_still_cites() {
+        let s = Scratch::new("wal-2pc-carry");
+        let (pa, pb, _, _) = two_phase(&s);
+        assert_eq!(replayed(&pb), 1);
+
+        // `b` has records its parts do not cover, so its prepare is live.
+        Wal::open(&pa).unwrap().truncate().unwrap();
+        assert_eq!(replayed(&pa), 0, "the coordinator's own records are in parts now");
+        assert_eq!(replayed(&pb), 1, "the participant must still resolve to commit");
+        // ...and again, across a reopen, since the carried decision has to
+        // survive the scan that reads it back.
+        Wal::open(&pa).unwrap().truncate().unwrap();
+        assert_eq!(replayed(&pb), 1);
+    }
+
+    /// The other half: once every other log is inside its table's parts,
+    /// nothing can cite a decision and it goes. Without this the coordinator's
+    /// log would grow a record per multi-table transaction, for ever.
+    #[test]
+    fn truncating_drops_decisions_once_every_other_log_is_covered() {
+        let s = Scratch::new("wal-2pc-drop");
+        let (pa, pb, _, _) = two_phase(&s);
+        let covered = std::fs::metadata(&pb).unwrap().len();
+        mark_covered(&s, "b", covered);
+
+        let mut a = Wal::open(&pa).unwrap();
+        a.truncate().unwrap();
+        assert_eq!(
+            std::fs::metadata(&pa).unwrap().len(),
+            format::HEADER_LEN as u64,
+            "a log nothing can cite must truncate to a bare header"
+        );
+        assert!(a.is_empty());
+    }
+
+    /// Sequence numbers are the citation. A truncation that keeps decisions
+    /// must keep the counter too, or the next transaction mints the number a
+    /// surviving prepare is waiting for and releases somebody else's rows.
+    #[test]
+    fn a_carried_truncation_fences_the_sequence_counter() {
+        let s = Scratch::new("wal-2pc-fence");
+        let (pa, pb, _, _) = two_phase(&s);
+        let used = {
+            let mut a = Wal::open(&pa).unwrap();
+            let n = a.begin();
+            a.truncate().unwrap();
+            n
+        };
+        let mut a = Wal::open(&pa).unwrap();
+        assert!(a.begin() > used, "the counter restarted under a live prepare");
+        // The participant is still committed, and by its own decision.
+        assert_eq!(replayed(&pb), 1);
+    }
+
+    /// A citation is read out of a file and handed to `open`, so it is a
+    /// hostile input like every other field on disk.
+    #[test]
+    fn a_citation_that_is_not_a_sibling_log_is_refused() {
+        let s = Scratch::new("wal-2pc-path");
+        let pb = table_log(&s, "b");
+        for rel in
+            ["/etc/passwd", "../../../../../../../../../../etc/passwd", "../a/TABLE", "..", "",
+             "../c/wal.log"]
+        {
+            let mut w = Wal::open(&pb).unwrap();
+            let seq = w.begin();
+            w.append_delete_staged(seq, 5).unwrap();
+            let mut body = Writer::with_capacity(64);
+            body.u8(TAG_PREPARE);
+            body.varint(seq);
+            body.varint(0);
+            body.str(rel);
+            w.append(&body.finish()).unwrap();
+            w.sync().unwrap();
+            let got = Wal::replay(&pb, &schema());
+            if rel == "../c/wal.log" {
+                // A citation that stays legal but names a log that is not
+                // there is not damage: it is a decision that was never
+                // written, which is an abort.
+                assert!(got.unwrap().is_empty(), "{rel} must not commit");
+            } else {
+                // Anything that would leave the tree, or open a file that is
+                // not a log, is refused outright rather than followed.
+                let e = got.expect_err("a bogus citation must be refused");
+                assert!(e.to_string().contains("citation"), "{rel}: {e}");
+            }
+            std::fs::remove_file(&pb).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_citation_names_the_coordinator_relative_to_the_citing_log() {
+        let s = Scratch::new("wal-2pc-rel");
+        let (pa, pb) = (table_log(&s, "a"), table_log(&s, "b"));
+        assert_eq!(relative_log(&pb, &pa).unwrap(), "../a/wal.log");
+        assert_eq!(resolve_citation(parent_of(&pb), "../a/wal.log").unwrap(), pa);
+        // A transaction may span databases, so a citation may have to climb
+        // two levels rather than one.
+        let other = s.path().join("db2").join("a").join(store::WAL_FILE);
+        assert_eq!(relative_log(&pb, &other).unwrap(), "../../db2/a/wal.log");
+        assert_eq!(resolve_citation(parent_of(&pb), "../../db2/a/wal.log").unwrap(), other);
+        // Two paths that cannot be compared are refused rather than guessed
+        // at, and so is a target that is not below anything.
+        assert!(relative_log(&pa, Path::new("db/a/wal.log")).is_err());
+        assert!(relative_log(Path::new("/x/wal.log"), Path::new("/x")).is_err());
+    }
+
+    /// A moved -- or restored -- data directory still resolves, which is the
+    /// reason the citation is relative and not absolute.
+    #[test]
+    fn a_two_phase_commit_survives_the_directory_being_moved() {
+        let s = Scratch::new("wal-2pc-move");
+        let (_, pb, _, _) = two_phase(&s);
+        assert_eq!(replayed(&pb), 1);
+        let moved = s.join("copy");
+        copy_dir(&s.path().join("db"), &moved.join("db"));
+        std::fs::copy(s.join(store::CATALOG_FILE), moved.join(store::CATALOG_FILE)).unwrap();
+        assert_eq!(replayed(&moved.join("db").join("b").join(store::WAL_FILE)), 1);
+    }
+
+    fn copy_dir(from: &Path, to: &Path) {
+        std::fs::create_dir_all(to).unwrap();
+        for e in std::fs::read_dir(from).unwrap().flatten() {
+            let (src, dst) = (e.path(), to.join(e.file_name()));
+            if e.file_type().unwrap().is_dir() {
+                copy_dir(&src, &dst);
+            } else {
+                std::fs::copy(&src, &dst).unwrap();
+            }
+        }
     }
 
     /// The batched append exists to remove a syscall per record, not to change

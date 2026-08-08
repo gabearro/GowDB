@@ -787,7 +787,16 @@ fn classify(t: &[Spanned]) -> Option<Ext> {
                     found = Some(Ext::Import(i));
                 } else if s.tok.is_keyword("OUTFILE") && i > 0 && t[i - 1].tok.is_keyword("INTO") {
                     found = Some(Ext::Export(i - 1));
-                } else if s.tok.is_keyword("SETTINGS") && i > 0 && found.is_none() {
+                } else if s.tok.is_keyword("SETTINGS")
+                    && i > 0
+                    && t[i - 1].tok != Token::Dot
+                    && found.is_none()
+                {
+                    // Not after a dot: `system.settings` and `mydb.settings`
+                    // are qualified *names*, and claiming them made every
+                    // table called `settings` unqueryable -- `SELECT * FROM
+                    // mydb.settings LIMIT 1` was parsed as a settings clause
+                    // and died on "expected a setting name".
                     found = Some(Ext::Scoped(i));
                 }
             }

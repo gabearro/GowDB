@@ -1187,6 +1187,21 @@ fn ntile(j: usize, size: usize, buckets: u64) -> u64 {
     }
 }
 
+/// Every value of `c` cast to `ty`, once, so a per-row gather can push lanes
+/// without asking what scale they were.
+///
+/// Only reached when the types genuinely differ; see the note in `eval_shift`.
+fn cast_column(c: &Column, ty: &DataType) -> Result<Column> {
+    let mut b = ColumnBuilder::with_capacity(ty.clone(), c.len());
+    for i in 0..c.len() {
+        match c.value(i) {
+            Value::Null => b.push_null(),
+            v => b.push_value(&v.cast_to(ty)?)?,
+        }
+    }
+    Ok(b.finish())
+}
+
 /// `lag` / `lead`: a positional gather inside the partition, with a default for
 /// the rows that fall off the end. The frame is ignored, per SQL.
 fn eval_shift(
@@ -1199,6 +1214,25 @@ fn eval_shift(
 ) -> Result<Column> {
     let back = matches!(f.kind, WindowKind::Lag);
     let off = f.offset as usize;
+
+    // `f.ty` is `promote(value, default)`, so either input can be narrower than
+    // the output -- and for a decimal that difference is a SCALE, which a
+    // `Value` carries and a lane does not. Pushing `Decimal(1000, 1)` into a
+    // `Decimal64(2)` column reinterprets the units and renders 100.0 as 10.00.
+    // Found by the sqlite oracle: `lag(2.25, 2, 100.0)` answered 10.00 against
+    // sqlite's 100.0, on 6 of 40000 generated cases.
+    //
+    // Hoisted out of the row loop and skipped when the types already agree,
+    // which is every non-decimal query and most decimal ones: one comparison
+    // per block, nothing per row.
+    let need_cast = |c: &Column| c.ty != f.ty;
+    let cast_v = if need_cast(val) { Some(cast_column(val, &f.ty)?) } else { None };
+    let val = cast_v.as_ref().unwrap_or(val);
+    let cast_d = match dflt {
+        Some(d) if need_cast(d) => Some(cast_column(d, &f.ty)?),
+        _ => None,
+    };
+    let dflt = cast_d.as_ref().or(dflt);
 
     let mut b = ColumnBuilder::with_capacity(f.ty.clone(), hi - lo);
     let mut ps = lo;

@@ -52,9 +52,9 @@ use std::cell::Cell;
 
 use crate::common::{Error, Result};
 use crate::sql::ast::{
-    BinaryOp, ColumnDef, CreateTable, Cte, ExplainKind, Expr, FrameBound, FrameUnits, Insert,
-    InsertSource, IntervalUnit, JoinConstraint, JoinOp, ObjectName, OrderByExpr, Query, Select,
-    SelectItem, SetExpr, SetOp, Statement, TableRef, UnaryOp, WindowFrame, WindowSpec,
+    BinaryOp, CheckDef, ColumnDef, CreateTable, Cte, ExplainKind, Expr, FrameBound, FrameUnits,
+    Insert, InsertSource, IntervalUnit, JoinConstraint, JoinOp, ObjectName, OrderByExpr, Query,
+    Select, SelectItem, SetExpr, SetOp, Statement, TableRef, UnaryOp, WindowFrame, WindowSpec,
 };
 use crate::sql::lexer::{is_reserved, tokenize, Spanned, Token};
 use crate::types::{DataType, Engine, Value};
@@ -164,6 +164,13 @@ const MAX_CHAIN: usize = 4096;
 
 struct Parser<'d> {
     toks: Vec<Spanned>,
+    /// The statement text the tokens came from.
+    ///
+    /// Only [`Parser::create_view`] reads it, and only to slice out the body of
+    /// a view. `Query` has no `Display`, so the *text* is the only faithful
+    /// serialization of one; rendering the AST back would mean a second SQL
+    /// printer that could disagree with this parser about what it parsed.
+    src: &'d str,
     i: usize,
     /// Byte offset just past the input, so "unexpected end of input" errors
     /// still point somewhere useful.
@@ -222,9 +229,10 @@ impl Drop for Nesting<'_> {
 }
 
 impl<'d> Parser<'d> {
-    fn new(sql: &str, depth: &'d Cell<u32>) -> Result<Parser<'d>> {
+    fn new(sql: &'d str, depth: &'d Cell<u32>) -> Result<Parser<'d>> {
         Ok(Parser {
             toks: tokenize(sql)?,
+            src: sql,
             i: 0,
             eof: sql.len(),
             depth,
@@ -434,6 +442,7 @@ impl Parser<'_> {
             "CREATE" => self.create(),
             "DROP" => self.drop_object(),
             "ALTER" => self.alter(),
+            "RENAME" => self.rename(),
             "OPTIMIZE" => {
                 self.bump();
                 self.expect_kw("TABLE")?;
@@ -605,14 +614,62 @@ impl Parser<'_> {
 
     fn create(&mut self) -> Result<Statement> {
         self.expect_kw("CREATE")?;
+        let or_replace = self.eat_kws(&["OR", "REPLACE"]);
         if self.eat_kw("DATABASE") {
             let if_not_exists = self.eat_kws(&["IF", "NOT", "EXISTS"]);
             return Ok(Statement::CreateDatabase { name: self.ident()?, if_not_exists });
         }
+        if self.eat_kw("VIEW") {
+            return self.create_view(or_replace);
+        }
+        // `MATERIALIZED VIEW` is a different object -- it has storage, an
+        // insert trigger and a refresh story -- and none of that is built. It
+        // is named here rather than left to fall through to "`TABLE` or
+        // `DATABASE` after CREATE", because the difference between the two
+        // kinds of view is exactly what someone porting a script needs told.
+        if self.at_kw("MATERIALIZED") {
+            return Err(Error::unsupported(
+                "MATERIALIZED VIEW: a materialized view stores rows and has to be \
+                 maintained on every insert into its source, which is not implemented. \
+                 `CREATE VIEW` (which stores the query, not the rows) is",
+            ));
+        }
         if self.eat_kw("TABLE") {
             return self.create_table();
         }
-        self.err("`TABLE` or `DATABASE` after CREATE")
+        self.err("`TABLE`, `VIEW` or `DATABASE` after CREATE")
+    }
+
+    /// `CREATE [OR REPLACE] VIEW [IF NOT EXISTS] v AS <query>`.
+    fn create_view(&mut self, or_replace: bool) -> Result<Statement> {
+        let if_not_exists = self.eat_kws(&["IF", "NOT", "EXISTS"]);
+        if or_replace && if_not_exists {
+            return self.err("either `OR REPLACE` or `IF NOT EXISTS`, not both");
+        }
+        let name = self.object_name()?;
+        // A column list would rename the view's output columns, which nothing
+        // downstream carries; accepting it would be a rename silently dropped.
+        if self.at(&Token::LParen) {
+            return Err(Error::unsupported(
+                "CREATE VIEW with a column list: the view's columns are the query's, so \
+                 alias them in the SELECT instead (`SELECT x AS renamed ...`)",
+            ));
+        }
+        self.expect_kw("AS")?;
+        // The body's own source text, from the first token of the query to
+        // wherever the query stopped. Sliced rather than re-rendered: see
+        // `Parser::src`.
+        let start = self.pos();
+        let query = self.query()?;
+        let end = self.toks.get(self.i).map_or(self.src.len(), |s| s.pos);
+        let body_sql = self.src[start..end].trim().to_string();
+        Ok(Statement::CreateView {
+            name,
+            query: Box::new(query),
+            body_sql,
+            or_replace,
+            if_not_exists,
+        })
     }
 
     fn create_table(&mut self) -> Result<Statement> {
@@ -620,9 +677,19 @@ impl Parser<'_> {
         let name = self.object_name()?;
 
         let mut columns = Vec::new();
+        let mut checks = Vec::new();
         if self.eat(&Token::LParen) {
             loop {
-                columns.push(self.column_def()?);
+                // A table-level constraint is an element of the same list as
+                // the columns, and the two are told apart by the leading
+                // keyword: `CONSTRAINT`, `CHECK` and `UNIQUE` cannot start a
+                // column definition, because a column's name is followed by a
+                // *type*.
+                if self.at_kw("CONSTRAINT") || self.at_kw("CHECK") || self.at_kw("UNIQUE") {
+                    self.table_constraint(&mut checks, &mut columns)?;
+                } else {
+                    columns.push(self.column_def(&mut checks)?);
+                }
                 if !self.eat(&Token::Comma) {
                     break;
                 }
@@ -638,6 +705,7 @@ impl Parser<'_> {
             order_by: Vec::new(),
             primary_key: Vec::new(),
             partition_by: None,
+            checks,
             as_query: None,
         };
 
@@ -722,14 +790,106 @@ impl Parser<'_> {
         Ok(Statement::CreateTable(Box::new(ct)))
     }
 
-    fn column_def(&mut self) -> Result<ColumnDef> {
+    /// One element of a `CREATE TABLE` list that is a constraint rather than a
+    /// column: `[CONSTRAINT name] CHECK (p)`, or `UNIQUE (col)`.
+    ///
+    /// `UNIQUE` is folded onto the column it names instead of getting a node of
+    /// its own, because that is where the enforcement decision is made and
+    /// there is exactly one shape this engine can enforce -- a single column
+    /// that is already the table's unique key. A composite one has nothing to
+    /// enforce against, and is refused here rather than stored and ignored.
+    fn table_constraint(
+        &mut self,
+        checks: &mut Vec<CheckDef>,
+        columns: &mut [ColumnDef],
+    ) -> Result<()> {
+        let named = if self.eat_kw("CONSTRAINT") {
+            let n = self.ident()?;
+            // `CONSTRAINT c UNIQUE (...)` would have to keep the name
+            // somewhere, and the column flag has no room for one; the name is
+            // only ever printed, so refusing is a rename declined rather than
+            // a constraint lost.
+            if self.at_kw("UNIQUE") {
+                return Err(Error::unsupported(format!(
+                    "named UNIQUE constraint `{n}`: write `UNIQUE` without a name, or \
+                     declare the column `UNIQUE`"
+                )));
+            }
+            Some(n)
+        } else {
+            None
+        };
+        if self.eat_kw("UNIQUE") {
+            let at = self.pos();
+            let cols = self.paren_ident_list()?;
+            let [col] = cols.as_slice() else {
+                return Err(Error::parse(
+                    format!(
+                        "UNIQUE ({}): a multi-column UNIQUE constraint is not enforceable \
+                         here -- the unique-key index is one lane of one column. Declare \
+                         one column UNIQUE, or drop the constraint",
+                        cols.join(", ")
+                    ),
+                    at,
+                ));
+            };
+            let Some(c) = columns.iter_mut().find(|c| c.name.eq_ignore_ascii_case(col)) else {
+                return Err(Error::parse(
+                    format!("UNIQUE ({col}): `{col}` is not one of the columns declared above it"),
+                    at,
+                ));
+            };
+            c.unique = true;
+            return Ok(());
+        }
+        self.expect_kw("CHECK")?;
+        checks.push(CheckDef { name: named, expr: self.paren_expr()? });
+        Ok(())
+    }
+
+    /// `(a, b, c)` as bare identifiers.
+    fn paren_ident_list(&mut self) -> Result<Vec<String>> {
+        self.expect(&Token::LParen)?;
+        let mut out = Vec::new();
+        loop {
+            out.push(self.ident()?);
+            if !self.eat(&Token::Comma) {
+                break;
+            }
+        }
+        self.expect(&Token::RParen)?;
+        Ok(out)
+    }
+
+    /// The `(...)` of a `CHECK`. The parens are required, as they are in every
+    /// dialect that has the clause, and they are what bounds the expression.
+    fn paren_expr(&mut self) -> Result<Expr> {
+        self.expect(&Token::LParen)?;
+        let e = self.expr()?;
+        self.expect(&Token::RParen)?;
+        Ok(e)
+    }
+
+    fn column_def(&mut self, checks: &mut Vec<CheckDef>) -> Result<ColumnDef> {
         let name = self.ident()?;
         let mut ty = self.data_type()?;
         let mut default = None;
         let mut codec = None;
+        let mut unique = false;
         loop {
             let at = self.pos();
-            if self.eat_kws(&["NOT", "NULL"]) {
+            if self.eat_kw("UNIQUE") {
+                unique = true;
+            } else if self.eat_kw("CHECK") {
+                // A column check is a table check that happens to mention one
+                // column: same storage, same evaluation, same error. Named
+                // after the column so the rejection can say which constraint
+                // failed without printing the expression back at the user.
+                checks.push(CheckDef {
+                    name: Some(format!("check_{name}")),
+                    expr: self.paren_expr()?,
+                });
+            } else if self.eat_kws(&["NOT", "NULL"]) {
                 // `NOT NULL` used to be eaten and dropped -- including on a
                 // `Nullable(...)` column, so `CREATE TABLE n (x
                 // Nullable(String) NOT NULL)` then took `INSERT ... (NULL)`,
@@ -792,7 +952,7 @@ impl Parser<'_> {
                 break;
             }
         }
-        Ok(ColumnDef { name, ty, default, codec })
+        Ok(ColumnDef { name, ty, default, codec, unique })
     }
 
     fn drop_object(&mut self) -> Result<Statement> {
@@ -801,11 +961,37 @@ impl Parser<'_> {
             let if_exists = self.eat_kws(&["IF", "EXISTS"]);
             return Ok(Statement::DropTable { name: self.object_name()?, if_exists });
         }
+        if self.eat_kw("VIEW") {
+            let if_exists = self.eat_kws(&["IF", "EXISTS"]);
+            return Ok(Statement::DropView { name: self.object_name()?, if_exists });
+        }
         if self.eat_kw("DATABASE") {
             let if_exists = self.eat_kws(&["IF", "EXISTS"]);
             return Ok(Statement::DropDatabase { name: self.ident()?, if_exists });
         }
-        self.err("`TABLE` or `DATABASE` after DROP")
+        self.err("`TABLE`, `VIEW` or `DATABASE` after DROP")
+    }
+
+    /// `RENAME TABLE a TO b`.
+    fn rename(&mut self) -> Result<Statement> {
+        self.expect_kw("RENAME")?;
+        self.expect_kw("TABLE")?;
+        let from = self.object_name()?;
+        self.expect_kw("TO")?;
+        let to = self.object_name()?;
+        // ClickHouse takes a comma-separated list and renames all of them in
+        // one step. One rename here is one catalog edit and one checkpoint, and
+        // a list would have to be all-or-nothing across several of each --
+        // which is buildable, but not by accepting the syntax and doing them
+        // one at a time.
+        if self.at(&Token::Comma) {
+            return Err(Error::unsupported(
+                "RENAME TABLE with more than one pair: each rename is its own commit \
+                 point here, so a list would not be atomic. Write them as separate \
+                 statements",
+            ));
+        }
+        Ok(Statement::RenameTable { from, to })
     }
 
     fn alter(&mut self) -> Result<Statement> {
@@ -835,18 +1021,66 @@ impl Parser<'_> {
         if self.eat_kw("ADD") {
             self.expect_kw("COLUMN")?;
             let if_not_exists = self.eat_kws(&["IF", "NOT", "EXISTS"]);
-            return Ok(Statement::AlterAddColumn {
-                table,
-                column: self.column_def()?,
-                if_not_exists,
-            });
+            let at = self.pos();
+            // A column added to a populated table cannot carry a constraint
+            // that the rows already there have never been tested against, and
+            // testing them is a different statement from adding a column. Both
+            // are refused where they are written rather than dropped on the
+            // floor -- `column_def` would otherwise hand its `CHECK` to a
+            // `Vec` this arm throws away.
+            let mut checks = Vec::new();
+            let column = self.column_def(&mut checks)?;
+            if !checks.is_empty() || column.unique {
+                return Err(Error::parse(
+                    format!(
+                        "ALTER TABLE ... ADD COLUMN `{}`: a constraint on a new column is \
+                         not implemented, because the rows already in the table were never \
+                         checked against it. Add the column, then re-create the table with \
+                         the constraint if you need one",
+                        column.name
+                    ),
+                    at,
+                ));
+            }
+            return Ok(Statement::AlterAddColumn { table, column, if_not_exists });
         }
         if self.eat_kw("DROP") {
             self.expect_kw("COLUMN")?;
             let if_exists = self.eat_kws(&["IF", "EXISTS"]);
             return Ok(Statement::AlterDropColumn { table, column: self.ident()?, if_exists });
         }
-        self.err("`DELETE`, `UPDATE`, `ADD COLUMN` or `DROP COLUMN`")
+        if self.eat_kw("MODIFY") {
+            self.expect_kw("COLUMN")?;
+            let column = self.ident()?;
+            let at = self.pos();
+            let ty = self.data_type()?;
+            // Only the type. `MODIFY COLUMN c T DEFAULT x` also changes the
+            // default, `... CODEC(...)` the encoding, `... COMMENT` nothing at
+            // all -- and a rewrite that applied the type while ignoring the
+            // rest would leave the table disagreeing with the statement that
+            // produced it.
+            if let Some(w) = self.peek().and_then(|t| t.bare_word()) {
+                let w = w.to_ascii_uppercase();
+                if matches!(w.as_str(), "DEFAULT" | "CODEC" | "COMMENT" | "TTL" | "NULL" | "NOT")
+                {
+                    return Err(Error::parse(
+                        format!(
+                            "ALTER TABLE ... MODIFY COLUMN `{column}` {ty} {w}: only the type \
+                             can be modified here. Nullability is part of the type \
+                             (`Nullable({ty})`); a DEFAULT, CODEC or COMMENT change is not \
+                             implemented"
+                        ),
+                        at,
+                    ));
+                }
+            }
+            return Ok(Statement::AlterModifyColumn { table, column, ty });
+        }
+        if self.eat_kw("RENAME") {
+            self.expect_kw("TO")?;
+            return Ok(Statement::RenameTable { from: table, to: self.object_name()? });
+        }
+        self.err("`DELETE`, `UPDATE`, `ADD COLUMN`, `DROP COLUMN`, `MODIFY COLUMN` or `RENAME TO`")
     }
 
     fn show(&mut self) -> Result<Statement> {
@@ -863,7 +1097,10 @@ impl Parser<'_> {
             return Ok(Statement::ShowDatabases);
         }
         if self.eat_kw("CREATE") {
-            self.eat_kw("TABLE");
+            // `VIEW` is accepted and means the same thing: one statement
+            // answers for both kinds of object, because which one a name is
+            // is not something the parser knows.
+            let _ = self.eat_kw("TABLE") || self.eat_kw("VIEW");
             return Ok(Statement::ShowCreateTable(self.object_name()?));
         }
         self.err("`TABLES`, `DATABASES` or `CREATE TABLE`")
@@ -2460,6 +2697,12 @@ fn negate_literal(v: &Value) -> Option<Value> {
     Some(match v {
         Value::Int(i) => Value::Int(i.checked_neg()?),
         Value::Float(f) => Value::Float(-f),
+        // A literal with a decimal point lexes as `Decimal`, so this arm is
+        // what keeps `-1.5` a *literal*. Without it the fold declines, the
+        // minus survives as a `UnaryOp`, and every consumer that wants a
+        // `Value` rather than a node to evaluate -- `INSERT ... VALUES`, zone
+        // pruning, the range checks -- loses the constant.
+        Value::Decimal(u, s) => Value::Decimal(u.checked_neg()?, *s),
         Value::UInt(u) if *u == 1u64 << 63 => Value::Int(i64::MIN),
         _ => return None,
     })
@@ -2563,7 +2806,11 @@ mod tests {
     #[test]
     fn unary_minus_folds_into_literals_but_not_columns() {
         assert_eq!(ex("-1"), Expr::Literal(Value::Int(-1)));
-        assert_eq!(ex("-1.5"), Expr::Literal(Value::Float(-1.5)));
+        // Inverted when a literal with a decimal point started lexing as an
+        // exact `Decimal` rather than a `Float`; the property under test is
+        // that the minus is *folded into the literal*, not which numeric type
+        // the literal has.
+        assert_eq!(ex("-1.5"), Expr::Literal(Value::Decimal(-15, 1)));
         assert_eq!(shape("-a"), "(- a)");
         assert_eq!(shape("a - -1"), "(a - -1)");
         assert_eq!(shape("- a + b"), "((- a) + b)");

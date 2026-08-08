@@ -4,10 +4,31 @@
 //! executor -- borrows tables from here rather than owning storage, which
 //! keeps the "who can mutate a table" question answerable: only code holding
 //! `&mut Catalog`.
+//!
+//! ## Quarantine
+//!
+//! Name resolution is also where damage stops. A table whose part files did
+//! not all decode at open ([`crate::persist::reader::read_table_image`]) is
+//! recorded here by name, and every accessor that hands out a `Table` refuses
+//! it -- because the `Table` behind that name is missing however many rows
+//! lived in the file that failed, and serving it would be a plausible wrong
+//! answer rather than an error.
+//!
+//! The refusal is deliberately *here* and not in the scan: this is the one
+//! place a query names a table, so the check costs one map probe per statement
+//! rather than one per granule, and it is skipped entirely -- a load and a
+//! branch -- while the map is empty, which it is on every undamaged database.
+//!
+//! What keeps working is everything that does not read a table's rows:
+//! `SHOW DATABASES`, `SHOW TABLES` (which lists the damaged table, because
+//! hiding it is how a later checkpoint would decide it had been dropped and
+//! delete its directory), `USE`, `CREATE TABLE`, and `DROP TABLE` -- the last
+//! being the operator's way out when the file is not coming back.
 
 use std::path::{Path, PathBuf};
 
 use crate::common::{Error, FastMap, Result};
+use crate::persist::reader::{self, DamagedPart};
 use crate::persist::store;
 use crate::sql::ast::ObjectName;
 use crate::storage::Table;
@@ -29,6 +50,15 @@ pub struct Catalog {
     /// Backing directory. `None` for a purely in-memory catalog.
     dir: Option<PathBuf>,
     delta_limit: usize,
+    /// Tables whose on-disk parts did not all decode, by `db.table`.
+    ///
+    /// Empty on every healthy database, which is what makes the check on the
+    /// resolve path free: one `is_empty` against a `HashMap` field, and no
+    /// name is formatted unless there is something to compare it against.
+    /// Open and scan on an undamaged 4M-row, 13-part database measured
+    /// unchanged (open 86.9 ms against 86.2 ms, scan 9.2 ms against 8.7 ms,
+    /// best of 16 interleaved runs per side, per-side spread ±12%).
+    damaged: FastMap<String, Vec<DamagedPart>>,
 }
 
 impl Catalog {
@@ -40,6 +70,7 @@ impl Catalog {
             current: DEFAULT_DATABASE.to_string(),
             dir: None,
             delta_limit: DEFAULT_DELTA_LIMIT,
+            damaged: FastMap::default(),
         }
     }
 
@@ -126,6 +157,9 @@ impl Catalog {
         if name == DEFAULT_DATABASE {
             return Err(Error::storage("cannot drop the default database"));
         }
+        if !self.damaged.is_empty() {
+            self.damaged.retain(|k, _| k.split_once('.').is_none_or(|(d, _)| d != name));
+        }
         if self.databases.remove(name).is_none() && !if_exists {
             return Err(Error::storage(format!("database `{name}` does not exist")));
         }
@@ -177,6 +211,13 @@ impl Catalog {
 
     pub fn drop_table(&mut self, name: &ObjectName, if_exists: bool) -> Result<()> {
         let (db, tbl) = self.resolve(name);
+        // Before the removal, and unconditionally: dropping a quarantined
+        // table is the operator's way out, so the quarantine has to go with
+        // it or the name stays refused for a table that no longer exists --
+        // and, worse, the next checkpoint would still decline to rewrite it.
+        if !self.damaged.is_empty() {
+            self.damaged.remove(&format!("{db}.{tbl}"));
+        }
         let d = self
             .databases
             .get_mut(&db)
@@ -189,6 +230,9 @@ impl Catalog {
 
     pub fn table(&self, name: &ObjectName) -> Result<&Table> {
         let (db, tbl) = self.resolve(name);
+        if !self.damaged.is_empty() {
+            refuse_if_damaged(&self.damaged, &db, &tbl)?;
+        }
         self.databases
             .get(&db)
             .and_then(|d| d.tables.get(&tbl))
@@ -197,6 +241,9 @@ impl Catalog {
 
     pub fn table_mut(&mut self, name: &ObjectName) -> Result<&mut Table> {
         let (db, tbl) = self.resolve(name);
+        if !self.damaged.is_empty() {
+            refuse_if_damaged(&self.damaged, &db, &tbl)?;
+        }
         self.databases
             .get_mut(&db)
             .and_then(|d| d.tables.get_mut(&tbl))
@@ -207,18 +254,86 @@ impl Catalog {
     /// which is always `db.table`.
     pub fn table_by_path(&self, path: &str) -> Result<&Table> {
         let (db, tbl) = split_path(path, &self.current);
+        if !self.damaged.is_empty() {
+            refuse_if_damaged(&self.damaged, db, tbl)?;
+        }
         self.databases
-            .get(&db)
-            .and_then(|d| d.tables.get(&tbl))
+            .get(db)
+            .and_then(|d| d.tables.get(tbl))
             .ok_or_else(|| Error::storage(format!("table `{path}` does not exist")))
     }
 
     pub fn table_by_path_mut(&mut self, path: &str) -> Result<&mut Table> {
         let (db, tbl) = split_path(path, &self.current);
+        if !self.damaged.is_empty() {
+            refuse_if_damaged(&self.damaged, db, tbl)?;
+        }
+        // Strictly after the refusal, and that ordering is the mechanism, not
+        // an accident. The loader reads a table's parts and then resolves it
+        // here once to install them; that resolve is the one this claim turns
+        // into a quarantine, so it succeeds and every resolve after it -- any
+        // INSERT, DELETE, ALTER or OPTIMIZE -- is refused above. A rebuild
+        // like `ALTER TABLE ... ADD COLUMN` reaches straight for this
+        // accessor, and it would otherwise rewrite the table from the parts
+        // that happened to load.
+        if reader::any_pending_damage() {
+            claim_damage(&mut self.damaged, self.dir.as_deref(), db, tbl);
+        }
         self.databases
-            .get_mut(&db)
-            .and_then(|d| d.tables.get_mut(&tbl))
+            .get_mut(db)
+            .and_then(|d| d.tables.get_mut(tbl))
             .ok_or_else(|| Error::storage(format!("table `{path}` does not exist")))
+    }
+
+    // ---- quarantine ------------------------------------------------------
+
+    /// Record that `db.table` has part files that did not decode.
+    ///
+    /// The direct route for a loader that *can* say so: `table_by_path_mut`
+    /// picks the same record up out of the reader's hand-off because
+    /// `store::load_catalog` has nowhere to put it, and this is what that
+    /// hand-off exists to stand in for. Passing an empty list lifts the
+    /// quarantine, which only a caller that has re-read the files should do.
+    pub fn quarantine(&mut self, path: &str, parts: Vec<DamagedPart>) {
+        if parts.is_empty() {
+            self.damaged.remove(path);
+        } else {
+            self.damaged.insert(path.to_string(), parts);
+        }
+    }
+
+    /// Is this `db.table` refusing to answer because of damage on disk?
+    pub fn is_quarantined(&self, path: &str) -> bool {
+        !self.damaged.is_empty() && self.damaged.contains_key(path)
+    }
+
+    /// The definition of a quarantined table, or `None` if it is healthy.
+    ///
+    /// What a checkpoint needs: a quarantined table must keep its place in the
+    /// committed roster (a table the root `CATALOG` stops naming is a table
+    /// the *next* checkpoint deletes the directory of) while none of its files
+    /// are rewritten, because rewriting them would collect the very part that
+    /// could not be read.
+    pub fn quarantined_def(&self, db: &str, table: &str) -> Option<&TableDef> {
+        if self.damaged.is_empty() || !self.damaged.contains_key(&format!("{db}.{table}")) {
+            return None;
+        }
+        self.databases.get(db).and_then(|d| d.tables.get(table)).map(|t| &t.def)
+    }
+
+    /// Every quarantined part, as `(db.table, part)`, sorted.
+    ///
+    /// One row per damaged *file*, which is the grain a `system.` table wants:
+    /// the table is what stopped answering, the file is what has to be put
+    /// back. Sorted so two calls agree.
+    pub fn damaged_parts(&self) -> Vec<(&str, &DamagedPart)> {
+        let mut v: Vec<(&str, &DamagedPart)> = self
+            .damaged
+            .iter()
+            .flat_map(|(t, parts)| parts.iter().map(move |p| (t.as_str(), p)))
+            .collect();
+        v.sort_unstable_by(|a, b| a.0.cmp(b.0).then_with(|| a.1.file.cmp(&b.1.file)));
+        v
     }
 
     /// Fully-qualified `db.table` path for a possibly-bare name.
@@ -348,10 +463,71 @@ fn holds_table_data(dir: &Path) -> bool {
     })
 }
 
-fn split_path(path: &str, current: &str) -> (String, String) {
+/// Borrowed, not owned: this runs once per resolve and a resolve runs once per
+/// INSERT *block*, so the two `String`s it used to allocate were two
+/// allocations per 8192 rows of an `INSERT ... SELECT`. Both halves borrow
+/// disjoint fields of the catalog, which is why the callers can still take
+/// `&mut self.databases` around them.
+///
+/// Measured on 40,000 single-row `INSERT` statements (~80,000 resolves), best
+/// of 32 interleaved runs against a build of the same tree without this and
+/// without the quarantine check: 171.6 ms against 176.2 ms. A 2.6% effect on
+/// a machine that swings 12% between identical runs -- three of the four
+/// batches favoured it and one did not -- so the honest reading is "the
+/// quarantine check costs nothing, and this pays for it".
+fn split_path<'a>(path: &'a str, current: &'a str) -> (&'a str, &'a str) {
     match path.split_once('.') {
-        Some((d, t)) => (d.to_string(), t.to_string()),
-        None => (current.to_string(), path.to_string()),
+        Some((d, t)) => (d, t),
+        None => (current, path),
+    }
+}
+
+/// Refuse a table whose parts did not all load. Called only when the map is
+/// non-empty, so the healthy path never formats a name.
+fn refuse_if_damaged(
+    damaged: &FastMap<String, Vec<DamagedPart>>,
+    db: &str,
+    tbl: &str,
+) -> Result<()> {
+    let path = format!("{db}.{tbl}");
+    let Some(parts) = damaged.get(&path) else { return Ok(()) };
+    // Every damaged file, up to three: an operator restoring from a backup
+    // needs the list, and a table with more than a handful of bad files has a
+    // dead disk rather than a bad block.
+    let mut msg = format!(
+        "table `{path}` is quarantined: {} of its part files could not be read when this \
+         database was opened",
+        parts.len()
+    );
+    for p in parts.iter().take(3) {
+        msg.push_str(". ");
+        msg.push_str(&p.why);
+    }
+    if parts.len() > 3 {
+        msg.push_str(&format!(". ...and {} more", parts.len() - 3));
+    }
+    msg.push_str(
+        ". Answering from the parts that did load would silently drop the rows in the ones \
+         that did not, so every read and write of this table is refused. Restore the file \
+         from a backup and reopen, or DROP the table. No other table is affected.",
+    );
+    Err(Error::corruption(msg))
+}
+
+/// Move the damage the loader just found for `db.tbl` into this catalog.
+///
+/// Keyed by the table's directory, which is the only name the reader and the
+/// catalog can both compute -- the reader never sees the database it is
+/// loading into, and the catalog never sees the files.
+fn claim_damage(
+    damaged: &mut FastMap<String, Vec<DamagedPart>>,
+    dir: Option<&Path>,
+    db: &str,
+    tbl: &str,
+) {
+    let Some(root) = dir else { return };
+    if let Some(parts) = reader::claim_damage(&root.join(db).join(tbl)) {
+        damaged.insert(format!("{db}.{tbl}"), parts);
     }
 }
 
@@ -488,6 +664,137 @@ mod tests {
             std::fs::write(s.join(store::CATALOG_FILE), b"opaque").unwrap();
             assert!(Catalog::on_disk(s.path()).is_ok(), "{marker}");
         }
+    }
+
+    // ---- quarantine -------------------------------------------------------
+
+    /// Two tables on disk, one of them with a bit-flipped part file. Hands
+    /// back the scratch and the name of the file that was damaged.
+    fn two_tables_one_damaged(tag: &str) -> (Scratch, String) {
+        use crate::persist::testkit::sample_block;
+        let s = Scratch::new(tag);
+        let mut c = Catalog::on_disk(s.path()).unwrap();
+        for name in ["a", "b"] {
+            c.create_table(crate::persist::testkit::table_def(name), false).unwrap();
+            c.table_by_path_mut(&format!("default.{name}"))
+                .unwrap()
+                .insert(sample_block(2_000))
+                .unwrap();
+        }
+        store::save_catalog(&mut c).unwrap();
+
+        let tdir = s.join("default").join("a");
+        let files = store::list_part_files(&tdir).unwrap();
+        let name = files[0].1.clone();
+        let p = tdir.join(&name);
+        let mut bytes = std::fs::read(&p).unwrap();
+        let mid = bytes.len() / 2;
+        bytes[mid] ^= 0x08;
+        std::fs::write(&p, &bytes).unwrap();
+        (s, name)
+    }
+
+    fn reopen(s: &Scratch) -> Catalog {
+        let mut c = Catalog::on_disk(s.path()).unwrap();
+        store::load_catalog(&mut c).expect("a damaged part must not fail the open");
+        c
+    }
+
+    /// The whole point: damage in `a` is damage in `a`. The database opens,
+    /// `b` answers, and the catalog itself is fully usable.
+    #[test]
+    fn a_damaged_part_quarantines_only_its_own_table() {
+        let (s, part) = two_tables_one_damaged("quarantine-one");
+        let c = reopen(&s);
+
+        assert!(c.table_by_path("default.b").is_ok(), "an unrelated table must be unaffected");
+        assert_eq!(c.table_names(None).unwrap(), vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(c.database_names(), vec!["default".to_string()]);
+
+        // `Table` has no `Debug` on purpose, so `expect_err` is out.
+        let Err(e) = c.table_by_path("default.a") else { panic!("a damaged table must refuse") };
+        assert_eq!(e.code(), "CHECKSUM_MISMATCH", "{e}");
+        let msg = e.to_string();
+        assert!(msg.contains("default.a"), "must name the table: {msg}");
+        assert!(msg.contains(&part), "must name the part file: {msg}");
+
+        assert!(c.is_quarantined("default.a"));
+        assert!(!c.is_quarantined("default.b"));
+        let dmg = c.damaged_parts();
+        assert_eq!(dmg.len(), 1);
+        assert_eq!((dmg[0].0, dmg[0].1.file.as_str()), ("default.a", part.as_str()));
+        assert!(c.quarantined_def("default", "a").is_some_and(|d| d.name == "a"));
+        assert!(c.quarantined_def("default", "b").is_none());
+    }
+
+    /// Every accessor that hands out a `Table`, not just the read path: an
+    /// `ALTER TABLE ... ADD COLUMN` rebuilds a table straight through
+    /// `table_by_path_mut`, and would otherwise rebuild it from the parts that
+    /// happened to load.
+    #[test]
+    fn every_accessor_refuses_a_quarantined_table() {
+        let (s, _) = two_tables_one_damaged("quarantine-accessors");
+        let mut c = reopen(&s);
+        let a = ObjectName::bare("a");
+        assert!(c.table(&a).is_err(), "table()");
+        assert!(c.table_mut(&a).is_err(), "table_mut()");
+        assert!(c.table_by_path("default.a").is_err(), "table_by_path()");
+        assert!(c.table_by_path_mut("default.a").is_err(), "table_by_path_mut()");
+        // ...and the same four still work for the healthy one.
+        let b = ObjectName::bare("b");
+        assert!(c.table(&b).is_ok());
+        assert!(c.table_mut(&b).is_ok());
+        assert!(c.table_by_path("default.b").is_ok());
+        assert!(c.table_by_path_mut("default.b").is_ok());
+    }
+
+    /// The way out. `DROP` is the operator's answer when the file is not
+    /// coming back, so it must not be refused -- and the quarantine has to go
+    /// with the table, or the name stays poisoned for a table that is gone.
+    #[test]
+    fn dropping_a_quarantined_table_clears_the_quarantine() {
+        let (s, _) = two_tables_one_damaged("quarantine-drop");
+        let mut c = reopen(&s);
+        c.drop_table(&ObjectName::bare("a"), false).unwrap();
+        assert!(c.damaged_parts().is_empty());
+        assert!(!c.is_quarantined("default.a"));
+
+        // A fresh table under the same name is a fresh table.
+        c.create_table(crate::persist::testkit::table_def("a"), false).unwrap();
+        assert!(c.table_by_path("default.a").is_ok(), "a re-created name must not inherit it");
+        assert!(store::save_catalog(&mut c).is_ok(), "and the database checkpoints again");
+    }
+
+    #[test]
+    fn dropping_the_database_clears_its_quarantines() {
+        let s = Scratch::new("quarantine-dropdb");
+        let mut c = Catalog::on_disk(s.path()).unwrap();
+        c.create_database("scratch", false).unwrap();
+        c.damaged.insert(
+            "scratch.a".into(),
+            vec![DamagedPart { file: "part_000001.gpart".into(), why: "x".into() }],
+        );
+        c.damaged.insert(
+            "default.a".into(),
+            vec![DamagedPart { file: "part_000002.gpart".into(), why: "y".into() }],
+        );
+        c.drop_database("scratch", false).unwrap();
+        assert_eq!(c.damaged_parts().len(), 1, "only the dropped database's entries go");
+        assert!(c.is_quarantined("default.a"));
+    }
+
+    /// An undamaged database must record nothing at all -- the map staying
+    /// empty is what keeps the check off the resolve path.
+    #[test]
+    fn a_healthy_database_carries_no_quarantine() {
+        let s = Scratch::new("quarantine-none");
+        let mut c = Catalog::on_disk(s.path()).unwrap();
+        c.create_table(crate::persist::testkit::table_def("t"), false).unwrap();
+        store::save_catalog(&mut c).unwrap();
+        let c2 = reopen(&s);
+        assert!(c2.damaged_parts().is_empty());
+        assert!(!c2.is_quarantined("default.t"));
+        assert!(c2.table_by_path("default.t").is_ok());
     }
 
     /// The check removes nothing, but it does refuse to open a whole database,

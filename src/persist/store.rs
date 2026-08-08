@@ -146,6 +146,30 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     sync_dir(dir)
 }
 
+/// [`atomic_write`], skipped when the file already holds exactly `bytes`.
+///
+/// For the small, rewritten-every-checkpoint records: `CATALOG` and `TABLE`.
+/// Once part writes are incremental (see [`writer::write_table`]) these are
+/// what a checkpoint of an unchanged database still costs, and they are not
+/// free: each one is a create, an `fsync`, a `rename` and a directory `fsync`,
+/// and an SSD charges a full erase block for a 300-byte file. A `SELECT 1` on
+/// a two-table database used to cost six of them.
+///
+/// Safe because the durability argument is inductive rather than per-call: the
+/// only way any byte of these files ever changes is [`atomic_write`], which
+/// fsyncs before it publishes, so bytes we can *read* are bytes that are
+/// already durable, and writing them again would produce a file identical to
+/// the one that is there. Reading a few hundred bytes to find that out is
+/// vastly cheaper than the four syscalls it avoids.
+///
+/// Returns whether it actually wrote.
+pub fn commit(path: &Path, bytes: &[u8]) -> Result<bool> {
+    if fs::read(path).is_ok_and(|old| old == bytes) {
+        return Ok(false);
+    }
+    atomic_write(path, bytes).map(|()| true)
+}
+
 /// `fsync` a directory so a rename inside it survives a power loss.
 ///
 /// Some platforms and filesystems refuse `fsync` on a directory handle
@@ -215,7 +239,7 @@ pub fn save_catalog(catalog: &mut Catalog) -> Result<()> {
         live.push((ddir, names));
         roster.push((db, defs));
     }
-    atomic_write(&root.join(CATALOG_FILE), &writer::catalog_doc(&roster))?;
+    commit(&root.join(CATALOG_FILE), &writer::catalog_doc(&roster))?;
 
     // The catalog is committed, so it is now authoritative about which tables
     // exist and a directory it does not name is a dropped one. Collecting
@@ -228,9 +252,13 @@ pub fn save_catalog(catalog: &mut Catalog) -> Result<()> {
     }
 
     // The committed parts cover everything the logs hold, so the logs can go.
+    // A log that is already just its header holds nothing, and reopening it to
+    // rewrite the header it already has -- plus the commit record, to record a
+    // watermark it already carries -- is write amplification charged to a
+    // database that was only read.
     for tdir in &checkpointed {
         let wal = tdir.join(WAL_FILE);
-        if wal.exists() {
+        if fs::metadata(&wal).is_ok_and(|m| m.len() > format::HEADER_LEN as u64) {
             Wal::open(&wal)?.truncate()?;
             set_wal_committed(tdir, format::HEADER_LEN as u64)?;
         }
@@ -308,7 +336,7 @@ pub fn load_catalog(catalog: &mut Catalog) -> Result<()> {
             // The table's own directory is authoritative for its contents; the
             // CATALOG entry is the roster (and the fallback for a table that
             // was declared but never written).
-            let image = if tdir.join(TABLE_FILE).exists() {
+            let mut image = if tdir.join(TABLE_FILE).exists() {
                 reader::read_table_image(&tdir)?
             } else {
                 reader::TableImage {
@@ -316,8 +344,28 @@ pub fn load_catalog(catalog: &mut Catalog) -> Result<()> {
                     parts: Vec::new(),
                     part_files: Vec::new(),
                     wal_committed: format::HEADER_LEN as u64,
+                    damaged: Vec::new(),
                 }
             };
+            // Tell each part which file it came from, so the next checkpoint
+            // knows it is already written. Without this the incremental path
+            // in [`writer::write_table`] would still rewrite the whole
+            // database on the first checkpoint after every restart -- which
+            // is *every* checkpoint for a one-shot `granular -q ...`.
+            //
+            // Guarded on the two vectors being the same length, because that
+            // is the alignment this zip needs and `read_table_image` does not
+            // always give it: a part file that fails to decode is recorded in
+            // `damaged` and contributes no `Part`, which would shift every
+            // later pairing by one and hand a healthy part some other file's
+            // name. A commit record naming the wrong bytes is far worse than
+            // the rewrite it would save, so a damaged table simply
+            // checkpoints the old way, in full.
+            if image.parts.len() == image.part_files.len() {
+                for (p, name) in image.parts.iter_mut().zip(&image.part_files) {
+                    p.set_origin(parse_part_seq(name).unwrap_or(0));
+                }
+            }
             let bare = image.def.name.clone();
             let mut qualified = image.def.clone();
             qualified.name = format!("{db}.{bare}");
@@ -371,7 +419,7 @@ pub fn set_wal_committed(tdir: &Path, committed: u64) -> Result<()> {
     let path = tdir.join(TABLE_FILE);
     let img = reader::table_header(&read_file(&path)?).map_err(|e| prefix(&path, e))?;
     let doc = writer::table_doc(&img.0, &img.1, committed);
-    atomic_write(&path, &doc)
+    commit(&path, &doc).map(|_| ())
 }
 
 /// Inverse of [`Value::to_lane`] for the physical kinds a primary key can
@@ -646,6 +694,63 @@ mod tests {
         for &k in keys.iter().step_by(5) {
             assert_eq!(t2.get(&Value::UInt(k)).unwrap(), None, "key {k} came back");
         }
+    }
+
+    /// The half of the incremental checkpoint that lives here: a table loaded
+    /// off disk knows which file each of its parts came from, so the *first*
+    /// checkpoint after a restart is incremental too. Without the pairing in
+    /// [`load_catalog`] this is the case that still rewrote everything -- and
+    /// for a one-shot `granular -q ...` it is the only case there is.
+    #[test]
+    fn a_checkpoint_after_a_reload_rewrites_nothing() {
+        let s = Scratch::new("reload-incremental");
+        let mut c = on_disk(&s);
+        c.create_table(table_def("t"), false).unwrap();
+        c.table_mut(&ObjectName::bare("t")).unwrap().insert(sample_block(3_000)).unwrap();
+        save_catalog(&mut c).unwrap();
+        let tdir = s.join("default").join("t");
+        let before = list_part_files(&tdir).unwrap();
+        assert_eq!(before.len(), 1);
+        let bytes = fs::read(tdir.join(&before[0].1)).unwrap();
+        let cat = fs::read(s.join(CATALOG_FILE)).unwrap();
+
+        let mut c2 = on_disk(&s);
+        load_catalog(&mut c2).unwrap();
+        save_catalog(&mut c2).unwrap();
+
+        assert_eq!(list_part_files(&tdir).unwrap(), before, "the reloaded part was renumbered");
+        assert_eq!(fs::read(tdir.join(&before[0].1)).unwrap(), bytes, "it was rewritten");
+        assert_eq!(fs::read(s.join(CATALOG_FILE)).unwrap(), cat);
+        assert_eq!(c2.table_by_path_mut("default.t").unwrap().row_count().unwrap(), 3_000);
+    }
+
+    /// ...and a table that gained rows writes exactly one more file, leaving
+    /// the part it did not touch where it is.
+    #[test]
+    fn a_checkpoint_writes_only_the_parts_that_moved() {
+        let s = Scratch::new("partial-checkpoint");
+        let mut c = on_disk(&s);
+        c.create_table(table_def("t"), false).unwrap();
+        let t = c.table_mut(&ObjectName::bare("t")).unwrap();
+        t.insert(sample_block(3_000)).unwrap();
+        t.flush().unwrap();
+        save_catalog(&mut c).unwrap();
+        let tdir = s.join("default").join("t");
+        let before = list_part_files(&tdir).unwrap();
+
+        let t = c.table_mut(&ObjectName::bare("t")).unwrap();
+        let mut b = sample_block(500);
+        // Disjoint keys, so nothing in the first part is tombstoned.
+        let keys: Vec<u64> =
+            b.column(0).as_u64().unwrap().iter().map(|&k| k + 100_000_000).collect();
+        b.columns[0] = Column::u64s(DataType::UInt64, keys);
+        t.insert(b).unwrap();
+        save_catalog(&mut c).unwrap();
+
+        let after = list_part_files(&tdir).unwrap();
+        assert_eq!(after.len(), 2, "{after:?}");
+        assert_eq!(after[0], before[0], "the untouched part moved");
+        assert!(after[1].0 > before[0].0, "sequence numbers are never reused: {after:?}");
     }
 
     #[test]

@@ -33,6 +33,17 @@
 //! behind a [`OnceLock`]: a pure function of bytes that never change, memoized
 //! race-free, so "immutable" still holds in the sense that matters.
 //!
+//! ## Immutability is also what makes an incremental checkpoint possible
+//!
+//! Because a published part's bytes never change, "is the copy on disk still
+//! correct?" is answerable without hashing or comparing anything: it is
+//! correct exactly while the part is the same object and its delete mask has
+//! not moved. [`PartSet::origins`] records the answer -- the sequence number
+//! of the part file that already holds these bytes -- and
+//! `persist::writer::write_table` skips every part that still has one. Without
+//! it a checkpoint is O(entire database) and a read-only query rewrites the
+//! whole table.
+//!
 //! ## Unlink safety
 //!
 //! Compaction removes a part's file as soon as the merged replacement is
@@ -47,6 +58,7 @@
 //! enough for it to matter. `table::a_compacted_away_part_stays_alive_under_a_
 //! snapshot` is the storage-side half of the same claim.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use crate::common::{BitSet, Result, GRANULE_SIZE, G_SHIFT};
@@ -74,6 +86,12 @@ pub struct Part {
     /// been published -- see `persist::writer::part_bytes`.
     pub deleted: BitSet,
     pub deleted_count: usize,
+    /// **Construction-time** file provenance, carried for exactly as long as
+    /// `deleted` is: the sequence number of the part file this was decoded
+    /// from, or [`NO_FILE`] for a part built in memory. [`PartSet::push`]
+    /// takes it into [`PartSet::origins`], where it becomes versioned state
+    /// like the delete mask, and it is meaningless here after that.
+    origin: u64,
     /// O(1) granule router: `key -> ((key - base) >> shift)` buckets
     /// bracketing the sparse-index answer.
     route_base: u64,
@@ -162,6 +180,7 @@ impl Part {
             part_max,
             deleted: BitSet::new(),
             deleted_count: 0,
+            origin: NO_FILE,
             route_base,
             route_shift,
             router,
@@ -192,6 +211,7 @@ impl Part {
             part_max,
             deleted,
             deleted_count,
+            origin: NO_FILE,
             route_base,
             route_shift,
             router,
@@ -200,6 +220,16 @@ impl Part {
             pk_col,
             ncols,
         }
+    }
+
+    /// Record which part file this was decoded from, before it is published.
+    ///
+    /// The loader's half of the incremental checkpoint: without it every part
+    /// read back from disk looks new to the next `write_table`, and the first
+    /// checkpoint after a restart rewrites the entire database once more.
+    /// Only meaningful between decoding and [`PartSet::push`].
+    pub fn set_origin(&mut self, seq: u64) {
+        self.origin = seq;
     }
 
     fn build_router(first_keys: &[u64], part_max: u64) -> (u64, u32, Vec<u32>) {
@@ -591,18 +621,61 @@ impl Deletes {
 
 // --------------------------------------------------------------- part set
 
+/// "This part is not in any file yet", as an origin. A real part file is
+/// `part_000001.gpart` upwards -- `persist::store` allocates sequence numbers
+/// from 1 -- so zero is free to mean "nowhere".
+pub const NO_FILE: u64 = 0;
+
 /// An immutable, versioned list of parts and their delete masks.
 ///
 /// This is the unit of atomicity for the whole storage layer. Every mutation
-/// clones the two vectors -- pointers, not data -- edits the entries that
+/// clones the three vectors -- pointers, not data -- edits the entries that
 /// changed and bumps `version`; readers take one `Arc` and are then insulated
 /// from every subsequent write. Nothing a reader can see ever changes under it.
-#[derive(Clone, Default)]
+#[derive(Default)]
 pub struct PartSet {
     parts: Vec<Arc<Part>>,
     /// Parallel to `parts`. `None` = nothing deleted, the common case.
     deletes: Vec<Option<Arc<Deletes>>>,
+    /// Parallel to `parts`: the sequence number of the part file that already
+    /// holds *these rows with this delete mask*, or [`NO_FILE`].
+    ///
+    /// This is what makes a checkpoint incremental, and its correctness rests
+    /// on two facts established above: a published part's bytes never change,
+    /// and its delete mask is owned by this set. So an entry is valid exactly
+    /// until the set replaces the part (never -- parts are only added and
+    /// removed) or moves its mask ([`PartSet::tombstone`], which clears it).
+    ///
+    /// `AtomicU64` for interior mutability, not for concurrency: `write_table`
+    /// learns the file a part landed in, and it holds the set through a
+    /// `Snapshot` -- there is no `&mut` to be had, and adding one would mean
+    /// threading `&mut Table` through the checkpoint just to write 8 bytes
+    /// that no reader ever looks at. `Relaxed` is therefore honest: every
+    /// store is made by the one thread that has exclusive write access to the
+    /// table, and a handoff to another thread carries its own happens-before.
+    ///
+    /// Width: 8 bytes per *part*, not per row -- a part holds up to 2^40 rows.
+    origins: Vec<AtomicU64>,
     version: u64,
+}
+
+/// Hand-written because `AtomicU64` is not `Clone`. Same cost as the derive
+/// plus one `Vec` of 8 bytes per part; this runs once per copy-on-write
+/// generation of the set (a flush, a batch of tombstones, a merge), never per
+/// row and never per granule.
+impl Clone for PartSet {
+    fn clone(&self) -> PartSet {
+        PartSet {
+            parts: self.parts.clone(),
+            deletes: self.deletes.clone(),
+            origins: self
+                .origins
+                .iter()
+                .map(|o| AtomicU64::new(o.load(Ordering::Relaxed)))
+                .collect(),
+            version: self.version,
+        }
+    }
 }
 
 impl PartSet {
@@ -619,6 +692,7 @@ impl PartSet {
         let mut set = PartSet {
             parts: Vec::with_capacity(parts.len()),
             deletes: Vec::with_capacity(parts.len()),
+            origins: Vec::with_capacity(parts.len()),
             version: 0,
         };
         for p in parts {
@@ -627,13 +701,18 @@ impl PartSet {
         set
     }
 
-    /// Append a part, adopting its construction-time deletes.
+    /// Append a part, adopting its construction-time deletes and its file
+    /// provenance.
     pub fn push(&mut self, mut part: Part) {
         let del = (part.deleted_count > 0).then(|| {
             let bits = std::mem::take(&mut part.deleted);
             let n = std::mem::replace(&mut part.deleted_count, 0);
             Arc::new(Deletes::new(bits, n, part.granules.len()))
         });
+        // Taken, like the delete image: from here the set owns the answer to
+        // "where is this on disk", because from here the set owns the mask
+        // that answer depends on.
+        self.origins.push(AtomicU64::new(std::mem::replace(&mut part.origin, NO_FILE)));
         self.parts.push(Arc::new(part));
         self.deletes.push(del);
     }
@@ -641,6 +720,7 @@ impl PartSet {
     /// Drop the part at `i`, deletes and all.
     pub fn remove(&mut self, i: usize) -> Arc<Part> {
         self.deletes.remove(i);
+        self.origins.remove(i);
         self.parts.remove(i)
     }
 
@@ -678,6 +758,30 @@ impl PartSet {
         self.version += 1;
     }
 
+    /// The part file that already holds part `i` exactly as this set sees it,
+    /// or [`NO_FILE`].
+    ///
+    /// A checkpoint may only *trust* this after confirming the file is still
+    /// there -- see `persist::writer::write_table`, which validates every
+    /// answer against the directory listing before reusing a name. The
+    /// consequence of a stale entry has to be a wasted rewrite, never a commit
+    /// record naming a file that is not there.
+    #[inline]
+    pub fn origin(&self, i: usize) -> u64 {
+        self.origins[i].load(Ordering::Relaxed)
+    }
+
+    /// Record that part `i`, with this set's current mask for it, is durably
+    /// in file `seq`.
+    ///
+    /// `&self` deliberately: the caller reaches the set through a `Snapshot`.
+    /// It must be called only *after* the file is fsynced and renamed into
+    /// place, because that is the claim it makes.
+    #[inline]
+    pub fn set_origin(&self, i: usize, seq: u64) {
+        self.origins[i].store(seq, Ordering::Relaxed);
+    }
+
     /// Live rows in part `i`.
     #[inline]
     pub fn live_rows_of(&self, i: usize) -> usize {
@@ -698,11 +802,31 @@ impl PartSet {
     /// first time this set touches it while a snapshot still holds the old
     /// one, then mutates in place for every tombstone after that. A flush that
     /// shadows ten thousand keys pays one clone, not ten thousand.
+    ///
+    /// **A moved mask invalidates the file.** The delete bitmap is written
+    /// inside the part file (`persist::writer::part_meta`), so a part whose
+    /// rows are untouched but whose deletes moved has to be rewritten in full.
+    /// The alternative -- a sidecar `part_NNNNNN.gdel` holding just the mask,
+    /// so a tombstone rewrites 8 bytes per 64 rows instead of the whole
+    /// columnar payload -- was rejected for this wave: it needs a second file
+    /// to become durable atomically with the first, which is a new and
+    /// weaker-by-default commit protocol in the one part of this codebase
+    /// that is genuinely production-grade. It is the right next step if
+    /// scattered single-row DELETEs over huge parts ever become the workload;
+    /// today's shape (deletes arrive in flush-sized batches, and a batch
+    /// dirties a bounded number of parts) does not pay for it.
+    ///
+    /// Note the `d.set(pos)` return: re-deleting an already-dead row leaves
+    /// the mask byte-identical, so it must *not* invalidate the file.
     pub fn tombstone(&mut self, i: usize, pos: usize) -> bool {
         let ngran = self.parts[i].granules.len();
         let slot = &mut self.deletes[i];
         let d = Arc::make_mut(slot.get_or_insert_with(|| Arc::new(Deletes::empty(ngran))));
-        d.set(pos)
+        if !d.set(pos) {
+            return false;
+        }
+        *self.origins[i].get_mut() = NO_FILE;
+        true
     }
 }
 
@@ -920,6 +1044,48 @@ mod tests {
         assert!(after.version() > before.version());
         // ...and both views still point at the same immutable part.
         assert!(std::ptr::eq(before.part(0), after.part(0)));
+    }
+
+    /// The provenance a checkpoint reads: adopted from the part, carried
+    /// through copy-on-write, dropped the instant a tombstone actually lands.
+    #[test]
+    fn a_parts_file_provenance_follows_its_delete_mask() {
+        let b = sorted_block(3000, false);
+        let mut p = Part::build(&b, Some(0), Some(0)).unwrap();
+        p.set_origin(7);
+        let mut set = PartSet::adopt(vec![p]);
+        assert_eq!(set.origin(0), 7, "adoption must take the decoded file number");
+
+        // A snapshot is a different set; both must still name file 7.
+        let pinned = set.clone();
+        assert_eq!(pinned.origin(0), 7, "a copy-on-write clone lost the provenance");
+
+        // A tombstone that hides nothing leaves the mask byte-identical...
+        set.tombstone(0, 5);
+        assert_eq!(set.origin(0), NO_FILE, "a tombstone must invalidate the file");
+        set.set_origin(0, 9);
+        assert!(!set.tombstone(0, 5), "the row is already hidden");
+        assert_eq!(set.origin(0), 9, "re-hiding a hidden row changed nothing on disk");
+
+        // ...and the snapshot taken before any of it is untouched.
+        assert_eq!(pinned.origin(0), 7);
+    }
+
+    /// The three vectors are indexed by the same `i` everywhere, so a removal
+    /// that shifted one of them would silently pair a part with another
+    /// part's file -- the one way this mechanism could commit wrong bytes.
+    #[test]
+    fn removing_a_part_keeps_provenance_aligned() {
+        let mut set = PartSet::new();
+        for (i, n) in [900usize, 1100, 1300].into_iter().enumerate() {
+            let mut p = Part::build(&sorted_block(n as u64, false), Some(0), Some(0)).unwrap();
+            p.set_origin(i as u64 + 1);
+            set.push(p);
+        }
+        set.remove(1);
+        assert_eq!(set.len(), 2);
+        assert_eq!((set.origin(0), set.origin(1)), (1, 3));
+        assert_eq!((set.part(0).n_rows, set.part(1).n_rows), (900, 1300));
     }
 
     #[test]

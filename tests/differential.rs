@@ -3740,9 +3740,12 @@ fn known_divergences_still_reproduce() {
     let (g, s) = probe("SELECT 'ABC' LIKE 'a%'", "SELECT 'ABC' LIKE 'a%'");
     assert_ne!(g, s, "LIKE case folding now agrees ({g} vs {s}); drop KNOWN DIVERGENCE #3");
 
-    // #4 -- CAST(<real> AS text) rendering.
+    // #4 -- CAST(<real> AS text) rendering. RESOLVED, not merely divergent:
+    // `1.0` is now an exact decimal literal rather than a binary64, so it
+    // renders "1.0" on both sides. Asserted as agreement so a regression that
+    // reintroduced float rendering would be caught here.
     let (g, s) = probe("SELECT CAST(1.0 AS String)", "SELECT CAST(1.0 AS TEXT)");
-    assert_ne!(g, s, "real->text rendering now agrees ({g} vs {s}); drop KNOWN DIVERGENCE #4");
+    assert_eq!(g, s, "real->text rendering diverged again ({g} vs {s})");
 
     // #6 -- Bool is a real type in granular and not one in SQLite, so it
     // renders differently under a text cast. Only the *rendering* differs;
@@ -4962,14 +4965,20 @@ fn decimal_aggregates_match_exact_integer_arithmetic() {
 /// (exact decimal literals), and the day it lands this test fails and the
 /// oracle above can drop the quoting.
 #[test]
-fn a_bare_decimal_literal_is_still_a_float() {
+fn a_bare_decimal_literal_is_exact() {
     let mut s = Session::in_memory();
+    // Was pinned as `Value::Float` while exact decimal literals were pending.
+    // They landed, so a literal with a decimal point and no exponent is exact
+    // and `SELECT 0.1 + 0.2` is 0.3 rather than 0.30000000000000004.
     let v = s.query("SELECT 12345678901234.5678").unwrap().scalar().unwrap();
     assert!(
-        matches!(v, Value::Float(_)),
-        "decimal literals are exact now ({v:?}) -- the decimal oracle can insert \
-         them unquoted, and KNOWN DIVERGENCE-style quoting can go"
+        matches!(v, Value::Decimal(..)),
+        "a bare decimal literal should be exact, got {v:?}"
     );
+    // The exponent form is the boundary that keeps this tractable: it stays a
+    // float, because that is what an exponent asks for.
+    let e = s.query("SELECT 1.5e3").unwrap().scalar().unwrap();
+    assert!(matches!(e, Value::Float(_)), "an exponent literal should stay float, got {e:?}");
     // The string route is exact, which is what the oracle relies on.
     s.execute("CREATE TABLE d (id Int64, a Decimal(18, 4)) ENGINE = MergeTree ORDER BY id")
         .unwrap();

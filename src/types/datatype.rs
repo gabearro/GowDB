@@ -234,6 +234,15 @@ impl DataType {
     /// Type promotion for binary arithmetic, following ClickHouse's rules
     /// closely enough to be unsurprising: float wins over int, signed wins
     /// over unsigned, wider wins over narrower.
+    ///
+    /// **The decimal arms below now govern every decimal-point literal in the
+    /// language**, not just columns someone declared `Decimal64`: `0.1` lexes
+    /// as `Decimal(1, 1)` (see the header of sql/lexer.rs), so `1.5 + 1` is a
+    /// decimal and `1.5 + 1.5e0` is a float purely by this table. That is
+    /// Postgres's rule -- an unsuffixed decimal constant is `numeric` and
+    /// becomes a float only when combined with one -- and it is what makes
+    /// `SELECT 0.1 + 0.2` answer `0.3`. It also means a mistake here is no
+    /// longer confined to one type: it is the arithmetic of the whole dialect.
     pub fn promote(a: &DataType, b: &DataType) -> Result<DataType> {
         let nullable = a.is_nullable() || b.is_nullable();
         let (ba, bb) = (a.base(), b.base());

@@ -24,11 +24,10 @@
 //!   * one staging group per enlisted table's log, plus the LSN that log stood
 //!     at when the table was enlisted.
 //!
-//! `COMMIT` fsyncs a commit marker into each log and then stores each overlay
-//! over its published set -- durability first, visibility second, and the
-//! second half cannot fail. `ROLLBACK` drops the overlays and rewinds each log
-//! to its enlistment LSN, which leaves both memory and disk exactly as they
-//! were.
+//! `COMMIT` makes the logs durable and then stores each overlay over its
+//! published set -- durability first, visibility second, and the second half
+//! cannot fail. `ROLLBACK` drops the overlays and rewinds each log to its
+//! enlistment LSN, which leaves both memory and disk exactly as they were.
 //!
 //! Enlistment is **lazy**: `BEGIN` writes one `Option` and touches no table, so
 //! a transaction that only reads costs nothing, and a transaction over one
@@ -89,15 +88,28 @@
 //! visibility test and no reader/writer interlock beyond the `RwLock` that
 //! keeps `&Catalog` and `&mut Catalog` apart.
 //!
-//! ### The multi-table caveat
+//! ### Several tables, one commit point
 //!
-//! Logs are per table, so a transaction spanning N tables writes N commit
-//! markers and fsyncs N files. A crash *between* those fsyncs can leave a
-//! prefix of them durable, which commits some tables and not others. Making
-//! that atomic needs one log for the whole database rather than one per table;
-//! it is the right fix and it is not in this change. A single-table
-//! transaction -- one marker, one fsync -- is fully atomic, and that is the
-//! shape the OLTP path actually has.
+//! Logs are per table, so a transaction spanning N tables touches N files. It
+//! used to write N commit markers and fsync N files, which is N commit points:
+//! a crash between two of them left a *prefix* of the transaction durable,
+//! committing some tables and not others with no error to anyone.
+//!
+//! [`Session::commit_durable`] is a two-phase commit instead. The last
+//! enlisted table is the coordinator; every earlier one logs a *prepare* that
+//! cites the coordinator's decision, and the coordinator's own marker -- the
+//! last append and the last fsync of the COMMIT -- releases all of them at
+//! once. Recovery resolves each prepare against the decision it names, so a
+//! crash anywhere in the sequence commits every table or none. It costs the
+//! same N fsyncs the broken version did, because the decision doubles as the
+//! coordinator's own marker; a single-table transaction writes no prepare at
+//! all and is unchanged, which is the shape the OLTP path actually has. See
+//! [`crate::persist::Wal::prepare`].
+//!
+//! The exception is a table that took a mutation the log cannot describe: its
+//! commit point is the `TABLE` rename in [`Session::fold_to_parts`] rather
+//! than a marker, so it is not a participant and its atomicity with the rest
+//! of the transaction is still the rename's.
 
 use std::fs::File;
 use std::path::Path;
@@ -372,6 +384,17 @@ pub struct Session {
     /// Budget, deadline and cancel flag handed to every query this session
     /// runs. Three words, read on the read path and nowhere else.
     limits: Limits,
+    /// The bounded ring `system.query_log` reads.
+    ///
+    /// Shared rather than owned so a [`Reader`] -- which runs statements
+    /// through `&self` on another thread -- appends to the same log the writer
+    /// does. One uncontended lock and one `memcpy` per *statement*, and no
+    /// allocation at all in steady state: see [`crate::system::QueryLog`].
+    log: crate::system::QueryLog,
+    /// CHECK constraints and stored views, loaded from `<db>._granular_ddl` at
+    /// open. Empty -- and so free to consult -- on a database that declares
+    /// neither.
+    ext: Extensions,
 }
 
 /// The per-query governance a session applies, as *settings* rather than as a
@@ -480,6 +503,149 @@ enum TxnStmt {
     Rollback,
 }
 
+impl TxnStmt {
+    fn name(self) -> &'static str {
+        match self {
+            TxnStmt::Begin => "BEGIN",
+            TxnStmt::Commit => "COMMIT",
+            TxnStmt::Rollback => "ROLLBACK",
+        }
+    }
+}
+
+/// Operator statements, recognised ahead of the parser for exactly the reason
+/// transaction control and `SET` are: `Statement` is matched exhaustively in
+/// this file and `src/sql` is not this module's to extend.
+///
+/// ```text
+///   BACKUP TO '<archive>' [INCREMENTAL FROM '<base archive>']
+///   RESTORE FROM '<archive>' [TO '<directory>']
+///   VERIFY BACKUP '<archive>'
+/// ```
+#[derive(Debug)]
+enum Admin {
+    Backup { to: String, base: Option<String> },
+    Restore { from: String, to: Option<String> },
+    Verify { archive: String },
+}
+
+// ------------------------------------------------- constraints and views
+//
+// Two things a table can now carry that `TableDef` has no room for: `CHECK`
+// constraints, and -- for a database rather than a table -- stored views. Both
+// are text plus a parsed AST, and both have to survive a restart, a backup and
+// a restore.
+//
+// ## Where they live, and why it is a table
+//
+// In a table. `<db>._granular_ddl`, one row per constraint or view, created
+// the first time a database has one and dropped when it has none.
+//
+// The alternative was a file beside `CATALOG`, and it was rejected for one
+// reason: `backup.rs` archives *tables*. A sidecar file is not in an archive,
+// so `RESTORE` would produce a database whose CHECK constraints had silently
+// disappeared -- and the first write after that restore would be accepted
+// where the original would have refused it. Storing them as rows means backup,
+// incremental backup, restore, verify, the WAL, the checkpoint's atomicity and
+// `collect_dropped_tables` all already handle them, with no second path to
+// keep in step. The cost is that the table is visible: `SHOW TABLES` lists it,
+// and a `SELECT` reads it. That is the honest trade -- there is no hidden
+// state -- and writes to it are refused (see `guard_ddl_table`), because the
+// engine's copy in memory is what enforcement reads.
+//
+// ## Durability without its own log
+//
+// Nothing here writes to the metadata table's write-ahead log. Every statement
+// that changes it is DDL, and `Session::dispatch` checkpoints after DDL, so the
+// commit point is the checkpoint's `CATALOG` rename -- one atomic publication
+// covering the table that gained the constraint *and* the row that records it.
+// Logging it as well would open a window the other way: a crash between the log
+// append and the checkpoint would replay a row set that is a superset of the
+// intended one, and since a DROP is expressed by a row's *absence*, a superset
+// resurrects dropped views.
+
+/// The metadata table's name, in each database that needs one.
+const DDL_TABLE: &str = "_granular_ddl";
+
+/// One `CHECK` constraint, as stored.
+struct Check {
+    /// `CONSTRAINT <name>`, or a generated one. Only ever printed.
+    name: String,
+    /// The predicate's source text, which is what the catalog row holds.
+    /// `Expr`'s `Display` is fully parenthesized, so this round-trips through
+    /// `parse_expr` unchanged -- the same property `DEFAULT` relies on.
+    sql: String,
+    /// The parsed predicate, bound afresh against the table's schema on each
+    /// statement that writes. Kept as an `Expr` rather than a `BoundExpr`
+    /// because a bound one holds column *indices*, and `ALTER TABLE ... DROP
+    /// COLUMN` renumbers them: a cached index that survived a DDL statement
+    /// would check the wrong column, silently.
+    expr: crate::sql::ast::Expr,
+}
+
+/// One stored view.
+struct View {
+    /// The database an unqualified name in `sql` resolves against -- the
+    /// session's current database when the view was created. `query` is
+    /// already qualified with it; this is kept so the row can be written back
+    /// out and re-qualified identically on the next open.
+    scope: String,
+    sql: String,
+    /// The body, parsed and fully qualified. Cloned into the outer statement
+    /// at every reference: a view is inlined, never materialized.
+    query: crate::sql::ast::Query,
+}
+
+/// Everything the catalog cannot hold, keyed the way the write path asks for
+/// it.
+#[derive(Default)]
+struct Extensions {
+    /// `db.table` -> its constraints. Declaration order within a statement,
+    /// and by name after a reload (the catalog rows are sorted so that two
+    /// checkpoints of an unchanged database produce identical bytes); order
+    /// only decides which of two violated constraints is named first. Empty on
+    /// every database that declares none, which is what makes the check on the
+    /// insert path one `is_empty` against a `HashMap` field.
+    checks: crate::common::FastMap<String, Vec<Check>>,
+    /// `db.view` -> the view.
+    views: crate::common::FastMap<String, View>,
+    /// `db.table` -> the column declared `UNIQUE`.
+    ///
+    /// One per table by construction: `check_unique_declarations` accepts the
+    /// declaration only on the table's own unique key, and there is one of
+    /// those. What it buys is the difference between an upsert and an error on
+    /// a repeated key, so it has to survive a restart like any other part of
+    /// the DDL -- a table that silently went back to last-write-wins after a
+    /// reopen would lose rows exactly where the user asked to be told.
+    uniques: crate::common::FastMap<String, String>,
+}
+
+impl Extensions {
+    fn is_empty(&self) -> bool {
+        self.checks.is_empty() && self.views.is_empty() && self.uniques.is_empty()
+    }
+
+    /// The view a table reference names, if it is one.
+    ///
+    /// Two probes at most, and the first is skipped entirely while no view
+    /// exists. `db` is the session's current database, for a bare name.
+    fn view(&self, name: &ObjectName, db: &str) -> Option<&View> {
+        if self.views.is_empty() {
+            return None;
+        }
+        self.views.get(&view_key(name, db))
+    }
+}
+
+/// What the fold detector needs beyond the AST: whether a bare table name is a
+/// view. Two words, copied down four levels of walk rather than borrowed
+/// separately at each.
+#[derive(Clone, Copy)]
+struct Names<'a> {
+    ext: &'a Extensions,
+    db: &'a str,
+}
+
 impl Session {
     pub fn in_memory() -> Session {
         Session {
@@ -493,6 +659,8 @@ impl Session {
             settings: crate::settings::Handle::new(Default::default()),
             read_only: false,
             limits: Limits::default(),
+            log: crate::system::QueryLog::new(),
+            ext: Extensions::default(),
         }
     }
 
@@ -511,7 +679,7 @@ impl Session {
         let root = catalog.dir().expect("on_disk always sets a directory").to_path_buf();
         let lock = lock_data_dir(&root, LockMode::Exclusive)?;
         crate::persist::load_catalog(&mut catalog)?;
-        Ok(Session {
+        let mut s = Session {
             catalog,
             wals: Default::default(),
             wal_enabled: true,
@@ -520,7 +688,11 @@ impl Session {
             settings: crate::settings::Handle::new(Default::default()),
             read_only: false,
             limits: Limits::default(),
-        })
+            log: crate::system::QueryLog::new(),
+            ext: Extensions::default(),
+        };
+        s.load_extensions()?;
+        Ok(s)
     }
 
     /// Open `dir` for queries only, under a **shared** directory lock.
@@ -543,7 +715,7 @@ impl Session {
         let root = catalog.dir().expect("on_disk always sets a directory").to_path_buf();
         let lock = lock_data_dir(&root, LockMode::Shared)?;
         crate::persist::load_catalog(&mut catalog)?;
-        Ok(Session {
+        let mut s = Session {
             catalog,
             wals: Default::default(),
             wal_enabled: false,
@@ -552,7 +724,14 @@ impl Session {
             settings: crate::settings::Handle::new(Default::default()),
             read_only: true,
             limits: Limits::default(),
-        })
+            log: crate::system::QueryLog::new(),
+            ext: Extensions::default(),
+        };
+        // A read-only session reads views and constraints like any other: the
+        // load only touches the metadata table's own rows, which the recovery
+        // above has already put in memory.
+        s.load_extensions()?;
+        Ok(s)
     }
 
     pub fn is_read_only(&self) -> bool {
@@ -593,6 +772,81 @@ impl Session {
         self.limits.cancel.store(false, Ordering::Relaxed);
     }
 
+    /// The ring `system.query_log` reads, for an embedder that would rather
+    /// ship these somewhere than query them.
+    pub fn query_log(&self) -> &crate::system::QueryLog {
+        &self.log
+    }
+
+    /// The view namespace, for the walk that decides whether a statement has
+    /// anything to fold.
+    fn names(&self) -> Names<'_> {
+        Names { ext: &self.ext, db: self.catalog.current_database() }
+    }
+
+    /// `db.view` and the view itself, for a name that is one.
+    fn view_of(&self, name: &ObjectName) -> Option<(String, &View)> {
+        if self.ext.views.is_empty() {
+            return None;
+        }
+        let key = view_key(name, self.catalog.current_database());
+        self.ext.views.get(&key).map(|v| (key, v))
+    }
+
+    /// Record one finished statement.
+    ///
+    /// Called from both halves of the session -- the `&mut` dispatcher and the
+    /// `&self` read path -- which is why the log is behind a handle rather
+    /// than in the struct: a `Reader` running on another thread has only
+    /// `&Session` and must still be visible here.
+    ///
+    /// ## What it costs a statement that never looks at the log
+    ///
+    /// One uncontended mutex, one `SystemTime::now`, and a `memcpy` of the
+    /// statement text into a buffer the ring recycled -- no allocation once
+    /// `LOG_CAPACITY` statements have run. A/B interleaved through a temporary
+    /// switch, 12 runs a side of 200k point statements each (the shortest
+    /// statement there is, so the worst case for a fixed per-statement cost):
+    /// **5.042 us against 5.169 us best-of-12, 5.33 against 5.38 by median**,
+    /// i.e. 50-130 ns on a 5.3 us statement and inside this machine's own
+    /// run-to-run spread. On a 1.2 ms analytic query it is not measurable at
+    /// all -- both sides moved 5-9% between runs of identical code.
+    ///
+    /// The first cut allocated the text with `Box<str>` and measured 129 ns;
+    /// recycling the evicted entry's buffers (see
+    /// [`crate::system::QueryLog::record`]) is what halved it.
+    fn log_stmt(
+        &self,
+        sql: &str,
+        kind: &'static str,
+        started: Instant,
+        r: &Result<ResultSet>,
+    ) {
+        let (rows, s) = match r {
+            Ok(rs) => (rs.affected.unwrap_or(rs.stats.rows) as u64, rs.stats),
+            Err(_) => (0, QueryStats::default()),
+        };
+        self.log.record(
+            sql,
+            kind,
+            crate::system::Counters {
+                rows,
+                // From the caller's clock rather than `stats.elapsed_us`,
+                // which is stamped before this point on some paths and not at
+                // all on others. A log whose durations disagree with the
+                // shell's timing footer is a log nobody trusts twice.
+                elapsed_us: started.elapsed().as_micros().min(u64::MAX as u128) as u64,
+                granules_read: s.granules_read,
+                granules_pruned: s.granules_pruned,
+                rows_scanned: s.rows_scanned,
+            },
+            // Formatted only on the failure path, which is not the one being
+            // measured -- and where an allocation is nothing next to whatever
+            // just went wrong.
+            r.as_ref().err().map(|e| e.to_string()).as_deref(),
+        );
+    }
+
     /// Turn write-ahead logging off for this session.
     ///
     /// Bulk loading is the case that wants this: an `fsync` per statement is
@@ -631,6 +885,293 @@ impl Session {
         // file length stale and make the next append land at the wrong offset.
         self.wals.clear();
         crate::persist::save_catalog(&mut self.catalog)
+    }
+
+    // ------------------------------------------- constraints and views: I/O
+
+    /// Read every database's `_granular_ddl` into [`Session::ext`].
+    ///
+    /// Runs once, at open, before any statement. A row naming a table that no
+    /// longer exists is dropped *in memory only* -- see
+    /// [`Session::run_rename_table`], which deliberately leaves such a row
+    /// behind for a window so that a crash mid-rename cannot lose a constraint.
+    fn load_extensions(&mut self) -> Result<()> {
+        for db in self.catalog.database_names() {
+            let path = format!("{db}.{DDL_TABLE}");
+            // A quarantined metadata table is the one damage this engine
+            // cannot degrade around: the rows it could not read are the rules
+            // the write path enforces, so opening anyway would accept writes
+            // the database was declared to refuse. Loud, and recoverable --
+            // restore the file, or delete the directory to give up the
+            // constraints deliberately.
+            if self.catalog.is_quarantined(&path) {
+                return Err(Error::corruption(format!(
+                    "`{path}` did not decode, and it holds this database's CHECK and \
+                     UNIQUE constraints and its views. Refusing to open `{db}` with its \
+                     rules unknown: restore the file from a backup, or remove \
+                     `{db}/{DDL_TABLE}` from the data directory to drop the constraints \
+                     on purpose"
+                )));
+            }
+            if self.catalog.table_by_path(&path).is_err() {
+                continue;
+            }
+            let cols: Vec<usize> = (0..DDL_COLUMNS.len()).collect();
+            // Recovery may have replayed rows into the delta, which a scan
+            // does not see.
+            self.catalog.table_by_path_mut(&path)?.flush()?;
+            let blocks = self.catalog.table_by_path_mut(&path)?.scan(&cols)?;
+            for b in &blocks {
+                for r in 0..b.rows() {
+                    let cell = |c: usize| match b.column(c).value(r) {
+                        Value::Str(s) => s.to_string(),
+                        other => other.to_string(),
+                    };
+                    self.install_ext_row(&db, &cell(0), cell(1), cell(2), cell(3), cell(4))?;
+                }
+            }
+        }
+        // The metadata table names the objects it describes; the catalog says
+        // which of them exist. Anything the catalog does not have is a leftover
+        // from a rename or a drop that was interrupted, and applying it would
+        // mean a constraint attached to nothing.
+        self.prune_ext();
+        Ok(())
+    }
+
+    /// Turn one metadata row into an entry. Errors here are corruption: the
+    /// rows were written by this code and re-parsed by the same parser.
+    fn install_ext_row(
+        &mut self,
+        db: &str,
+        kind: &str,
+        object: String,
+        name: String,
+        scope: String,
+        sql: String,
+    ) -> Result<()> {
+        let key = format!("{db}.{object}");
+        match kind {
+            "CHECK" => {
+                let expr = crate::sql::parser::parse_expr(&sql).map_err(|e| {
+                    Error::corruption(format!(
+                        "`{db}.{DDL_TABLE}` holds an unparseable CHECK for `{key}`: {e}"
+                    ))
+                })?;
+                self.ext.checks.entry(key).or_default().push(Check { name, sql, expr });
+            }
+            "VIEW" => {
+                let mut query = parse_view_body(&sql).map_err(|e| {
+                    Error::corruption(format!(
+                        "`{db}.{DDL_TABLE}` holds an unparseable view `{key}`: {e}"
+                    ))
+                })?;
+                query.qualify_tables(&scope);
+                self.ext.views.insert(key, View { scope, sql, query });
+            }
+            "UNIQUE" => {
+                self.ext.uniques.insert(key, name);
+            }
+            other => {
+                return Err(Error::corruption(format!(
+                    "`{db}.{DDL_TABLE}` holds a row of unknown kind `{other}`"
+                )))
+            }
+        }
+        Ok(())
+    }
+
+    /// Forget every constraint whose table, and every view whose database, the
+    /// catalog no longer has.
+    fn prune_ext(&mut self) {
+        if self.ext.is_empty() {
+            return;
+        }
+        let catalog = &self.catalog;
+        self.ext.checks.retain(|k, _| catalog.table_by_path(k).is_ok());
+        self.ext.uniques.retain(|k, _| catalog.table_by_path(k).is_ok());
+        let dbs = catalog.database_names();
+        self.ext
+            .views
+            .retain(|k, _| dbs.iter().any(|d| k.starts_with(d) && k[d.len()..].starts_with('.')));
+    }
+
+    /// Rewrite `<db>._granular_ddl` from what is in memory.
+    ///
+    /// Whole-table, not incremental: the row set for one database is a handful
+    /// of short strings, and rewriting it makes "what is in the table" and
+    /// "what is in memory" the same statement rather than two that can drift.
+    /// The table is dropped outright when the last constraint or view in a
+    /// database goes, so an ordinary database has no such table at all.
+    ///
+    /// Not logged; see the module note above. The caller is DDL and
+    /// [`Session::dispatch`] checkpoints behind it.
+    fn persist_ext(&mut self, db: &str) -> Result<()> {
+        if !self.catalog.is_persistent() {
+            return Ok(());
+        }
+        let mut rows: Vec<[String; 5]> = Vec::new();
+        let prefix = format!("{db}.");
+        for (k, checks) in &self.ext.checks {
+            let Some(object) = k.strip_prefix(&prefix) else { continue };
+            for c in checks {
+                rows.push([
+                    "CHECK".into(),
+                    object.into(),
+                    c.name.clone(),
+                    String::new(),
+                    c.sql.clone(),
+                ]);
+            }
+        }
+        for (k, v) in &self.ext.views {
+            let Some(object) = k.strip_prefix(&prefix) else { continue };
+            rows.push([
+                "VIEW".into(),
+                object.into(),
+                String::new(),
+                v.scope.clone(),
+                v.sql.clone(),
+            ]);
+        }
+        for (k, col) in &self.ext.uniques {
+            let Some(object) = k.strip_prefix(&prefix) else { continue };
+            rows.push([
+                "UNIQUE".into(),
+                object.into(),
+                col.clone(),
+                String::new(),
+                String::new(),
+            ]);
+        }
+        // Two writes of the same database must produce the same table, or an
+        // unchanged catalog would checkpoint differently every time.
+        rows.sort_unstable();
+
+        let name = ObjectName(vec![db.to_string(), DDL_TABLE.to_string()]);
+        let path = format!("{db}.{DDL_TABLE}");
+        self.catalog.drop_table(&name, true)?;
+        if rows.is_empty() {
+            return Ok(());
+        }
+        self.catalog.create_table(ddl_table_def(&path)?, false)?;
+        let mut cols: Vec<ColumnBuilder> = (0..DDL_COLUMNS.len())
+            .map(|_| ColumnBuilder::with_capacity(DataType::String, rows.len()))
+            .collect();
+        for r in &rows {
+            for (i, cell) in r.iter().enumerate() {
+                cols[i].push_value(&Value::str(cell.as_str()))?;
+            }
+        }
+        let block = Block::new(cols.into_iter().map(|b| b.finish()).collect())?;
+        self.catalog.table_by_path_mut(&path)?.insert(block)?;
+        Ok(())
+    }
+
+    // ------------------------------------------------------ backup / restore
+
+    fn run_admin(&mut self, a: &Admin) -> Result<ResultSet> {
+        match a {
+            Admin::Backup { to, base } => self.run_backup(to, base.as_deref()),
+            Admin::Restore { from, to } => self.run_restore(from, to.as_deref()),
+            Admin::Verify { archive } => {
+                let r = crate::backup::verify(Path::new(archive))?;
+                report(
+                    &["archive", "tables", "parts", "rows", "bytes"],
+                    Value::str(archive.as_str()),
+                    &[r.tables as u64, r.parts as u64, r.rows, r.bytes],
+                )
+            }
+        }
+    }
+
+    /// `BACKUP TO '<archive>' [INCREMENTAL FROM '<base>']`.
+    ///
+    /// One [`crate::storage::part::Snapshot`] per table, all of them taken
+    /// here, under the write borrow this statement already holds -- so the
+    /// archive is one instant of the whole database rather than one instant
+    /// per table. From there on nothing in the catalog is read: parts are
+    /// immutable, so a writer that publishes a new `PartSet` while the bytes
+    /// are going out cannot change what this archive contains. That is the
+    /// property a `cp -r` cannot have, and the reason two of eight such copies
+    /// of a live instance were unopenable.
+    ///
+    /// Allowed on a read-only session: it writes nothing to the database.
+    fn run_backup(&mut self, to: &str, base: Option<&str>) -> Result<ResultSet> {
+        if self.txn.is_some() {
+            return Err(Error::unsupported(
+                "cannot BACKUP inside a transaction: `snapshot()` would hand it the \
+                 transaction's uncommitted overlay, which ROLLBACK is still entitled to \
+                 erase. COMMIT or ROLLBACK first",
+            ));
+        }
+        // Buffered rows are in the delta and an archive is made of parts, so
+        // "acknowledged" and "archived" are only the same set after this line.
+        self.catalog.flush_all()?;
+        if let Some(&(path, dp)) = self.catalog.damaged_parts().first() {
+            return Err(Error::corruption(format!(
+                "refusing to back up `{path}`: it is quarantined because `{}` did not \
+                 decode, so an archive taken now would be silently missing whatever rows \
+                 that file held. Repair or DROP the table first. ({})",
+                dp.file, dp.why
+            )));
+        }
+
+        let mut dbs = self.catalog.database_names();
+        dbs.sort();
+        let mut roster: Vec<(String, String)> = Vec::new();
+        for db in &dbs {
+            for t in self.catalog.table_names(Some(db))? {
+                roster.push((db.clone(), t));
+            }
+        }
+        let mut src = Vec::with_capacity(roster.len());
+        for (db, name) in &roster {
+            let t = self.catalog.table_by_path(&format!("{db}.{name}"))?;
+            // A `Memory` table is defined to vanish on restart; archiving one
+            // would restore it as something that does not, which is the same
+            // silent change of semantics `save_catalog` declines to make.
+            if !t.def.engine.is_persistent() {
+                continue;
+            }
+            src.push(crate::backup::Source { db, def: &t.def, snap: t.snapshot() });
+        }
+        let r = crate::backup::write_archive(Path::new(to), &dbs, &src, base.map(Path::new))?;
+        report(
+            &["archive", "tables", "parts", "rows", "bytes", "reused_parts"],
+            Value::str(to),
+            &[r.tables as u64, r.parts as u64, r.rows, r.bytes, r.reused as u64],
+        )
+    }
+
+    /// `RESTORE FROM '<archive>' TO '<directory>'`.
+    ///
+    /// The target is mandatory, and it may not be the directory this session
+    /// has open. Both refusals are the same rule: a restore that wrote into a
+    /// live database would interleave its part sequence numbers and commit
+    /// records with the ones already there, and the result would be neither
+    /// database. Restore beside it and swap the directories -- `rename` is
+    /// atomic and the old copy survives the mistake.
+    fn run_restore(&mut self, from: &str, to: Option<&str>) -> Result<ResultSet> {
+        let Some(to) = to else {
+            return Err(Error::unsupported(
+                "RESTORE needs a target: `RESTORE FROM '<archive>' TO '<directory>'`. It is \
+                 never the open database -- restore beside it and swap the directories.",
+            ));
+        };
+        let target = Path::new(to);
+        if self.catalog.dir().is_some_and(|d| same_dir(d, target)) {
+            return Err(Error::storage(format!(
+                "refusing to restore into {to}: this session has that database open. \
+                 Restore to a new directory and swap.",
+            )));
+        }
+        let r = crate::backup::restore(Path::new(from), target)?;
+        report(
+            &["directory", "tables", "parts", "rows"],
+            Value::str(to),
+            &[r.tables as u64, r.parts as u64, r.rows],
+        )
     }
 
     /// Open (or reuse) the cached log handle for `path`.
@@ -810,7 +1351,7 @@ impl Session {
     }
 
     /// The fallible half of COMMIT: flush the buffered rows into each overlay,
-    /// then fsync a commit marker into each enlisted log.
+    /// then make every enlisted log durable behind one commit point.
     ///
     /// Durability strictly before visibility. Nothing has been published when
     /// this returns -- the overlays are still private -- so an error here is
@@ -828,15 +1369,42 @@ impl Session {
         for e in tables {
             self.catalog.table_by_path_mut(&e.path)?.flush()?;
         }
-        for e in tables.iter().filter(|e| !e.fold) {
-            let Some(seq) = e.seq else { continue };
-            let w = self
-                .wals
-                .get_mut(&e.path)
-                .expect("an enlisted table with a sequence number has an open log");
-            w.commit(seq)?;
-            w.sync()?;
+        // Across several tables this is a two-phase commit, because N markers
+        // in N files fsynced one after another are N commit points, and a
+        // crash between two of them left a *prefix* of the transaction durable
+        // -- some tables holding it and some not, with no error to anyone.
+        // The last participant is the coordinator: every earlier one logs a
+        // prepare citing its decision, and the coordinator's own marker, the
+        // last append and the last fsync of the whole COMMIT, releases all of
+        // them at once. See [`crate::persist::Wal::prepare`].
+        //
+        // A single-table transaction pays nothing for it: no prepare, no extra
+        // record, the same one marker and one fsync it always had -- which is
+        // the shape every autocommit statement and the whole OLTP path have.
+        let Some(last) = tables.iter().rposition(|e| !e.fold && e.seq.is_some()) else {
+            return Ok(());
+        };
+        let seq = tables[last].seq.expect("rposition matched on `is_some`");
+        let parties = tables.iter().filter(|e| !e.fold && e.seq.is_some()).count();
+        let missing = || Error::storage("an enlisted table with a sequence number has no log");
+        if parties > 1 {
+            // One `PathBuf` for the whole transaction, and only when there is
+            // more than one participant to cite it.
+            let coord = self.wals.get(&tables[last].path).ok_or_else(missing)?.path().to_owned();
+            for e in tables.iter().take(last).filter(|e| !e.fold) {
+                let Some(s) = e.seq else { continue };
+                let w = self.wals.get_mut(&e.path).ok_or_else(missing)?;
+                w.prepare(s, &coord, seq)?;
+                w.sync()?;
+            }
         }
+        let w = self.wals.get_mut(&tables[last].path).ok_or_else(missing)?;
+        if parties > 1 {
+            w.decide(seq)?;
+        } else {
+            w.commit(seq)?;
+        }
+        w.sync()?;
         Ok(())
     }
 
@@ -1025,8 +1593,41 @@ impl Session {
         // `&mut Session`; the state is behind an `Arc`, so it is two atomics
         // per *statement* against a statement about to be lexed, parsed, bound
         // and lowered.
+        // `INSERT ... FROM INFILE` is intercepted below and streams straight
+        // into `Table::insert` (`io::emit`), so it passes none of the checks
+        // `run_insert` applies. Rather than let a bulk load be the one door
+        // constraints do not cover, it is refused while this database has any
+        // -- coarse on purpose, because the alternative is picking the target
+        // table out of the text a second time, and a mistake there would be a
+        // silent import rather than a refusal.
+        //
+        // The narrow fix is one line in `io::emit` (see the report): route the
+        // block through `Session::import_block`. When that lands, this gate
+        // goes.
+        if !(self.ext.checks.is_empty() && self.ext.uniques.is_empty())
+            && mentions_infile(sql)
+        {
+            return Err(self.poison(Error::unsupported(
+                "INSERT ... FROM INFILE does not enforce CHECK or UNIQUE constraints, and \
+                 this database has some -- so it is refused rather than allowed to load \
+                 rows the table's own INSERT would reject. Import into an unconstrained \
+                 table and `INSERT ... SELECT` from it, which is checked",
+            )));
+        }
         if let Some(r) = self.settings.clone().intercept(self, sql) {
             return r;
+        }
+        // `BACKUP` / `RESTORE` / `VERIFY BACKUP` are recognised by the same
+        // splitter transaction control uses, for the same reason and at the
+        // same price: one byte scan that answers "no" for every statement this
+        // engine had before, and a second lex only for the ones it does not.
+        //
+        // Strictly *after* the settings hook and not beside the txn one:
+        // `INSERT INTO t FROM INFILE 'backup.csv'` mentions the word, and
+        // `run_mixed` does not run the settings extensions, so claiming it
+        // here first would turn a working import into a parse error.
+        if mentions_admin_keyword(sql) {
+            return self.run_mixed(sql);
         }
         // Poisoning is applied here rather than inside `exec_statement`,
         // because a parse error is a statement that failed too -- and one that
@@ -1035,9 +1636,11 @@ impl Session {
             Ok(s) => s,
             Err(e) => return Err(self.poison(e)),
         };
+        let texts = statement_texts(sql, stmts.len());
         let mut out = Vec::with_capacity(stmts.len());
-        for s in &stmts {
-            match self.exec_statement(s) {
+        for (i, s) in stmts.iter().enumerate() {
+            let text = texts.as_ref().map_or(sql, |t| t[i]);
+            match self.exec_statement(s, text) {
                 Ok(rs) => out.push(rs),
                 Err(e) => return Err(self.poison(e)),
             }
@@ -1067,43 +1670,71 @@ impl Session {
             if span.is_empty() {
                 continue; // `;;`, or a trailing `;`
             }
-            match txn_stmt(span) {
-                Some(t) => {
-                    let t0 = Instant::now();
-                    // ROLLBACK is the way *out* of a poisoned transaction, so
-                    // it is the one statement that must still run; BEGIN and
-                    // COMMIT poison or report on their own.
-                    match t {
-                        TxnStmt::Begin => self.begin()?,
-                        TxnStmt::Commit => self.commit()?,
-                        TxnStmt::Rollback => self.rollback()?,
-                    }
+            // The statement's own text, from its first token to the semicolon
+            // that ended it (or the end of the input).
+            let end = if i == toks.len() { sql.len() } else { toks[i].pos };
+            let text = sql[span[0].pos..end].trim();
+            if let Some(t) = txn_stmt(span) {
+                let t0 = Instant::now();
+                // ROLLBACK is the way *out* of a poisoned transaction, so it
+                // is the one statement that must still run; BEGIN and COMMIT
+                // poison or report on their own.
+                let r = match t {
+                    TxnStmt::Begin => self.begin(),
+                    TxnStmt::Commit => self.commit(),
+                    TxnStmt::Rollback => self.rollback(),
+                }
+                .map(|()| {
                     let mut rs = ResultSet::empty();
                     rs.stats.elapsed_us = t0.elapsed().as_micros();
-                    out.push(rs);
-                }
-                None => {
-                    // The statement's own text, from its first token to the
-                    // semicolon that ended it (or the end of the input).
-                    let end = if i == toks.len() { sql.len() } else { toks[i].pos };
-                    let stmts = match parse(&sql[span[0].pos..end]) {
-                        Ok(s) => s,
-                        Err(e) => return Err(self.poison(e)),
-                    };
-                    for s in &stmts {
-                        match self.exec_statement(s) {
-                            Ok(rs) => out.push(rs),
-                            Err(e) => return Err(self.poison(e)),
-                        }
+                    rs
+                });
+                self.log_stmt(text, t.name(), t0, &r);
+                out.push(r?);
+                continue;
+            }
+            if let Some(a) = admin_stmt(span) {
+                let t0 = Instant::now();
+                let r = a.and_then(|a| self.run_admin(&a));
+                self.log_stmt(text, "ADMIN", t0, &r);
+                match r {
+                    Ok(mut rs) => {
+                        rs.stats.elapsed_us = t0.elapsed().as_micros();
+                        out.push(rs);
                     }
+                    Err(e) => return Err(self.poison(e)),
+                }
+                continue;
+            }
+            let stmts = match parse(text) {
+                Ok(s) => s,
+                Err(e) => return Err(self.poison(e)),
+            };
+            let texts = statement_texts(text, stmts.len());
+            for (k, s) in stmts.iter().enumerate() {
+                match self.exec_statement(s, texts.as_ref().map_or(text, |t| t[k])) {
+                    Ok(rs) => out.push(rs),
+                    Err(e) => return Err(self.poison(e)),
                 }
             }
         }
         Ok(out)
     }
 
-    fn exec_statement(&mut self, stmt: &Statement) -> Result<ResultSet> {
+    /// Run one statement and record it in the query log.
+    ///
+    /// The wrapper exists so that *every* return path of the dispatcher below
+    /// -- including the early refusals -- lands in the log. A log that only
+    /// holds the statements that got as far as the executor would be missing
+    /// exactly the ones an operator is looking for.
+    fn exec_statement(&mut self, stmt: &Statement, sql: &str) -> Result<ResultSet> {
         let t0 = Instant::now();
+        let r = self.dispatch(stmt, t0);
+        self.log_stmt(sql, stmt_kind(stmt), t0, &r);
+        r
+    }
+
+    fn dispatch(&mut self, stmt: &Statement, t0: Instant) -> Result<ResultSet> {
         // Nothing runs in a transaction that has already failed. Returning
         // `Ok` here is the shape of the bug: the statement's writes go into an
         // overlay the session is committed to discarding, and the client is
@@ -1146,12 +1777,39 @@ impl Session {
                 self.catalog.create_database(name, *if_not_exists)?;
                 ResultSet::empty()
             }
+            Statement::CreateView { name, query, body_sql, or_replace, if_not_exists } => {
+                self.run_create_view(name, query, body_sql, *or_replace, *if_not_exists)?
+            }
+            Statement::DropView { name, if_exists } => self.run_drop_view(name, *if_exists)?,
+            Statement::RenameTable { from, to } => self.run_rename_table(from, to)?,
+            Statement::AlterModifyColumn { table, column, ty } => {
+                self.run_modify_column(table, column, ty)?
+            }
             Statement::DropTable { name, if_exists } => {
+                self.guard_ddl_table(name)?;
+                let path = self.catalog.qualify(name);
                 self.catalog.drop_table(name, *if_exists)?;
+                // The constraints go with the table, and they go *now*: a
+                // table re-created under the same name has not declared them,
+                // and a stale entry would enforce a constraint the new table
+                // never had.
+                let mut changed = self.ext.checks.remove(&path).is_some();
+                changed |= self.ext.uniques.remove(&path).is_some();
+                if changed {
+                    let (db, _) = self.catalog.resolve(name);
+                    self.persist_ext(&db)?;
+                }
                 ResultSet::empty()
             }
             Statement::DropDatabase { name, if_exists } => {
                 self.catalog.drop_database(name, *if_exists)?;
+                // The metadata table went with the database; the copy in
+                // memory has to go too, and there is nothing left to persist
+                // it to.
+                let prefix = format!("{name}.");
+                self.ext.checks.retain(|k, _| !k.starts_with(&prefix));
+                self.ext.uniques.retain(|k, _| !k.starts_with(&prefix));
+                self.ext.views.retain(|k, _| !k.starts_with(&prefix));
                 ResultSet::empty()
             }
             Statement::Use(db) => {
@@ -1168,9 +1826,13 @@ impl Session {
                 ResultSet::empty()
             }
             Statement::Truncate { table } => {
+                self.guard_ddl_table(table)?;
                 let def = self.catalog.table(table)?.def.clone();
                 self.catalog.drop_table(table, false)?;
                 self.catalog.create_table(def, false)?;
+                // Deliberately *not* touching `ext`: TRUNCATE empties a table,
+                // it does not redefine it, so the constraints it was created
+                // with still apply to everything written after.
                 ResultSet::empty()
             }
             Statement::SystemFlush(target) => {
@@ -1232,8 +1894,22 @@ impl Session {
     /// [`Session::read`] under a caller-supplied budget, deadline and cancel
     /// flag, for a pool that governs each connection separately.
     pub fn read_with(&self, sql: &str, ctx: &QueryContext) -> Result<ResultSet> {
-        let stmt = self.one_read_stmt(sql)?;
-        self.read_statement(&stmt, ctx)
+        let t0 = Instant::now();
+        // `SELECT` is the kind a statement that never parsed is filed under:
+        // this path refuses everything else anyway, so it is the truth for
+        // every entry that can reach the log from here.
+        let mut kind = "SELECT";
+        let r = self.one_read_stmt(sql).and_then(|stmt| {
+            kind = stmt_kind(&stmt);
+            let mut rs = self.read_statement(&stmt, ctx)?;
+            // The `&mut` dispatcher has always stamped this; the `&self` half
+            // never did, so a `Reader::query` reported an elapsed time of zero
+            // and `system.query_log` would have inherited the same blank.
+            rs.stats.elapsed_us = t0.elapsed().as_micros();
+            Ok(rs)
+        });
+        self.log_stmt(sql, kind, t0, &r);
+        r
     }
 
     /// Stream a `SELECT`'s blocks to `sink` without ever holding more than one.
@@ -1325,18 +2001,60 @@ impl Session {
             Statement::ShowDatabases => {
                 ResultSet::one_string_column("name", self.catalog.database_names())
             }
-            Statement::ShowTables { database } => ResultSet::one_string_column(
-                "name",
-                self.catalog.table_names(database.as_deref())?,
-            ),
+            Statement::ShowTables { database } => {
+                let db = database.as_deref().unwrap_or(self.catalog.current_database());
+                let mut names = self.catalog.table_names(Some(db))?;
+                // Views are listed beside tables because that is the namespace
+                // they share: a `SELECT` names either the same way, and a
+                // `SHOW TABLES` that omitted them would be a list you cannot
+                // trust to tell you what a name will resolve to.
+                let prefix = format!("{db}.");
+                names.extend(
+                    self.ext
+                        .views
+                        .keys()
+                        .filter_map(|k| k.strip_prefix(&prefix).map(str::to_string)),
+                );
+                names.sort();
+                ResultSet::one_string_column("name", names)
+            }
             Statement::ShowCreateTable(name) => {
-                let t = self.catalog.table(name)?;
-                ResultSet::one_string_column(
-                    "statement",
-                    vec![render_create_table(t.schema(), &t.def)],
-                )
+                let statement = match self.view_of(name) {
+                    Some((key, v)) => {
+                        let (db, bare) = key.split_once('.').unwrap_or(("", &key));
+                        format!("CREATE VIEW `{db}`.`{bare}` AS\n{}", v.sql)
+                    }
+                    None => {
+                        let t = self.catalog.table(name)?;
+                        let path = self.catalog.qualify(name);
+                        render_create_table(
+                            t.schema(),
+                            &t.def,
+                            self.ext.checks.get(&path).map_or(&[][..], Vec::as_slice),
+                            self.ext.uniques.get(&path).map(String::as_str),
+                        )
+                    }
+                };
+                ResultSet::one_string_column("statement", vec![statement])
             }
             Statement::Describe(name) => {
+                // A view's columns are its query's, and the cheapest exact way
+                // to say what they are is to bind it -- which is also the only
+                // way that cannot drift from what a SELECT would return.
+                if let Some((_, v)) = self.view_of(name) {
+                    let plan = self.plan_in(&v.query, ctx)?;
+                    let schema = Schema::new(vec![
+                        Field::new("name", DataType::String),
+                        Field::new("type", DataType::String),
+                    ])?;
+                    let rows = plan
+                        .schema()
+                        .fields()
+                        .iter()
+                        .map(|f| vec![Value::str(f.name.clone()), Value::str(f.ty.to_string())])
+                        .collect();
+                    return ResultSet::from_rows(schema, rows);
+                }
                 let t = self.catalog.table(name)?;
                 let schema = Schema::new(vec![
                     Field::new("name", DataType::String),
@@ -1416,7 +2134,13 @@ impl Session {
         q: &'q crate::sql::ast::Query,
         ctx: &QueryContext,
     ) -> Result<std::borrow::Cow<'q, crate::sql::ast::Query>> {
-        if !has_subquery(q) {
+        // `system.*` rides the same walk and the same clone: both rewrites
+        // replace a node in place, both need an owned AST to do it, and a
+        // query that needs neither -- which is almost every query -- pays one
+        // borrowed traversal and nothing else. Folding the system-table test
+        // into `has_subquery` rather than adding a second walk is what keeps
+        // "must not cost anything when unused" true.
+        if !has_subquery(q, self.names()) {
             return Ok(std::borrow::Cow::Borrowed(q));
         }
         let mut out = q.clone();
@@ -1490,7 +2214,56 @@ impl Session {
     fn rewrite_tableref(&self, t: &mut crate::sql::ast::TableRef, budget: &mut Sub<'_>) -> Result<()> {
         use crate::sql::ast::{JoinConstraint, TableRef};
         match t {
-            TableRef::Table { .. } => {}
+            // A `system.` or `information_schema.` reference becomes the
+            // derived table it is equivalent to, computed now, from this
+            // session's catalog. Everything downstream -- binder, optimizer,
+            // executor -- then treats it as an ordinary relation, which is
+            // what makes it joinable and filterable without a plan node that
+            // could drift from the real one.
+            TableRef::Table { name, alias, .. } => {
+                if let Some(kind) = crate::system::classify(name, &self.catalog) {
+                    let q = crate::system::derived(
+                        kind,
+                        &self.catalog,
+                        &self.settings,
+                        &self.log,
+                    )?;
+                    // Unaliased, the table is still addressable by its bare
+                    // name -- `system.parts p` and `system.parts` must both
+                    // qualify as `parts`.
+                    let alias = alias.clone().or_else(|| Some(name.last().to_string()));
+                    *t = TableRef::Subquery { query: Box::new(q), alias };
+                    return Ok(());
+                }
+                // A view becomes the derived table it is defined as, exactly
+                // as a `system.` reference does -- one rewrite, and everything
+                // downstream sees an ordinary subquery. Inlining rather than
+                // materializing is what makes a view cost nothing to keep and
+                // always agree with its sources.
+                //
+                // The stored body is already fully qualified, so it means the
+                // same thing spliced into a statement from any database.
+                let Some(v) = self.ext.view(name, self.catalog.current_database()) else {
+                    return Ok(());
+                };
+                // Views can nest, and after a DROP + CREATE they can nest in a
+                // cycle (`a` over `b`, then `b` re-created over `a`). The
+                // subquery budget bounds both: it is the one counter that is
+                // already decremented per level of folding, and running out of
+                // it says so rather than overflowing the stack.
+                if budget.left == 0 {
+                    return Err(Error::unsupported(format!(
+                        "view `{}` nests too deeply -- if two views reference each other, \
+                         one of them has to go",
+                        name.last()
+                    )));
+                }
+                budget.left -= 1;
+                let mut q = v.query.clone();
+                let alias = alias.clone().or_else(|| Some(name.last().to_string()));
+                self.rewrite_query(&mut q, budget)?;
+                *t = TableRef::Subquery { query: Box::new(q), alias };
+            }
             TableRef::Subquery { query, .. } => self.rewrite_query(query, budget)?,
             TableRef::Join { left, right, constraint, .. } => {
                 self.rewrite_tableref(left, budget)?;
@@ -1799,6 +2572,15 @@ impl Session {
     // ------------------------------------------------------------------ DML
 
     fn run_insert(&mut self, ins: &Insert) -> Result<ResultSet> {
+        self.guard_ddl_table(&ins.table)?;
+        // Named before the catalog is asked, or the error would be "table does
+        // not exist" about a name that plainly does exist.
+        if let Some((key, _)) = self.view_of(&ins.table) {
+            return Err(Error::unsupported(format!(
+                "cannot INSERT into `{key}`: it is a view, which stores a query rather \
+                 than rows. Insert into the table the view selects from"
+            )));
+        }
         let path = self.catalog.qualify(&ins.table);
         let target = self.catalog.table_by_path(&path)?.def.schema.clone();
 
@@ -1855,12 +2637,24 @@ impl Session {
         target: &Schema,
         order: &[usize],
     ) -> Result<usize> {
+        // `UNIQUE` on the key column is the difference between an upsert and a
+        // refusal, and it is decided once per statement: one map probe, on a
+        // map that is empty unless some table in this database declared one.
+        let unique = self.ext.uniques.contains_key(path);
         let mut n = 0;
         for b in blocks {
             if b.rows() == 0 {
                 continue;
             }
             let full = self.widen_to_schema(b, target, order)?;
+            // Checked before anything is logged: a refused row must leave no
+            // record behind, and a record in the log is a row a crash would
+            // replay. A CHECK can say no from the block alone, so it does.
+            self.enforce_checks(path, &full)?;
+            if unique {
+                n += self.insert_unique(path, full)?;
+                continue;
+            }
             // Log-before-apply: the record is durable before the write is
             // acknowledged, so a crash between the two replays the insert
             // rather than losing it. Inside a transaction it is staged
@@ -1869,6 +2663,89 @@ impl Session {
             n += self.catalog.table_by_path_mut(path)?.insert(full)?;
         }
         Ok(n)
+    }
+
+    /// One block from a bulk importer, checked the way an `INSERT` is.
+    ///
+    /// The hook `io::emit` should call instead of reaching for
+    /// `catalog.table_by_path_mut(..).insert(..)`, which is the one write path
+    /// in the engine that bypasses constraints. Until it does, `Session::run`
+    /// refuses an import into a database that has any; see the gate there.
+    // Dead until that one line changes, and deliberately kept anyway: the
+    // whole point of the note above is that the fix should be a call, not a
+    // reimplementation of the checks somewhere else.
+    #[allow(dead_code)]
+    pub(crate) fn import_block(&mut self, path: &str, b: Block) -> Result<usize> {
+        self.enforce_checks(path, &b)?;
+        if self.ext.uniques.contains_key(path) {
+            return self.insert_unique(path, b);
+        }
+        self.catalog.table_by_path_mut(path)?.insert(b)
+    }
+
+    /// Insert into a table whose key is declared `UNIQUE`: refuse a repeated
+    /// key instead of replacing the row that already has it.
+    ///
+    /// ## Why this cannot be log-before-apply
+    ///
+    /// A refusal is the *expected* outcome here, not an I/O accident -- it is
+    /// what the constraint is for. Logging first and then refusing leaves an
+    /// `Insert` record in the log for a statement the caller was told failed,
+    /// and replay applies records with last-write-wins, so a crash after a
+    /// refused insert would land exactly the row the constraint rejected, on
+    /// top of the row it was protecting. Silent, and only after a crash.
+    ///
+    /// So the record is **staged** instead, under a group of its own, and the
+    /// commit marker is written only once `insert_with` has accepted the
+    /// batch. A staged group with no marker is never replayed -- that is what
+    /// the form exists for, and it is the same mechanism a transaction uses --
+    /// so every crash point has one of two outcomes and no third. The rewind
+    /// on the failure path is hygiene, not correctness: it keeps a refused
+    /// statement from leaving bytes in the log, and the log would ignore them
+    /// either way.
+    ///
+    /// It costs one extra record (the marker, ~10 bytes) per statement against
+    /// the plain path's one, and the same single `fsync`.
+    fn insert_unique(&mut self, path: &str, full: Block) -> Result<usize> {
+        // Inside a transaction the ordinary path is already this shape: the
+        // record is staged under the transaction's group, and a refusal
+        // poisons the transaction so the group is never committed.
+        if self.txn.is_some() {
+            self.log_insert(path, &full)?;
+            return self
+                .catalog
+                .table_by_path_mut(path)?
+                .insert_with(full, KeyConflict::Reject);
+        }
+        let staged = match self.wal_for(path)? {
+            Some(w) => {
+                let seq = w.begin();
+                let lsn = w.lsn();
+                w.append_insert_staged(seq, &full)?;
+                Some((seq, lsn))
+            }
+            None => None,
+        };
+        let applied = self
+            .catalog
+            .table_by_path_mut(path)?
+            .insert_with(full, KeyConflict::Reject);
+        match (&applied, staged) {
+            (Ok(_), Some((seq, _))) => {
+                let w = self.wal_for(path)?.expect("the log that staged the record");
+                w.commit(seq)?;
+                w.sync()?;
+            }
+            (Err(_), Some((_, lsn))) => {
+                if let Some(w) = self.wal_for(path)? {
+                    // Best effort, and safe either way: an uncommitted group
+                    // is inert.
+                    let _ = w.rewind_to(lsn);
+                }
+            }
+            _ => {}
+        }
+        applied
     }
 
     /// Evaluate literal VALUES rows into a block covering only `order`.
@@ -1902,6 +2779,11 @@ impl Session {
                                 Value::Int(i) => Value::Int(-i),
                                 Value::UInt(u) => Value::Int(-(*u as i64)),
                                 Value::Float(f) => Value::Float(-f),
+                                // `-2.5` in a VALUES row: the literal is
+                                // exact, and negating it through `f64` would
+                                // be the one place an INSERT threw the
+                                // exactness away.
+                                Value::Decimal(u, s) => Value::Decimal(-u, *s),
                                 other => {
                                     return Err(Error::bind(format!("cannot negate {other}")))
                                 }
@@ -2214,6 +3096,12 @@ impl Session {
         for b in it {
             acc.extend(&b)?;
         }
+        // The replacement row images, checked exactly as an INSERT's are --
+        // and before the log record, so a refused UPDATE leaves nothing to
+        // replay. An UPDATE is the *other* way a row can come to violate a
+        // constraint, and a table that enforced its CHECKs on INSERT only
+        // would be a constraint in name.
+        self.enforce_checks(path, &acc)?;
         // An UPDATE is a re-insert of the changed rows, so logging the insert
         // is enough to replay it: the primary key makes it idempotent, and
         // where there is no key the sweep's tombstones were logged just above.
@@ -2228,7 +3116,391 @@ impl Session {
         Ok(n)
     }
 
+    // -------------------------------------------- constraints: enforcement
+
+    /// Refuse `block` if any row fails a CHECK declared on `path`.
+    ///
+    /// ## Vectorized, because this is the write path
+    ///
+    /// One `eval` per constraint per *block*, not per row: the predicate goes
+    /// through the same evaluator a `WHERE` does, so a check over an
+    /// `Int64` column is a specialized comparison over a decoded lane and
+    /// costs about what filtering the same block would. What it must never
+    /// become is a per-row bind or a per-row `Value` walk -- a buffered insert
+    /// is ~33 ns/row, and either of those is an order of magnitude more than
+    /// the row itself.
+    ///
+    /// Measured, A/B interleaved through the CLI, release build, best of 7 per
+    /// side, `INSERT INTO t SELECT * FROM src` over 1M rows:
+    ///
+    /// ```text
+    ///   one CHECK (v > 0)      0.58 s      no constraint    0.60 s
+    ///   eight CHECKs           0.58 s      no constraint    0.56 s
+    /// ```
+    ///
+    /// One constraint is **not measurable** -- it came out ahead in five of
+    /// the seven rounds, which is what this machine's +-40 ms spread on
+    /// identical code looks like. Eight of them cost about 20 ms per million
+    /// rows, i.e. ~2.5 ns per row per constraint, still inside the noise of a
+    /// single side. The same insert re-parsed from 200k literal `VALUES` rows
+    /// measured 1.12 s against 1.11 s, where the parser is the statement and
+    /// the check is invisible.
+    ///
+    /// ## NULL passes
+    ///
+    /// SQL's rule, and deliberately kept: a constraint is violated only when
+    /// the predicate is **FALSE**, so `CHECK (v > 0)` accepts a NULL `v`. The
+    /// alternative reading -- "not TRUE is a violation" -- would make a
+    /// `Nullable` column with a CHECK unwritable without a DEFAULT, and would
+    /// disagree with every other engine. Declare the column non-nullable if
+    /// NULL is not allowed; nullability is a type here, and the type already
+    /// refuses it.
+    fn enforce_checks(&self, path: &str, block: &Block) -> Result<()> {
+        // The gate. One load and a branch on a database that declares no
+        // constraints, which is every database that had one before this
+        // existed.
+        if self.ext.checks.is_empty() {
+            return Ok(());
+        }
+        let Some(checks) = self.ext.checks.get(path) else {
+            return Ok(());
+        };
+        // Borrowed, not cloned: this runs once per statement on the write
+        // path, and both borrows below are shared ones of the same catalog.
+        let schema = &self.catalog.table_by_path(path)?.def.schema;
+        let mut binder = Binder::new(&self.catalog);
+        for c in checks {
+            let bound = binder.bind_expr_standalone(&c.expr, schema).map_err(|e| {
+                Error::bind(format!(
+                    "constraint `{}` on `{path}` no longer binds against the table: {e}",
+                    c.name
+                ))
+            })?;
+            let col = crate::exec::expr::eval(&bound, block)?;
+            if let Some(row) = first_false(&col) {
+                return Err(Error::exec(format!(
+                    "CHECK constraint `{}` on `{path}` is violated by {}: {}",
+                    c.name,
+                    render_row(block, schema, row),
+                    c.sql
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Refuse a schema change that would leave a CHECK unable to bind.
+    ///
+    /// The alternative is a constraint that silently stops being enforced --
+    /// or, worse, one that fails every write afterwards with a message about
+    /// binding rather than about the column that went away. Asked by binding,
+    /// so it is exactly the question the write path will ask.
+    fn rebind_checks(&self, path: &str, schema: &Schema, what: &str) -> Result<()> {
+        let Some(checks) = self.ext.checks.get(path) else { return Ok(()) };
+        for c in checks {
+            Binder::new(&self.catalog)
+                .bind_expr_standalone(&c.expr, schema)
+                .map_err(|e| {
+                    Error::bind(format!(
+                        "cannot {what}: constraint `{}` on `{path}` would no longer bind \
+                         ({e}). Re-create the table without the constraint first",
+                        c.name
+                    ))
+                })?;
+        }
+        Ok(())
+    }
+
+    /// Refuse a statement that would write the engine's own metadata table.
+    ///
+    /// Enforcement reads the copy in memory, so a hand-written `INSERT` into
+    /// `_granular_ddl` would produce a table whose rows and whose behaviour
+    /// disagree -- and the disagreement would only show up after a restart.
+    fn guard_ddl_table(&self, name: &ObjectName) -> Result<()> {
+        if !name.last().eq_ignore_ascii_case(DDL_TABLE) {
+            return Ok(());
+        }
+        Err(Error::unsupported(format!(
+            "`{DDL_TABLE}` is the catalog's own table -- it holds this database's CHECK \
+             constraints and views, and the engine keeps a copy in memory that a direct \
+             write would not update. Use CREATE/DROP VIEW and CREATE TABLE ... CHECK; \
+             read it with SELECT"
+        )))
+    }
+
     // ------------------------------------------------------------------ DDL
+
+    /// `CREATE VIEW v AS <query>`.
+    ///
+    /// The body is **validated by binding it**, here, against the catalog as
+    /// it stands -- a view that cannot be planned is refused at creation
+    /// rather than at the first `SELECT` from it. It is also qualified here
+    /// (see [`crate::sql::ast::Query::qualify_tables`]), so what is stored
+    /// means the same thing from any session.
+    fn run_create_view(
+        &mut self,
+        name: &ObjectName,
+        query: &crate::sql::ast::Query,
+        body_sql: &str,
+        or_replace: bool,
+        if_not_exists: bool,
+    ) -> Result<ResultSet> {
+        self.guard_ddl_table(name)?;
+        let (db, view) = self.catalog.resolve(name);
+        let key = format!("{db}.{view}");
+        // Asked before anything is installed: the view is recorded in a table
+        // *in that database*, so a name in a database that does not exist
+        // would leave a view in memory that nothing could persist.
+        self.catalog.table_names(Some(&db))?;
+        // A view and a table share one namespace, because a query names them
+        // the same way. Shadowing either direction is a silent wrong answer:
+        // the reference would resolve to whichever the rewrite happened to
+        // check first.
+        if self.catalog.table_by_path(&key).is_ok() {
+            return Err(Error::bind(format!(
+                "`{key}` is a table; a view cannot shadow it"
+            )));
+        }
+        if self.ext.views.contains_key(&key) && !or_replace {
+            return if if_not_exists {
+                Ok(ResultSet::empty())
+            } else {
+                Err(Error::bind(format!(
+                    "view `{key}` already exists (use CREATE OR REPLACE VIEW)"
+                )))
+            };
+        }
+        let scope = self.catalog.current_database().to_string();
+        let mut q = query.clone();
+        q.qualify_tables(&scope);
+        // Binding is the validation, and it has to happen with the view *not*
+        // yet installed: otherwise `CREATE OR REPLACE VIEW v AS SELECT * FROM
+        // v` would validate against its own previous definition and then
+        // recurse at every use.
+        self.plan(&q)?;
+        let replaced = self
+            .ext
+            .views
+            .insert(key.clone(), View { scope, sql: body_sql.to_string(), query: q });
+        // `persist_ext` reads what is in memory, so the entry has to go in
+        // first -- and come back out if the write fails, or the session would
+        // enforce a view the catalog does not have.
+        if let Err(e) = self.persist_ext(&db) {
+            match replaced {
+                Some(v) => self.ext.views.insert(key, v),
+                None => self.ext.views.remove(&key),
+            };
+            return Err(e);
+        }
+        Ok(ResultSet::empty())
+    }
+
+    fn run_drop_view(&mut self, name: &ObjectName, if_exists: bool) -> Result<ResultSet> {
+        let (db, view) = self.catalog.resolve(name);
+        let key = format!("{db}.{view}");
+        let Some(gone) = self.ext.views.remove(&key) else {
+            return if if_exists {
+                Ok(ResultSet::empty())
+            } else {
+                Err(Error::storage(format!("view `{key}` does not exist")))
+            };
+        };
+        if let Err(e) = self.persist_ext(&db) {
+            self.ext.views.insert(key, gone);
+            return Err(e);
+        }
+        Ok(ResultSet::empty())
+    }
+
+    /// `RENAME TABLE a TO b`.
+    ///
+    /// ## Atomic, and it is the checkpoint that makes it so
+    ///
+    /// The rename itself is three map operations on the catalog. What has to
+    /// be atomic is the *directory*, and the trick is that nothing here
+    /// renames one: the table's parts are hard-linked under the new name
+    /// first, the new directory's `TABLE` record is committed, and only then
+    /// does the root `CATALOG` -- the single commit point of a checkpoint --
+    /// start naming the new table. A crash before that publication leaves the
+    /// old name with its own untouched directory and an orphan beside it that
+    /// the next checkpoint's `collect_dropped_tables` removes; a crash after
+    /// it leaves the new name complete. There is no third state, and no
+    /// window in which a name resolves to a directory that is not there.
+    ///
+    /// Hard links rather than a copy because a rename must not be proportional
+    /// to the table: parts are immutable, and two directory entries for one
+    /// inode is exactly what "the same part, under a new table name" means.
+    /// Measured through the CLI, A/B interleaved against a build that skipped
+    /// the linking and let the checkpoint rewrite the parts (temporary env
+    /// switch, since removed), 1M rows / 14 MB, best of 5 per side:
+    /// **0.08 s linked against 0.23 s copied**, whole process included. The
+    /// gap is the part copy and grows with the table; the linked side does
+    /// not.
+    ///
+    /// The constraints move with the table, and they move *first*, under both
+    /// names at once. A crash between the two publications then leaves
+    /// whichever table survived still carrying its CHECKs; the row for the
+    /// name that lost is pruned at the next open.
+    fn run_rename_table(&mut self, from: &ObjectName, to: &ObjectName) -> Result<ResultSet> {
+        let (from_db, from_name) = self.catalog.resolve(from);
+        let (to_db, to_name) = self.catalog.resolve(to);
+        let from_path = format!("{from_db}.{from_name}");
+        let to_path = format!("{to_db}.{to_name}");
+        if from_path == to_path {
+            return Ok(ResultSet::empty());
+        }
+        self.guard_ddl_table(from)?;
+        self.guard_ddl_table(to)?;
+        // Resolve both ends before touching anything.
+        self.catalog.table_by_path(&from_path)?;
+        if self.catalog.table_by_path(&to_path).is_ok() {
+            return Err(Error::storage(format!("table `{to_path}` already exists")));
+        }
+        if self.ext.views.contains_key(&to_path) {
+            return Err(Error::bind(format!("`{to_path}` is a view; a table cannot shadow it")));
+        }
+        if !crate::persist::store::is_safe_name(&to_name) {
+            return Err(Error::storage(format!(
+                "table name `{to_name}` cannot be a directory name"
+            )));
+        }
+
+        // Everything the old name owns has to be on disk before the parts can
+        // be linked under the new one, and the delta has to be empty because
+        // buffered rows live in neither directory.
+        self.checkpoint()?;
+
+        // Phase 1: the constraints, under *both* names. Published on its own,
+        // so no crash can leave the surviving table without them.
+        let mut moved_meta = false;
+        if let Some(cs) = self.ext.checks.get(&from_path) {
+            let copy: Vec<Check> = cs
+                .iter()
+                .map(|c| Check { name: c.name.clone(), sql: c.sql.clone(), expr: c.expr.clone() })
+                .collect();
+            self.ext.checks.insert(to_path.clone(), copy);
+            moved_meta = true;
+        }
+        if let Some(u) = self.ext.uniques.get(&from_path).cloned() {
+            self.ext.uniques.insert(to_path.clone(), u);
+            moved_meta = true;
+        }
+        if moved_meta {
+            self.persist_ext(&to_db)?;
+            if to_db != from_db {
+                self.persist_ext(&from_db)?;
+            }
+            self.checkpoint()?;
+        }
+
+        // Phase 2: the parts, linked under the new name, with the new
+        // directory's own commit record -- all of it invisible until the
+        // `CATALOG` below names it.
+        if let Some(root) = self.catalog.dir().map(Path::to_path_buf) {
+            let t = self.catalog.table_by_path(&from_path)?;
+            let mut def = t.def.clone();
+            def.name = to_name.clone();
+            let snap = t.snapshot();
+            let dbdir = root.join(&to_db);
+            std::fs::create_dir_all(&dbdir)
+                .map_err(|e| Error::Io(format!("cannot create {}: {e}", dbdir.display())))?;
+            link_table_dir(
+                &root.join(&from_db).join(&from_name),
+                &dbdir.join(&to_name),
+                &def,
+                &snap,
+            )?;
+        }
+
+        // Phase 3: the catalog. `Table` has no public move, so the old entry
+        // is swapped out for a placeholder that is dropped a line later --
+        // this never clones a part.
+        let mut def = self.catalog.table_by_path(&from_path)?.def.clone();
+        def.name = to_name.clone();
+        let empty = crate::storage::Table::new(def.clone(), crate::catalog::DEFAULT_DELTA_LIMIT);
+        let mut moved = std::mem::replace(self.catalog.table_by_path_mut(&from_path)?, empty);
+        moved.def.name = to_name.clone();
+        self.wals.remove(&from_path);
+        self.catalog.drop_table(from, false)?;
+        let mut qualified = def;
+        qualified.name = to_path.clone();
+        self.catalog.create_table(qualified, false)?;
+        *self.catalog.table_by_path_mut(&to_path)? = moved;
+
+        // Phase 4: the old name's constraints go, now that nothing names it.
+        let mut dropped = self.ext.checks.remove(&from_path).is_some();
+        dropped |= self.ext.uniques.remove(&from_path).is_some();
+        if dropped {
+            self.persist_ext(&from_db)?;
+        }
+        Ok(ResultSet::empty())
+    }
+
+    /// `ALTER TABLE t MODIFY COLUMN c <type>`: rewrite the column, or refuse.
+    ///
+    /// Every value is cast up front, and **the first one that does not fit
+    /// fails the whole statement**, naming the row and the value. That is the
+    /// only defensible answer for a schema change: the alternatives are
+    /// storing a saturated or truncated value (silent, permanent data loss) or
+    /// leaving the table half-migrated, and a `MODIFY COLUMN` that half-ran is
+    /// unrecoverable because the old bytes are gone.
+    ///
+    /// The rewrite itself is the same shape as ADD/DROP COLUMN: build a fresh
+    /// table, insert the recast blocks, and swap it in only once every block
+    /// has been converted -- so a failure leaves the original untouched, and
+    /// the checkpoint that follows is what makes the new one durable.
+    fn run_modify_column(
+        &mut self,
+        table: &ObjectName,
+        name: &str,
+        ty: &DataType,
+    ) -> Result<ResultSet> {
+        self.guard_ddl_table(table)?;
+        let path = self.catalog.qualify(table);
+        let t = self.catalog.table_by_path_mut(&path)?;
+        let idx = t.def.schema.require(name)?;
+        if t.def.schema.ty(idx) == ty {
+            return Ok(ResultSet::empty());
+        }
+        // A key column's lane is what the sparse index, the router and the
+        // zone maps are built on, and its physical width is baked into every
+        // part already written. Retyping one would need the index rebuilt in
+        // the same statement; refusing says so.
+        if t.def.order_by.contains(&idx) || t.def.primary_key.contains(&idx) {
+            return Err(Error::unsupported(format!(
+                "cannot MODIFY `{name}`: it is part of `{path}`'s key, and the parts on \
+                 disk are sorted and indexed by its current type. Create a table with the \
+                 type you want and `INSERT ... SELECT` into it"
+            )));
+        }
+        let cols: Vec<usize> = (0..t.def.schema.len()).collect();
+        let blocks = t.scan(&cols)?;
+        let mut def = t.def.clone();
+        def.schema = retyped_schema(&def.schema, idx, ty)?;
+        self.rebind_checks(&path, &def.schema, &format!("MODIFY `{name}`"))?;
+
+        // Cast first, publish second. `Column::cast_to` is per value and
+        // reports the first failure; the row number it is given is the row
+        // within the table, counted across blocks, because that is the number
+        // that lets someone go and look at it.
+        let mut recast = Vec::with_capacity(blocks.len());
+        let mut seen = 0usize;
+        for b in blocks {
+            let rows = b.rows();
+            let mut cs = b.columns;
+            cs[idx] = cast_column(&cs[idx], ty, name, seen)?;
+            recast.push(Block::new(cs)?);
+            seen += rows;
+        }
+        let mut fresh = crate::storage::Table::new(def, crate::catalog::DEFAULT_DELTA_LIMIT);
+        let mut n = 0;
+        for b in recast {
+            n += fresh.insert(b)?;
+        }
+        fresh.flush()?;
+        *self.catalog.table_by_path_mut(&path)? = fresh;
+        Ok(ResultSet::with_affected(n))
+    }
 
     fn run_create_table(&mut self, c: &CreateTable) -> Result<ResultSet> {
         // CREATE TABLE ... AS SELECT takes its schema from the query.
@@ -2308,19 +3580,105 @@ impl Session {
         };
 
         let name = self.catalog.qualify(&c.name);
-        let def = TableDef { name, schema, order_by, primary_key, partition_by, engine: c.engine };
+        // The reverse of the check in `run_create_view`: one namespace, so a
+        // table may not take a name a view already answers to. Without this
+        // the reference resolves to whichever the rewrite looks at first,
+        // which is a wrong answer rather than an error.
+        if self.ext.views.contains_key(&name) {
+            return Err(Error::bind(format!(
+                "`{name}` is a view; a table cannot shadow it (DROP VIEW it first)"
+            )));
+        }
+        let def =
+            TableDef { name, schema, order_by, primary_key, partition_by, engine: c.engine };
+
+        // Both constraint kinds are decided *before* the table exists, so a
+        // declaration this engine cannot enforce leaves nothing behind.
+        let checks = self.bind_checks(&c.checks, &def)?;
+        check_unique_declarations(&c.columns, &def)?;
+
+        let path = self.catalog.qualify(&c.name);
+        if self.catalog.table_by_path(&path).is_ok() {
+            // `IF NOT EXISTS` on an existing table: `create_table` is about to
+            // do nothing, so nothing here may either -- least of all replace
+            // the live table's constraints with this statement's.
+            self.catalog.create_table(def, c.if_not_exists)?;
+            return Ok(ResultSet::empty());
+        }
         self.catalog.create_table(def, c.if_not_exists)?;
+        // A re-created table must not inherit the constraints of the one that
+        // had the name before it: a CREATE TABLE that declares none has
+        // declared none.
+        let mut changed = self.ext.checks.remove(&path).is_some();
+        changed |= self.ext.uniques.remove(&path).is_some();
+        if !checks.is_empty() {
+            self.ext.checks.insert(path.clone(), checks);
+            changed = true;
+        }
+        if let Some(u) = c.columns.iter().find(|c| c.unique) {
+            self.ext.uniques.insert(path.clone(), u.name.clone());
+            changed = true;
+        }
+        if changed {
+            let (db, _) = self.catalog.resolve(&c.name);
+            self.persist_ext(&db)?;
+        }
 
         let mut n = 0;
         if let Some(blocks) = as_blocks {
-            let path = self.catalog.qualify(&c.name);
             for b in blocks {
                 if b.rows() > 0 {
+                    self.enforce_checks(&path, &b)?;
                     n += self.catalog.table_by_path_mut(&path)?.insert(b)?;
                 }
             }
         }
         Ok(if n > 0 { ResultSet::with_affected(n) } else { ResultSet::empty() })
+    }
+
+    /// Bind every declared CHECK against the table being created, and keep the
+    /// ones that bind.
+    ///
+    /// Binding here is what makes a constraint refuse at DDL time rather than
+    /// at the first insert: `CHECK (nosuch > 0)` names a column that does not
+    /// exist, `CHECK (v)` is not a predicate, and `CHECK (count(*) > 0)` is an
+    /// aggregate -- all three are the user's mistake, and all three are far
+    /// cheaper to report now than on a write six months later.
+    fn bind_checks(
+        &self,
+        decls: &[crate::sql::ast::CheckDef],
+        def: &TableDef,
+    ) -> Result<Vec<Check>> {
+        let mut out: Vec<Check> = Vec::with_capacity(decls.len());
+        for (i, d) in decls.iter().enumerate() {
+            let name = match &d.name {
+                Some(n) => n.clone(),
+                None => format!("check_{}", i + 1),
+            };
+            if out.iter().any(|c| c.name.eq_ignore_ascii_case(&name)) {
+                return Err(Error::bind(format!(
+                    "two constraints on `{}` are both named `{name}`",
+                    def.name
+                )));
+            }
+            let bound = Binder::new(&self.catalog)
+                .bind_expr_standalone(&d.expr, &def.schema)
+                .map_err(|e| Error::bind(format!("CHECK `{name}`: {e}")))?;
+            if bound.ty().base() != &DataType::Bool {
+                return Err(Error::bind(format!(
+                    "CHECK `{name}` is {} rather than a condition: write a comparison, \
+                     e.g. `CHECK ({} <> 0)`",
+                    bound.ty(),
+                    d.expr
+                )));
+            }
+            // Stored as text, because that is what the catalog row holds and
+            // what has to survive a restart. Rendered from the AST rather than
+            // sliced out of the statement so that what is stored is exactly
+            // what was bound.
+            out.push(Check { name, sql: d.expr.to_string(), expr: d.expr.clone() });
+        }
+        Ok(out)
     }
 
     /// `ALTER TABLE ... ADD COLUMN`: rebuild with the new column appended.
@@ -2330,6 +3688,7 @@ impl Session {
         col: &ColumnDef,
         if_not_exists: bool,
     ) -> Result<ResultSet> {
+        self.guard_ddl_table(table)?;
         let path = self.catalog.qualify(table);
         let t = self.catalog.table_by_path_mut(&path)?;
         if t.def.schema.index_of(&col.name).is_some() {
@@ -2376,6 +3735,7 @@ impl Session {
         name: &str,
         if_exists: bool,
     ) -> Result<ResultSet> {
+        self.guard_ddl_table(table)?;
         let path = self.catalog.qualify(table);
         let t = self.catalog.table_by_path_mut(&path)?;
         let Some(idx) = t.def.schema.index_of(name) else {
@@ -2394,6 +3754,7 @@ impl Session {
         let blocks = t.scan(&keep)?;
         let mut def = t.def.clone();
         def.schema = def.schema.project(&keep);
+        self.rebind_checks(&path, &def.schema, &format!("drop `{name}`"))?;
         let remap = |i: usize| keep.iter().position(|&k| k == i).unwrap();
         def.order_by = def.order_by.iter().map(|&i| remap(i)).collect();
         def.primary_key = def.primary_key.iter().map(|&i| remap(i)).collect();
@@ -3119,6 +4480,158 @@ fn txn_stmt(span: &[crate::sql::lexer::Spanned]) -> Option<TxnStmt> {
     }
 }
 
+/// A one-row result: a name, then a row of counts. What every operator
+/// statement in this file reports, so they cannot describe themselves in three
+/// different shapes.
+fn report(cols: &[&str], name: Value, counts: &[u64]) -> Result<ResultSet> {
+    let schema = Schema::new(
+        std::iter::once(Field::new(cols[0], DataType::String))
+            .chain(cols[1..].iter().map(|c| Field::new(*c, DataType::UInt64)))
+            .collect(),
+    )?;
+    let row = std::iter::once(name).chain(counts.iter().map(|&n| Value::UInt(n))).collect();
+    ResultSet::from_rows(schema, vec![row])
+}
+
+/// Whether two paths name the same directory.
+///
+/// Canonicalized when both exist, because `./db` and `/abs/db` are the same
+/// place and the refusal this feeds must not be dodgeable by spelling. A path
+/// that cannot be canonicalized has not been created yet, so it cannot be the
+/// open database, and the literal comparison is the right fallback.
+fn same_dir(a: &Path, b: &Path) -> bool {
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => a == b,
+    }
+}
+
+/// [`mentions_txn_keyword`] for the three operator statements, and with the
+/// same reasoning about false positives: `SELECT 'backup'` costs one extra
+/// lex, `admin_stmt` then declines it, and the parser gets it unchanged.
+fn mentions_admin_keyword(sql: &str) -> bool {
+    #[inline]
+    fn starts(hay: &[u8], kw: &[u8]) -> bool {
+        hay.len() >= kw.len() && hay[..kw.len()].eq_ignore_ascii_case(kw)
+    }
+    let b = sql.as_bytes();
+    for (i, &c) in b.iter().enumerate() {
+        let hit = match c | 0x20 {
+            b'b' => starts(&b[i..], b"backup"),
+            b'r' => starts(&b[i..], b"restore"),
+            b'v' => starts(&b[i..], b"verify"),
+            _ => false,
+        };
+        if hit {
+            return true;
+        }
+    }
+    false
+}
+
+/// Does the text contain the word `INFILE`?
+///
+/// The same shape as [`mentions_admin_keyword`] and for the same reason: it
+/// answers "no" for every statement that is not a bulk import, in one pass over
+/// the bytes and with no lexer, so the gate above costs a scan only on a
+/// database that actually has a constraint to protect.
+fn mentions_infile(sql: &str) -> bool {
+    let b = sql.as_bytes();
+    b.iter().enumerate().any(|(i, &c)| {
+        c | 0x20 == b'i' && b.len() - i >= 6 && b[i..i + 6].eq_ignore_ascii_case(b"infile")
+    })
+}
+
+/// Classify one statement's tokens as an operator statement.
+///
+/// `None` hands it to the parser untouched. `Some(Err(..))` is for a head word
+/// that is unambiguously ours with a tail that is not: none of these three can
+/// begin a statement in this dialect, so "BACKUP" followed by anything else is
+/// a mistyped backup and deserves to be told what the syntax is, rather than
+/// the parser's "unexpected token" on a word it has never heard of.
+fn admin_stmt(span: &[crate::sql::lexer::Spanned]) -> Option<Result<Admin>> {
+    use crate::sql::lexer::Token;
+    let head = span[0].tok.bare_word()?;
+    let text = |i: usize| match span.get(i).map(|s| &s.tok) {
+        Some(Token::Str(s)) => Some(s.clone()),
+        _ => None,
+    };
+    let kw = |i: usize, w: &str| span.get(i).is_some_and(|s| s.tok.is_keyword(w));
+    let usage = |what: &str, form: &str| {
+        Some(Err(Error::parse(format!("{what} takes the form `{form}`"), span[0].pos)))
+    };
+
+    if head.eq_ignore_ascii_case("backup") {
+        let Some(to) = kw(1, "to").then(|| text(2)).flatten() else {
+            return usage("BACKUP", "BACKUP TO '<archive>' [INCREMENTAL FROM '<base>']");
+        };
+        return match span.len() {
+            3 => Some(Ok(Admin::Backup { to, base: None })),
+            6 if kw(3, "incremental") && kw(4, "from") => match text(5) {
+                Some(base) => Some(Ok(Admin::Backup { to, base: Some(base) })),
+                None => usage("BACKUP", "BACKUP TO '<archive>' INCREMENTAL FROM '<base>'"),
+            },
+            _ => usage("BACKUP", "BACKUP TO '<archive>' [INCREMENTAL FROM '<base>']"),
+        };
+    }
+    if head.eq_ignore_ascii_case("restore") {
+        let Some(from) = kw(1, "from").then(|| text(2)).flatten() else {
+            return usage("RESTORE", "RESTORE FROM '<archive>' [TO '<directory>']");
+        };
+        return match span.len() {
+            3 => Some(Ok(Admin::Restore { from, to: None })),
+            5 if kw(3, "to") => match text(4) {
+                Some(to) => Some(Ok(Admin::Restore { from, to: Some(to) })),
+                None => usage("RESTORE", "RESTORE FROM '<archive>' TO '<directory>'"),
+            },
+            _ => usage("RESTORE", "RESTORE FROM '<archive>' [TO '<directory>']"),
+        };
+    }
+    if head.eq_ignore_ascii_case("verify") {
+        // Only `VERIFY BACKUP`, so the word stays available for whatever a
+        // later wave wants to verify.
+        if !kw(1, "backup") {
+            return None;
+        }
+        return match (span.len(), text(2)) {
+            (3, Some(archive)) => Some(Ok(Admin::Verify { archive })),
+            _ => usage("VERIFY BACKUP", "VERIFY BACKUP '<archive>'"),
+        };
+    }
+    None
+}
+
+/// The text of each statement in `sql`, when there is more than one.
+///
+/// [`parse`] returns statements with no spans, and the query log wants the
+/// text that was typed rather than a reconstruction from the AST. Only a batch
+/// pays the second lex; a single statement *is* the whole input, which is what
+/// the CLI and every `query`/`execute` call submit. A split that disagrees
+/// with the parse gives up rather than pairing texts with the wrong
+/// statements.
+fn statement_texts(sql: &str, n: usize) -> Option<Vec<&str>> {
+    use crate::sql::lexer::{tokenize, Token};
+    if n < 2 {
+        return None;
+    }
+    let toks = tokenize(sql).ok()?;
+    let mut out = Vec::with_capacity(n);
+    let mut start = 0usize;
+    for i in 0..=toks.len() {
+        if i != toks.len() && toks[i].tok != Token::Semicolon {
+            continue;
+        }
+        let span = &toks[start..i];
+        start = i + 1;
+        if span.is_empty() {
+            continue;
+        }
+        let end = if i == toks.len() { sql.len() } else { toks[i].pos };
+        out.push(sql[span[0].pos..end].trim());
+    }
+    (out.len() == n).then_some(out)
+}
+
 /// What *holding* `b` costs this process, in bytes.
 ///
 /// Deliberately not [`Block::bytes`], on two counts. It walks every string in
@@ -3161,9 +4674,9 @@ fn retained_bytes(b: &Block) -> usize {
 // first, and it is why the catch-alls are wildcards rather than exhaustive
 // matches the compiler would force somebody to extend.
 
-fn has_subquery(q: &crate::sql::ast::Query) -> bool {
-    q.with.iter().any(|c| has_subquery(&c.query))
-        || set_has_subquery(&q.body)
+fn has_subquery(q: &crate::sql::ast::Query, n: Names<'_>) -> bool {
+    q.with.iter().any(|c| has_subquery(&c.query, n))
+        || set_has_subquery(&q.body, n)
         || q.order_by.iter().any(|o| expr_has_subquery(&o.expr))
         || q.limit.iter().chain(q.offset.iter()).any(expr_has_subquery)
         || q.limit_by.as_ref().is_some_and(|(n, keys)| {
@@ -3171,14 +4684,14 @@ fn has_subquery(q: &crate::sql::ast::Query) -> bool {
         })
 }
 
-fn set_has_subquery(s: &crate::sql::ast::SetExpr) -> bool {
+fn set_has_subquery(s: &crate::sql::ast::SetExpr, n: Names<'_>) -> bool {
     use crate::sql::ast::{SelectItem, SetExpr};
     match s {
         SetExpr::Select(sel) => {
             sel.projection.iter().any(|i| match i {
                 SelectItem::Expr { expr, .. } => expr_has_subquery(expr),
                 _ => false,
-            }) || sel.from.as_ref().is_some_and(tableref_has_subquery)
+            }) || sel.from.as_ref().is_some_and(|f| tableref_has_subquery(f, n))
                 || sel
                     .prewhere
                     .iter()
@@ -3187,24 +4700,41 @@ fn set_has_subquery(s: &crate::sql::ast::SetExpr) -> bool {
                     .any(expr_has_subquery)
                 || sel.group_by.iter().any(expr_has_subquery)
         }
-        SetExpr::Query(q) => has_subquery(q),
+        SetExpr::Query(q) => has_subquery(q, n),
         SetExpr::SetOperation { left, right, .. } => {
-            set_has_subquery(left) || set_has_subquery(right)
+            set_has_subquery(left, n) || set_has_subquery(right, n)
         }
         SetExpr::Values(rows) => rows.iter().flatten().any(expr_has_subquery),
     }
 }
 
-fn tableref_has_subquery(t: &crate::sql::ast::TableRef) -> bool {
+fn tableref_has_subquery(t: &crate::sql::ast::TableRef, n: Names<'_>) -> bool {
     use crate::sql::ast::{JoinConstraint, TableRef};
     match t {
-        TableRef::Table { .. } => false,
+        // Not a subquery, but the other thing `rewrite_tableref` turns into
+        // one, and it needs the same owned AST. Deliberately only the two
+        // qualifier compares here and not the full `system::classify`: a
+        // reference to a *real* table in a database called `system` answers
+        // yes and costs a clone the rewrite then declines to use, which is
+        // exactly the trade the rest of this walk already makes.
+        TableRef::Table { name, .. } => {
+            name.qualifier().is_some_and(|q| {
+                q.eq_ignore_ascii_case(crate::system::SYSTEM_DB)
+                    || q.eq_ignore_ascii_case(crate::system::INFO_SCHEMA_DB)
+            })
+            // The third thing `rewrite_tableref` turns into a subquery. This
+            // one *is* an exact test rather than a cheap over-approximation,
+            // because a view's name has no distinguishing qualifier -- and it
+            // costs nothing on a database with no views, where the map is
+            // empty and `Extensions::view` returns before hashing anything.
+            || n.ext.view(name, n.db).is_some()
+        }
         // A derived table is bound, not folded -- but one nested *inside* it
         // is folded, so the walk goes through.
-        TableRef::Subquery { query, .. } => has_subquery(query),
+        TableRef::Subquery { query, .. } => has_subquery(query, n),
         TableRef::Join { left, right, constraint, .. } => {
-            tableref_has_subquery(left)
-                || tableref_has_subquery(right)
+            tableref_has_subquery(left, n)
+                || tableref_has_subquery(right, n)
                 || matches!(constraint, JoinConstraint::On(e) if expr_has_subquery(e))
         }
     }
@@ -3254,15 +4784,24 @@ fn expr_has_subquery(e: &crate::sql::ast::Expr) -> bool {
 }
 
 /// Statements that change the catalog's shape rather than a table's contents.
+///
+/// Every one of them checkpoints on the way out, which is what makes the
+/// constraint and view metadata durable at the same instant as the table it
+/// describes -- see the `Extensions` note. A new DDL statement that is missing
+/// from this list would leave its metadata row in memory only.
 fn is_ddl(s: &Statement) -> bool {
     matches!(
         s,
         Statement::CreateTable(_)
             | Statement::CreateDatabase { .. }
+            | Statement::CreateView { .. }
+            | Statement::DropView { .. }
             | Statement::DropTable { .. }
             | Statement::DropDatabase { .. }
             | Statement::AlterAddColumn { .. }
             | Statement::AlterDropColumn { .. }
+            | Statement::AlterModifyColumn { .. }
+            | Statement::RenameTable { .. }
             | Statement::Truncate { .. }
     )
 }
@@ -3321,6 +4860,10 @@ fn stmt_kind(s: &Statement) -> &'static str {
         Statement::AlterUpdate { .. } => "ALTER TABLE ... UPDATE",
         Statement::AlterAddColumn { .. } => "ALTER TABLE ... ADD COLUMN",
         Statement::AlterDropColumn { .. } => "ALTER TABLE ... DROP COLUMN",
+        Statement::AlterModifyColumn { .. } => "ALTER TABLE ... MODIFY COLUMN",
+        Statement::RenameTable { .. } => "RENAME TABLE",
+        Statement::CreateView { .. } => "CREATE VIEW",
+        Statement::DropView { .. } => "DROP VIEW",
         Statement::ShowDatabases => "SHOW DATABASES",
         Statement::ShowTables { .. } => "SHOW TABLES",
         Statement::ShowCreateTable(_) => "SHOW CREATE TABLE",
@@ -3348,6 +4891,295 @@ fn read_only_err(what: &str) -> Error {
     ))
 }
 
+
+// ------------------------------------------ constraints and views: helpers
+
+/// Accept `UNIQUE` only where this engine can actually enforce it, and say
+/// exactly what is missing where it cannot.
+///
+/// ## What is enforced, and by what
+///
+/// A `UNIQUE` column is enforced **iff it is the table's unique key** --
+/// [`TableDef::pk_col`], i.e. a single-column `PRIMARY KEY` (or a
+/// `ReplacingMergeTree` sort key) whose lane is order-preserving. That is not
+/// a coincidence of implementation: that column, and only that column, has the
+/// MPH index and the keyed delta behind it, so "does this value already exist"
+/// is one probe rather than a scan. `Table::insert_with(KeyConflict::Reject)`
+/// then asks it of the whole batch, against the batch itself and against every
+/// live row, and refuses the statement if the answer is yes.
+///
+/// What that changes is the *meaning* of an insert on a keyed table, which is
+/// why it is opt-in: without `UNIQUE`, a repeated primary key is
+/// last-write-wins (an upsert -- the OLTP path this engine is built around).
+/// With it, a repeated key is an error.
+///
+/// ## What is refused, and why not "accept and scan"
+///
+/// `UNIQUE` on any other column is refused at DDL time. Enforcing it would
+/// mean a full scan of the column per insert -- turning a 33 ns/row write into
+/// a table scan -- or a second index this engine does not have. Both are real
+/// answers; neither is *this* answer, and the one thing that must not happen
+/// is accepting the declaration and enforcing nothing, which is precisely the
+/// silent-acceptance defect four waves of work have been removing. The error
+/// says which column would have to become the key.
+fn check_unique_declarations(cols: &[ColumnDef], def: &TableDef) -> Result<()> {
+    for c in cols.iter().filter(|c| c.unique) {
+        let idx = def.schema.require(&c.name)?;
+        if def.pk_col() == Some(idx) {
+            continue;
+        }
+        let why = if def.primary_key.is_empty() {
+            format!(
+                "`{}` has no PRIMARY KEY. Declare `PRIMARY KEY ({0})` (and put it first \
+                 in ORDER BY) and the constraint is enforced by the key index",
+                c.name
+            )
+        } else if !def.primary_key.contains(&idx) {
+            format!(
+                "the table's key is `{}`, not `{}`. A UNIQUE constraint is enforced here \
+                 only on the unique key itself, which is the one column with an index \
+                 behind it",
+                def.schema.name(def.primary_key[0]),
+                c.name
+            )
+        } else {
+            format!(
+                "`{}` is part of a key this engine cannot index on its own -- a unique \
+                 key must be a single non-nullable, non-string column that leads ORDER BY",
+                c.name
+            )
+        };
+        return Err(Error::unsupported(format!(
+            "UNIQUE on `{}`: not enforceable, so it is refused rather than accepted and \
+             ignored. {why}. Every other column would need a scan per insert or a \
+             secondary index, and neither exists here",
+            c.name
+        )));
+    }
+    Ok(())
+}
+
+/// `db.name` for a possibly-bare object name, against the current database.
+/// The one place the view namespace's key shape is written down.
+fn view_key(name: &ObjectName, db: &str) -> String {
+    match name.qualifier() {
+        Some(q) => format!("{q}.{}", name.last()),
+        None => format!("{db}.{}", name.last()),
+    }
+}
+
+/// The metadata table's columns. Five strings, self-describing on purpose:
+/// `SELECT * FROM _granular_ddl` has to be readable by whoever is looking at a
+/// database they did not create.
+const DDL_COLUMNS: [&str; 5] = ["kind", "object", "name", "scope", "sql"];
+
+/// `_granular_ddl`'s definition. `Log`: it is appended, read whole, and
+/// rewritten whole -- there is nothing to sort by and nothing to index.
+fn ddl_table_def(path: &str) -> Result<TableDef> {
+    Ok(TableDef {
+        name: path.to_string(),
+        schema: Schema::new(
+            DDL_COLUMNS.iter().map(|n| Field::new(*n, DataType::String)).collect(),
+        )?,
+        order_by: Vec::new(),
+        primary_key: Vec::new(),
+        partition_by: None,
+        engine: crate::types::Engine::Log,
+    })
+}
+
+/// Re-parse a stored view body. It went in as the text of one query, so
+/// anything else in the row is corruption rather than a user error.
+fn parse_view_body(sql: &str) -> Result<crate::sql::ast::Query> {
+    match crate::sql::parser::parse_one(sql)? {
+        Statement::Query(q) => Ok(*q),
+        other => Err(Error::corruption(format!(
+            "a view body must be a query, got {}",
+            stmt_kind(&other)
+        ))),
+    }
+}
+
+/// The first row where `c` is FALSE, skipping NULLs.
+///
+/// SQL's rule for a CHECK: only FALSE violates it. One pass over the lane with
+/// no allocation, and the null mask is consulted only for the rows that
+/// already failed -- a column with no nulls never touches it at all.
+fn first_false(c: &Column) -> Option<usize> {
+    let crate::types::ColumnData::U64(v) = &c.data else {
+        // Guarded at declaration: a non-boolean CHECK is refused there, so
+        // reaching this would be a bound expression whose type changed under
+        // us. Report no violation rather than guess at truthiness.
+        return None;
+    };
+    let mut from = 0;
+    while let Some(k) = v[from..].iter().position(|&x| x == 0) {
+        let row = from + k;
+        if !c.is_null(row) {
+            return Some(row);
+        }
+        from = row + 1;
+    }
+    None
+}
+
+/// `column = value, column = value` for one row, for a rejection message.
+///
+/// Long values are cut short: the point is to identify the row, and an error
+/// carrying a 64 KB JSON blob is one nobody can read.
+fn render_row(b: &Block, schema: &Schema, row: usize) -> String {
+    let mut s = String::from("row (");
+    for (i, col) in b.columns.iter().enumerate().take(schema.len()) {
+        if i > 0 {
+            s.push_str(", ");
+        }
+        s.push_str(schema.name(i));
+        s.push('=');
+        let v = col.value(row).to_string();
+        match v.char_indices().nth(40) {
+            Some((cut, _)) => {
+                s.push_str(&v[..cut]);
+                s.push_str("...");
+            }
+            None => s.push_str(&v),
+        }
+    }
+    s.push(')');
+    s
+}
+
+/// `schema` with column `idx` retyped.
+///
+/// The column's `DEFAULT` is re-coerced to the new type rather than carried
+/// across, so `MODIFY COLUMN c UInt8` on a column defaulting to 300 fails here
+/// instead of leaving a default the column can no longer hold.
+fn retyped_schema(schema: &Schema, idx: usize, ty: &DataType) -> Result<Schema> {
+    let mut fields = schema.fields().to_vec();
+    let old = &fields[idx];
+    let mut f = Field::new(old.name.clone(), ty.clone());
+    if let Some(v) = old.default_value() {
+        f = f.with_default_value(v.clone())?;
+    }
+    fields[idx] = f;
+    Schema::new(fields)
+}
+
+/// Cast every value of `c` to `ty`, refusing the first one the new type cannot
+/// hold. `base_row` is the row number of `c`'s first row within the table, so
+/// the message names a row somebody can go and look at.
+///
+/// **Lossy is refused, not accepted.** `Value::cast_to` is the `CAST(...)`
+/// operator's coercion and truncates a float toward zero, which is right for
+/// an expression and wrong for a schema change: `MODIFY COLUMN v Int64` on a
+/// column holding 1.9 would silently store 1 and there would be no way back.
+/// So each value is cast *back* and compared, and anything that does not
+/// survive the round trip fails the statement.
+fn cast_column(c: &Column, ty: &DataType, name: &str, base_row: usize) -> Result<Column> {
+    let n = c.data.len();
+    // The declared type exactly: a `Nullable` source going to a non-nullable
+    // target is not widened back here, it is refused below, row by row.
+    let mut b = ColumnBuilder::with_capacity(ty.clone(), n);
+    for i in 0..n {
+        if c.is_null(i) {
+            if !ty.is_nullable() {
+                return Err(Error::exec(format!(
+                    "cannot MODIFY `{name}` to {ty}: row {} is NULL, and {ty} has no NULL. \
+                     Use `Nullable({ty})`, or delete the row first",
+                    base_row + i
+                )));
+            }
+            b.push_null();
+            continue;
+        }
+        let v = c.value(i);
+        let cast = v.cast_to(ty).map_err(|e| {
+            Error::exec(format!(
+                "cannot MODIFY `{name}` to {ty}: row {} holds {v} ({e})",
+                base_row + i
+            ))
+        })?;
+        if !round_trips(&v, &cast, &c.ty) {
+            return Err(Error::exec(format!(
+                "cannot MODIFY `{name}` to {ty}: row {} holds {v}, which {ty} cannot \
+                 represent exactly (it would become {cast}). Nothing was changed",
+                base_row + i
+            )));
+        }
+        b.push_value(&cast)?;
+    }
+    Ok(b.finish())
+}
+
+/// Does `cast` still mean `original`? Asked by casting back to the old type.
+fn round_trips(original: &Value, cast: &Value, old: &DataType) -> bool {
+    match cast.cast_to(old) {
+        // NaN is never equal to itself, so a float that is still NaN has in
+        // fact survived; every other inequality is a real loss.
+        Ok(back) => {
+            back == *original
+                || matches!((&back, original), (Value::Float(a), Value::Float(b))
+                    if a.is_nan() && b.is_nan())
+        }
+        Err(_) => false,
+    }
+}
+
+/// Publish a table's part files under a second name, without copying them.
+///
+/// `from` and `to` are table directories, and `snap` is the part set the
+/// caller has just checkpointed. Every live part is hard-linked across under
+/// the file name it already has, and a `TABLE` record naming them **in part
+/// order** is committed in `to` -- which leaves `to` a complete, openable
+/// table directory that nothing yet refers to, because the root `CATALOG`
+/// still names only `from`. See [`Session::run_rename_table`] for why that
+/// ordering is the whole atomicity argument.
+///
+/// Part *order* is the thing that must not be lost: newest-part-wins is how a
+/// keyed table resolves a repeated key, so a record that listed the same parts
+/// in a different order would silently resurrect superseded rows. It comes
+/// from `PartSet::origin`, which pairs each live part with the file the last
+/// checkpoint wrote it to -- not from the directory listing, whose sequence
+/// order is allocation order and need not match.
+///
+/// Returns `false` if the parts cannot be linked (any part not yet written, or
+/// the source directory absent), in which case the caller lets the checkpoint
+/// write the new directory from scratch.
+fn link_table_dir(from: &Path, to: &Path, def: &TableDef, snap: &crate::storage::part::Snapshot) -> Result<bool> {
+    use crate::persist::{store, writer};
+    let set = snap.set();
+    let mut names = Vec::with_capacity(snap.len());
+    for i in 0..snap.len() {
+        match set.origin(i) {
+            crate::storage::part::NO_FILE => return Ok(false),
+            seq => names.push(store::part_file_name(seq)),
+        }
+    }
+    if !from.is_dir() || !names.iter().all(|n| from.join(n).exists()) {
+        return Ok(false);
+    }
+    if to.exists() {
+        // An orphan from a rename interrupted before its `CATALOG` was
+        // published. Nothing can be referring to it -- the roster that
+        // survived the crash cannot name it -- so it is ours to replace.
+        std::fs::remove_dir_all(to)
+            .map_err(|e| Error::Io(format!("cannot remove {}: {e}", to.display())))?;
+    }
+    std::fs::create_dir_all(to)
+        .map_err(|e| Error::Io(format!("cannot create {}: {e}", to.display())))?;
+    for n in &names {
+        std::fs::hard_link(from.join(n), to.join(n)).map_err(|e| {
+            Error::Io(format!("cannot link {} into {}: {e}", n, to.display()))
+        })?;
+    }
+    // The log is empty and its records are all inside the parts above: the
+    // caller checkpointed, and a checkpoint truncates.
+    store::commit(
+        &to.join(store::TABLE_FILE),
+        &writer::table_doc(def, &names, crate::persist::format::HEADER_LEN as u64),
+    )?;
+    store::sync_dir(to)?;
+    Ok(true)
+}
 
 /// String literals in VALUES adopt the column's type, so
 /// `INSERT INTO t VALUES ('2024-01-01')` into a Date column works.
@@ -3406,15 +5238,37 @@ fn resolve_key_exprs(
     Ok(out)
 }
 
-fn render_create_table(schema: &Schema, def: &TableDef) -> String {
-    let cols: Vec<String> = schema
+/// `checks` and `unique` are the table's constraints, which live beside the
+/// `TableDef` rather than in it. They are printed for the same reason the
+/// `PRIMARY KEY` is: this output is what somebody pastes into a migration, and
+/// DDL that silently dropped a constraint would produce a table that accepts
+/// writes the original refuses.
+fn render_create_table(
+    schema: &Schema,
+    def: &TableDef,
+    checks: &[Check],
+    unique: Option<&str>,
+) -> String {
+    let mut cols: Vec<String> = schema
         .fields()
         .iter()
-        .map(|f| match f.default_sql() {
-            Some(d) => format!("    `{}` {} DEFAULT {d}", f.name, f.ty),
-            None => format!("    `{}` {}", f.name, f.ty),
+        .map(|f| {
+            let u = if unique.is_some_and(|u| u.eq_ignore_ascii_case(&f.name)) {
+                " UNIQUE"
+            } else {
+                ""
+            };
+            match f.default_sql() {
+                Some(d) => format!("    `{}` {}{u} DEFAULT {d}", f.name, f.ty),
+                None => format!("    `{}` {}{u}", f.name, f.ty),
+            }
         })
         .collect();
+    cols.extend(
+        checks
+            .iter()
+            .map(|c| format!("    CONSTRAINT `{}` CHECK ({})", c.name, c.sql)),
+    );
     let key = |idx: &[usize]| -> String {
         idx.iter()
             .map(|&i| format!("`{}`", schema.name(i)))
@@ -3461,6 +5315,8 @@ mod tests {
     /// spot-checks -- they exist to prove the detector is not `|| true`.
     #[test]
     fn every_position_the_folder_rewrites_is_a_position_the_detector_looks_in() {
+        let empty = Extensions::default();
+        let names = Names { ext: &empty, db: crate::catalog::DEFAULT_DATABASE };
         let with = [
             "SELECT (SELECT max(id) FROM t) FROM t",
             "SELECT * FROM t WHERE id IN (SELECT id FROM t)",
@@ -3483,7 +5339,7 @@ mod tests {
         for sql in with {
             let stmts = parse(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
             let Statement::Query(q) = &stmts[0] else { panic!("{sql}: not a query") };
-            assert!(has_subquery(q), "missed the subquery in `{sql}`");
+            assert!(has_subquery(q, names), "missed the subquery in `{sql}`");
         }
         for sql in [
             "SELECT id, v FROM t WHERE id = 1",
@@ -3493,7 +5349,7 @@ mod tests {
         ] {
             let stmts = parse(sql).unwrap();
             let Statement::Query(q) = &stmts[0] else { panic!("{sql}: not a query") };
-            assert!(!has_subquery(q), "`{sql}` has no subquery to fold");
+            assert!(!has_subquery(q, names), "`{sql}` has no subquery to fold");
         }
     }
 

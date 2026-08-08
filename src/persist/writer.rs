@@ -35,7 +35,7 @@ use std::path::Path;
 
 use crate::common::{Error, Result};
 use crate::storage::granule::PkIndexParts;
-use crate::storage::part::Deletes;
+use crate::storage::part::{self, Deletes};
 use crate::storage::{Granule, PackedColumn, Part, Table};
 use crate::types::{Block, ColumnData, TableDef};
 
@@ -226,13 +226,49 @@ fn put_opt_index(w: &mut Writer, v: Option<usize>) {
 // tables
 // ---------------------------------------------------------------------------
 
-/// Write every part of `table` into `dir/<table name>/` and commit them.
+/// Write the parts of `table` that are not already on disk into
+/// `dir/<table name>/` and commit them.
 ///
 /// `dir` is the *database* directory; the table gets a subdirectory of its
-/// own. Parts are written under freshly allocated sequence numbers, the
-/// `TABLE` file is committed last, and only then are the superseded files
-/// removed -- so the table is readable and consistent at every instant, and a
-/// crash at any point leaves the previous commit intact.
+/// own. New parts are written under freshly allocated sequence numbers, the
+/// `TABLE` file is committed last, and only then are the files no longer named
+/// by it removed -- so the table is readable and consistent at every instant,
+/// and a crash at any point leaves the previous commit intact.
+///
+/// ## Incremental, and why that does not weaken the commit
+///
+/// A part whose bytes are already in a file keeps that file, its sequence
+/// number and its inode: it is not read, not rewritten and not renamed. That
+/// is the difference between a checkpoint costing O(entire database) and
+/// O(what changed) -- before this, a `SELECT 1` against a 100 GB database
+/// rewrote 100 GB on exit, needed 100 GB free to do it, and gave every part a
+/// new name so no filesystem snapshot could ever be a valid backup.
+///
+/// The protocol is unchanged in every respect that makes it safe:
+///
+///   * a part file is still written to a temp name, fsynced, renamed and the
+///     directory fsynced ([`store::atomic_write`]);
+///   * sequence numbers are still allocated strictly above everything present,
+///     so a write can never land on a file the current commit refers to;
+///   * the `TABLE` file is still the single commit point, written after every
+///     part it names is durable;
+///   * files are still unlinked only after that commit, and only ones the new
+///     commit does not name -- which now includes leaving the reused ones
+///     alone, and still collects orphans from a crashed earlier attempt.
+///
+/// The one new claim is `PartSet::origin`: "part `i` is already in file
+/// `seq`". It is not trusted on its word. Every reuse is checked against the
+/// directory listing taken at the top of this function, so the worst a stale
+/// origin can cost is a rewrite we did not need -- never a commit record
+/// naming a file that is not there. Two consequences of that check are worth
+/// stating, because they are what keep a reused name unambiguous:
+///
+///   * a name can only be reused if it is present, and allocation starts above
+///     every present sequence number, so this commit can never hand the same
+///     name to two different parts;
+///   * a duplicate origin (which would make two entries name one file, and so
+///     duplicate rows on reload) is refused the same way -- `taken` lets each
+///     file be claimed once, and the loser is rewritten.
 pub fn write_table(dir: &Path, table: &Table) -> Result<()> {
     if !store::is_safe_name(&table.def.name) {
         return Err(crate::common::Error::storage(format!(
@@ -244,20 +280,45 @@ pub fn write_table(dir: &Path, table: &Table) -> Result<()> {
     std::fs::create_dir_all(&tdir)
         .map_err(|e| store::io_err("create directory", &tdir, e))?;
 
-    let superseded = store::list_part_files(&tdir)?;
+    let on_disk = store::list_part_files(&tdir)?;
     // Above every sequence number already on disk, so a new part can never
-    // land on a file the current commit still refers to.
-    let first = superseded.iter().map(|(s, _)| s + 1).max().unwrap_or(1);
+    // land on a file the current commit still refers to -- including the ones
+    // this commit is about to reuse.
+    let mut next = on_disk.last().map_or(1, |&(s, _)| s + 1);
+    let mut taken = vec![false; on_disk.len()];
 
     // One snapshot for the whole commit: the parts and the delete masks that
     // reach disk must be the same generation, or a restart would resurrect
     // rows a later generation had already tombstoned.
     let snap = table.snapshot();
+    let set = snap.set();
     let mut names = Vec::with_capacity(snap.len());
-    for (seq, (i, p)) in (first..).zip(snap.parts().iter().enumerate()) {
-        let name = store::part_file_name(seq);
-        write_part_with(&tdir.join(&name), p, snap.deletes(i))?;
-        names.push(name);
+    for (i, p) in snap.parts().iter().enumerate() {
+        // `on_disk` is sorted by sequence number, so this is a binary search
+        // over the *files*, of which there are hundreds at most -- against a
+        // part write of megabytes, it does not exist.
+        let claim = match set.origin(i) {
+            part::NO_FILE => None,
+            seq => match on_disk.binary_search_by_key(&seq, |&(s, _)| s) {
+                Ok(k) if !taken[k] => {
+                    taken[k] = true;
+                    Some(k)
+                }
+                _ => None,
+            },
+        };
+        match claim {
+            Some(k) => names.push(on_disk[k].1.clone()),
+            None => {
+                let name = store::part_file_name(next);
+                write_part_with(&tdir.join(&name), p, set.deletes(i))?;
+                // Only now, with the bytes fsynced and the rename durable, is
+                // the claim this records actually true.
+                set.set_origin(i, next);
+                names.push(name);
+                next += 1;
+            }
+        }
     }
 
     // Everything already in the log is now inside the parts above.
@@ -265,13 +326,15 @@ pub fn write_table(dir: &Path, table: &Table) -> Result<()> {
         .map(|m| m.len())
         .unwrap_or(format::HEADER_LEN as u64);
 
-    store::atomic_write(
+    store::commit(
         &tdir.join(store::TABLE_FILE),
         &table_doc(&table.def, &names, wal_len),
     )?;
 
-    for (_, old) in superseded {
-        let _ = std::fs::remove_file(tdir.join(old));
+    for (k, (_, old)) in on_disk.iter().enumerate() {
+        if !taken[k] {
+            let _ = std::fs::remove_file(tdir.join(old));
+        }
     }
     Ok(())
 }
@@ -493,6 +556,70 @@ mod tests {
         let files = store::list_part_files(&tdir).unwrap();
         assert_eq!(files.len(), 1, "superseded parts must be collected: {files:?}");
         assert_eq!(files[0].0, 4, "sequence numbers are never reused");
+    }
+
+    /// The keystone, at the unit: a second commit of an unchanged table
+    /// touches no part file at all.
+    #[test]
+    fn an_unchanged_part_keeps_its_file() {
+        let s = Scratch::new("wt-incremental");
+        let t = sample_table("t", &[600, 400]);
+        write_table(s.path(), &t).unwrap();
+        let tdir = s.join("t");
+        let first = store::list_part_files(&tdir).unwrap();
+        let bytes: Vec<Vec<u8>> =
+            first.iter().map(|(_, n)| std::fs::read(tdir.join(n)).unwrap()).collect();
+
+        write_table(s.path(), &t).unwrap();
+        assert_eq!(store::list_part_files(&tdir).unwrap(), first, "a part was renumbered");
+        for ((_, n), was) in first.iter().zip(&bytes) {
+            assert_eq!(&std::fs::read(tdir.join(n)).unwrap(), was, "{n} was rewritten");
+        }
+    }
+
+    /// A part whose file has gone missing behind our back must be *written*,
+    /// never merely named. This is the guard that keeps a stale provenance a
+    /// performance problem instead of a commit record pointing at nothing --
+    /// the one failure this mechanism could introduce that loses data.
+    #[test]
+    fn a_part_whose_file_vanished_is_rewritten_not_named() {
+        let s = Scratch::new("wt-vanished");
+        let t = sample_table("t", &[600, 400]);
+        write_table(s.path(), &t).unwrap();
+        let tdir = s.join("t");
+        let files = store::list_part_files(&tdir).unwrap();
+        std::fs::remove_file(tdir.join(&files[0].1)).unwrap();
+
+        write_table(s.path(), &t).unwrap();
+        let img = reader::read_table_image(&tdir).unwrap();
+        assert_eq!(img.parts.len(), 2, "the commit lost a part");
+        for n in &img.part_files {
+            assert!(tdir.join(n).exists(), "the commit names {n}, which is not there");
+        }
+        assert_eq!(img.parts.iter().map(|p| p.n_rows).sum::<usize>(), 1_000);
+    }
+
+    /// Two parts claiming one file would make a commit record name it twice,
+    /// and the reload would duplicate every row in it. The claim is
+    /// first-come, and the loser is written out.
+    #[test]
+    fn two_parts_cannot_claim_the_same_file() {
+        let s = Scratch::new("wt-dup-origin");
+        let tdir = s.join("t");
+        std::fs::create_dir_all(&tdir).unwrap();
+        // The file both parts will point at, holding the first one's bytes.
+        write_part(&tdir.join(store::part_file_name(1)), &sample_part(600)).unwrap();
+
+        let (mut a, mut b) = (sample_part(600), sample_part(400));
+        a.set_origin(1);
+        b.set_origin(1);
+        let t = Table::from_parts(table_def("t"), vec![a, b], 1 << 20);
+        write_table(s.path(), &t).unwrap();
+
+        let img = reader::read_table_image(&tdir).unwrap();
+        assert_eq!(img.part_files.len(), 2);
+        assert_ne!(img.part_files[0], img.part_files[1], "one file was committed twice");
+        assert_eq!(img.parts.iter().map(|p| p.n_rows).sum::<usize>(), 1_000);
     }
 
     #[test]

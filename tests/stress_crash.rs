@@ -697,8 +697,26 @@ fn single_table_transaction_is_all_or_nothing() {
         let dir = Scratch::new("txn");
         setup(&dir, T_DDL);
         let script = write_script(&dir, "w.sql", &body);
-        let at = base.mul_f64(0.05 + rng.frac() * 1.1);
-        killed += kill_after(spawn(&dir, &script), at) as u64;
+        // The delay is a fraction of a baseline timed ONCE, before the page
+        // cache and the filesystem were warm -- so later children run faster
+        // than the baseline predicts and the kill lands after they have already
+        // exited. Halve and retry when that happens, so the window gets
+        // exercised on a fast machine instead of the test quietly measuring
+        // nothing. Bounded, because a child that is genuinely instant should
+        // fail the `killed > 0` assertion rather than loop.
+        let mut at = base.mul_f64(0.05 + rng.frac() * 1.1);
+        let mut hit = kill_after(spawn(&dir, &script), at);
+        for _ in 0..6 {
+            if hit {
+                break;
+            }
+            at /= 2;
+            let dir2 = Scratch::new("txn-retry");
+            setup(&dir2, T_DDL);
+            let script2 = write_script(&dir2, "w.sql", &body);
+            hit = kill_after(spawn(&dir2, &script2), at);
+        }
+        killed += hit as u64;
         let ids = recovered(&dir, "t")
             .unwrap_or_else(|e| panic!("trial {trial} (kill at {at:?}): reopen failed: {e}"));
         assert_prefix(&ids, TXNS * ROWS, 0, &format!("trial {trial}, kill at {at:?}"));
@@ -713,26 +731,27 @@ fn single_table_transaction_is_all_or_nothing() {
     assert!(killed > 0, "every trial finished before its kill");
 }
 
-/// **Known limitation, documented here rather than left as folklore.**
+/// A crash inside a `COMMIT` over twelve tables commits all of them or none.
 ///
-/// The log is per table, and `commit_durable` walks the enlisted tables
-/// appending a commit marker and fsyncing each one in turn. A crash between
-/// two of those fsyncs releases the staging groups of the tables already
-/// walked and drops the rest -- so a transaction over `T` tables can commit a
-/// **prefix** of itself.
+/// **This assertion is inverted from the one that used to be here**, and the
+/// old one is worth remembering: the log is per table, and `commit_durable`
+/// walked the enlisted tables appending a commit marker and fsyncing each in
+/// turn, so a crash between two of those fsyncs released the staging groups of
+/// the tables already walked and dropped the rest -- a transaction committing
+/// a **prefix** of itself, at a 100% reproduction rate, which is what the test
+/// pinned. `commit_durable` is a two-phase commit now: every table but the
+/// last logs a prepare citing the last one's decision, and that decision is
+/// the transaction's only commit point. See `Wal::prepare`.
 ///
-/// The trigger needs no timing at all. Every table's log is the same size
-/// after the staged inserts, and the markers go down in enlistment order, so
-/// "the first table's log has grown and the last one's has not" is exactly the
-/// mid-commit state, and it holds for as long as the remaining fsyncs take.
-/// The reproduction rate is 100%.
-///
-/// This test asserts the **current** behaviour. When the two-phase commit that
-/// fixes it lands, this test fails, and the assertion below is the one to
-/// invert: `first == PER && last == 0` becomes `first == last`.
+/// The trigger is unchanged and still needs no timing. Every table's log is
+/// the same size after the staged inserts, and the markers go down in
+/// enlistment order, so "the first table's log has grown and the last one's
+/// has not" is exactly the mid-commit state -- which is now the window in
+/// which the transaction is *prepared and undecided*, and a kill there must
+/// leave every table agreeing.
 #[test]
-fn multi_table_transaction_commits_a_prefix_on_crash() {
-    seed("multi_table_transaction_commits_a_prefix_on_crash");
+fn a_crash_inside_a_multi_table_commit_is_all_or_nothing() {
+    seed("a_crash_inside_a_multi_table_commit_is_all_or_nothing");
     const TABLES: usize = 12;
     // Big enough that each per-table fsync at commit is milliseconds, which is
     // what makes the mid-commit state observable from another process.
@@ -792,19 +811,18 @@ fn multi_table_transaction_commits_a_prefix_on_crash() {
     assert_eq!(counts.len(), TABLES);
     eprintln!("  per-table row counts after a crash inside COMMIT: {counts:?}");
 
-    // The bug, stated as an assertion so the fix has a target: the first table
-    // committed and the last did not, out of one transaction.
-    assert_eq!(counts[0], PER, "table 0 did not commit; the trigger fired too early");
-    assert_eq!(
-        *counts.last().unwrap(),
-        0,
-        "the last table committed too -- if this now holds for every trial, the per-table \
-         commit has been replaced and this test should be inverted to `counts[0] == \
-         *counts.last().unwrap()`"
+    // The guarantee, where the bug used to be asserted. Either answer is
+    // correct at this instant -- the transaction is entitled to be lost right
+    // up until its decision is fsynced, and entitled to be present from then
+    // on -- but the twelve tables have to give the *same* one.
+    assert!(
+        counts.iter().all(|&c| c == counts[0]),
+        "a transaction over {TABLES} tables committed a PREFIX of itself: {counts:?}"
     );
     assert!(
-        counts.iter().any(|&c| c != counts[0]),
-        "KNOWN LIMITATION no longer reproduces: the transaction was atomic across tables"
+        counts[0] == 0 || counts[0] == PER,
+        "every table holds {} rows, expected 0 (rolled back) or {PER} (committed)",
+        counts[0]
     );
 }
 
@@ -1127,15 +1145,16 @@ fn a_read_only_query_on_a_full_disk() {
         .unwrap_or_else(|e| panic!("a read-only query on a full disk destroyed the directory: {e}"));
     assert_eq!(ids.len(), 2000, "a read-only query lost rows on a full disk");
 
-    // **The defect, asserted so it has a target.** Nothing in `SELECT
-    // count()` needs to write, but `main.rs` runs `session.checkpoint()`
-    // unconditionally before exiting, so a query that reads rewrites every
-    // part -- and on a volume with no room, a pure read fails. Give the shell
-    // a read-only mode (or make the exit checkpoint conditional on the session
-    // having written) and this assertion becomes `codes == [Some(0); 3]`.
+    // **The defect, fixed, and this is the inversion.** Nothing in
+    // `SELECT count()` needs to write, but the exit checkpoint used to rewrite
+    // every part unconditionally, so a pure read failed on a volume with no
+    // room -- the instance wedged permanently, including for queries that only
+    // wanted to look at it. Checkpoint is incremental now: a part that has not
+    // changed keeps its file, its inode and its bytes, so a read-only session
+    // writes nothing and needs no space.
     assert!(
-        codes.iter().all(|c| *c == Some(1)),
-        "a read-only query no longer fails on a full disk (exits {codes:?}) -- if the exit \
-         checkpoint has been made conditional, invert this assertion to `Some(0)`"
+        codes.iter().all(|c| *c == Some(0)),
+        "a read-only query failed on a full disk (exits {codes:?}) -- the exit checkpoint \
+         is writing when the session never wrote"
     );
 }
