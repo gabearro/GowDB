@@ -7,6 +7,46 @@
 //! shape that lets a filter compile to a branchless compare over `&[i64]`
 //! instead of an interpreter step per tuple.
 //!
+//! ## Where a `SELECT`'s time actually goes
+//!
+//! `Table::scan_fold` and this pipeline read the same parts, and the same work
+//! through the two doors used to differ by 8x. That gap is not one thing, and
+//! guessing at it produced two wrong answers before it was taken apart. The
+//! decomposition below is one process, 2M rows, best-of-15, every stage driven
+//! **serially on one thread** so thread scheduling cannot colour it:
+//!
+//! ```text
+//!   storage: scan_each of one Int64 column, body counts rows   1.62 ms
+//!   Scan operator, same column, same snapshot                  3.84 ms   2.4x
+//!   Scan operator, empty projection (the count(*) shape)       0.04 ms
+//!   Scan + Project, one bare column reference                 +1.36 ms  <- was here
+//!   Scan + Filter, predicate that keeps every row             +3.16 ms
+//!   Scan + Filter, predicate that keeps half                  +4.51 ms
+//!   parse + bind + optimize + lower, per query                 0.006-0.06 ms
+//!   build the operator tree (serial or exchange), per query     0.001-0.01 ms
+//! ```
+//!
+//! Four things fall out of that, and they are worth more than the ratio was:
+//!
+//!   * **Planning and building are free.** Under 1% of every query measured,
+//!     including the 1.3 ms ones. Nobody needs to cache a plan.
+//!   * **The per-block machinery is free.** An empty-projection scan moves 2M
+//!     rows in 40 us; that is 244 `Box<dyn Operator>` dispatches, 244
+//!     `QueryContext::check`s and 244 blocks built and dropped. The relaxed
+//!     atomic per block really is unmeasurable, as the note below claims.
+//!   * **`Scan` costs 2.4x the storage decode it wraps**, and that is per
+//!     *granule*, not per block: it decodes each granule into a fresh `Block`
+//!     and then `extend`s it into an accumulator, so every value is written
+//!     twice and every column allocates once per 1024 rows. `ScanScratch`
+//!     next door decodes straight into a reused, L1-sized batch. That is the
+//!     single largest remaining item and it lives in `scan.rs`/`exchange.rs`.
+//!   * **Predicate evaluation costs more than the scan under it**, for the
+//!     reason recorded in [`filter`]: `expr` materializes four full buffers per
+//!     block to answer `col > lit`.
+//!
+//! The `+1.36 ms` line is the one this file could reach, and it is gone; see
+//! [`project`].
+//!
 //! ## Where the decisions are, and are not
 //!
 //! There are none in this file. [`build`] lowers the logical plan through
@@ -387,6 +427,7 @@ pub fn build_physical<'a>(
     Ok(match plan {
         PhysicalPlan::Scan(s) => Box::new(scan::Scan::new(s, catalog)?),
         PhysicalPlan::IndexLookup(path) => Box::new(scan::IndexLookup::new(*path, catalog)?),
+        PhysicalPlan::MetaAggregate(path) => Box::new(scan::MetaAggregate::new(*path, catalog)?),
         PhysicalPlan::Filter { input, predicate } => {
             Box::new(filter::Filter::new(build_physical(*input, catalog, ctx)?, predicate))
         }
@@ -597,23 +638,48 @@ pub fn row_key(cols: &[crate::types::Column], row: usize) -> GroupKey {
 /// is also where the cancel/deadline checkpoint has to live: `guard` is
 /// consulted once per block and charged the running size of the accumulator,
 /// which is exactly the thing that grows without bound here.
+///
+/// The running size is **summed as blocks arrive** rather than re-measured off
+/// the accumulator, and that is not a micro-optimization: `Block::bytes` is
+/// O(1) for a fixed-width column but O(rows) for a string one, because it walks
+/// the `Vec<Arc<str>>` adding lengths. Asking a *growing* accumulator its size
+/// once per block therefore made this loop quadratic in the input -- 244 blocks
+/// over 2M rows re-walk 245M entries -- on any plan carrying a string.
+///
+/// Measured with a temporary switch alternating old and new in one loop,
+/// best-of-15 per side, over 2M rows through the one shape that reaches
+/// `drain` (a `Sort` with no keys, i.e. `LIMIT k` in input order):
+///
+/// ```text
+///   String column   104.2 -> 40.6 ms   2.57x   (2.57-2.95x over 3 runs)
+///   Int64 column      5.63 ->  5.59 ms  1.01x   <- control, bytes() was already O(1)
+/// ```
+///
+/// The two sums are not bit-identical: `a.extend(&b)` may widen the
+/// accumulator's null bitmap past the sum of the blocks' own, so this can
+/// under-count by a bit per row (1/64 of a fixed-width column, 1/512 of a
+/// 64-byte string). `grow_to` feeds a *budget estimate* that already ignores
+/// `Vec` slack in the other direction, and no answer depends on it -- only how
+/// early a starved query is told no.
 pub(crate) fn drain(
     op: &mut Box<dyn Operator + '_>,
     ctx: &QueryContext,
     guard: &mut MemGuard,
 ) -> Result<Block> {
     let mut acc: Option<Block> = None;
+    let mut bytes = 0usize;
     loop {
         ctx.check()?;
         let Some(b) = op.next()? else { break };
         if b.rows() == 0 {
             continue;
         }
+        bytes += b.bytes();
         match &mut acc {
             None => acc = Some(b),
             Some(a) => a.extend(&b)?,
         }
-        guard.grow_to(acc.as_ref().map_or(0, |a| a.bytes()))?;
+        guard.grow_to(bytes)?;
     }
     Ok(match acc {
         Some(a) => a,
@@ -1143,12 +1209,22 @@ mod tests {
             assert!(build(&plan, &cat, &QueryContext::new()).is_err());
         }
 
-        /// A `GROUP BY id` / bare `count()` pair over the same scan, so the two
+        /// A `GROUP BY id` / bare aggregate pair over the same scan, so the two
         /// halves of the budget story below differ in exactly one thing:
         /// whether there is a key to partition the overflow by.
+        ///
+        /// `uniqExact(id)` rather than `count()`, and the difference is the
+        /// whole reason the argument is spelled out: a bare unfiltered
+        /// `count()` is answered from part metadata (`physical::meta_path`),
+        /// so it never builds an accumulator, never charges the tracker and
+        /// can no longer be starved -- it would silently stop testing the half
+        /// it is here for. `uniqExact` over 20k distinct ids is the same
+        /// one-group shape and answers 20 000 all the same; plain `uniq` is
+        /// an HLL sketch and answers 19 881.
         fn agg_plan(cat: &Catalog, group: Vec<BoundExpr>) -> LogicalPlan {
-            let count = functions::aggregate("count").unwrap();
-            let ty = (count.ret)(&[], &[]).unwrap();
+            let uniq = functions::aggregate("uniqExact").unwrap();
+            let arg = col(0, DataType::UInt64);
+            let ty = (uniq.ret)(&[DataType::UInt64], &[]).unwrap();
             // `[id, n]` with a grouping key, `[n]` without.
             let mut fields: Vec<Field> =
                 group.iter().map(|_| Field::new("id", DataType::UInt64)).collect();
@@ -1157,8 +1233,8 @@ mod tests {
                 input: Box::new(LogicalPlan::Scan(Box::new(scan(cat, vec![0])))),
                 group,
                 aggs: vec![BoundAgg {
-                    func: count,
-                    args: vec![],
+                    func: uniq,
+                    args: vec![arg],
                     params: vec![],
                     distinct: false,
                     ty,

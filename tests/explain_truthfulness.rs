@@ -133,7 +133,11 @@ fn every_parallel_shape_says_so_and_no_serial_shape_does() {
     // The shapes `exchange::analyze` admits: an aggregate or a sort over a
     // chain of filters and projections.
     for q in [
-        "SELECT count(*) FROM t",
+        // `count(*)` alone is no longer here: `physical::meta_path` answers a
+        // bare count from part metadata, so there is nothing left to spread
+        // and the honest plan has no `Exchange` in it. Paired with a `sum` it
+        // is a parallel aggregate again, which is what this line is testing.
+        "SELECT count(*), sum(v) FROM t",
         "SELECT sum(v) FROM t WHERE k = 3",
         "SELECT k, count(*), sum(v) FROM t GROUP BY k",
         "SELECT id FROM t ORDER BY v DESC LIMIT 5",
@@ -185,7 +189,10 @@ fn the_threshold_is_where_it_is_documented_to_be() {
     while lo + 1 < hi {
         let mid = (lo + hi) / 2;
         let mut s = session(mid);
-        if pipeline(&mut s, "SELECT count(*) FROM t").contains("Exchange") {
+        // Not a bare `count(*)`: that is answered from part metadata at every
+        // size, so it is serial on both sides of the threshold and the bisect
+        // below would never converge on one.
+        if pipeline(&mut s, "SELECT sum(v) FROM t").contains("Exchange") {
             hi = mid;
         } else {
             lo = mid;

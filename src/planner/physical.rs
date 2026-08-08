@@ -6,7 +6,7 @@
 //! was a 1:1 structural mapping from [`LogicalPlan`] to operators, with no
 //! place to put a decision even if one had been obvious.
 //!
-//! Three decisions live here today.
+//! Four decisions live here today.
 //!
 //! ## 1. Index selection
 //!
@@ -103,6 +103,93 @@
 //! now does strictly *less* work than it did -- `try_build` used to re-run the
 //! shape match at every one of the plan's nodes, including the leaves.
 //!
+//! ## 4. Answering from metadata
+//!
+//! `SELECT count() FROM t` used to read every row of `t` to find out how many
+//! there were: 1.29 ms and 1555 M rows/s on 2M rows, a *throughput* number for
+//! a question with no rows in the answer. But a part already records how many
+//! rows each granule holds and a `PartSet` already tracks its tombstones
+//! separately, so an unfiltered count is a fold over metadata --
+//! `Σ n_rows - deleted`, one term per part, independent of the table's size.
+//! The same is true of `min`/`max`: the zone maps that prune granules are
+//! per-granule `(min, max)` pairs, and the extreme of the table is the extreme
+//! of those pairs.
+//!
+//! [`MetaPath`] is that decision, and [`MetaAggregate`] runs it. Both
+//! variants were built into **one** binary behind a temporary switch and
+//! interleaved in a single loop, the sides alternating which ran first,
+//! best-of-N per side over 5-15 rounds; 2M rows / 1954 granules, 14 cores, on
+//! a loaded machine. Two independent sessions, reported as a range where they
+//! disagree:
+//!
+//! ```text
+//!                                            scanned      folded    speedup
+//!   count()                              2.18-2.41 ms   5.8-6.5 us   338-420x
+//!   min(bytes), max(bytes)               4.37-4.92 ms    60-64 us     68-82x
+//!   min(country), max(country)           9.80-14.2 ms   193-215 us    46-74x
+//!   count() WHERE ts >= <50% cut>        1.40-1.41 ms    43-44 us        32x
+//!   count() WHERE ts >= <90% cut>          353-433 us    37-50 us    8.7-9.6x
+//!   count() WHERE ts < <1% cut>            109-113 us    35-37 us       3.1x
+//!   count() WHERE ts BETWEEN <1000 rows>  53.9-58.4 us    46-55 us   1.1-1.2x
+//!   count(), table carrying tombstones   2.76-2.88 ms  1.53-1.66 ms  1.7-1.8x
+//!   count() inside an open transaction   1.57-1.93 ms   5.1-6.5 us   296-309x
+//! ```
+//!
+//! And the shapes this must *not* move, measured the same way: an undecidable
+//! predicate (`latency > 500`, refused) 1.0-1.1x, a predicate no zone test can
+//! express (`user_id % 7 = 0`, refused) 0.9-1.2x, `sum(bytes)` 1.1x, `GROUP BY
+//! country` 1.1x, `max(bytes)` on a table with tombstones (refused) 1.1x.
+//! Nothing moves, which is the required result rather than an afterthought.
+//!
+//! The claim is really the scaling, not the ratio: 2M / 4M / 8M rows fold in
+//! 5.8 / 5.8 / 5.2 us while the scan they replace takes 2.47 / 4.26 / 10.99 ms.
+//! `min`/`max` is linear in the *granule* count rather than the row count
+//! (1954 zone maps to fold, not 2M values to decode), which is the 1024x
+//! reduction the granule size buys; a string column pays three times as much
+//! because every bound is decoded through that granule's own dictionary.
+//!
+//! ### Why a filtered count is the general case
+//!
+//! A granule whose zone map proves that *every* row matches the predicate
+//! contributes its live row count without being decoded; one that proves *no*
+//! row matches contributes zero; only the granules that straddle the boundary
+//! -- at most one per conjunct on a clustered column -- have to be read. An
+//! unfiltered count is just the case where every granule is covered.
+//!
+//! "Every row matches `P`" is not a new kind of reasoning and deliberately is
+//! not implemented as one: it is "**no** row matches `¬P`", tested by the same
+//! [`ZoneFilter::may_match`] the scan already prunes with. That matters,
+//! because pruning is already load-bearing for correctness -- a `may_match`
+//! that answered "no" while a matching row existed would drop rows from every
+//! query in the engine -- so the covering test inherits exactly the trust the
+//! engine already places in it, instead of introducing a second comparison
+//! that could disagree with the evaluator. The one extra condition is NULLs:
+//! three-valued logic means a NULL row satisfies neither `P` nor `¬P`, so a
+//! granule is only *covered* if the predicate's column has no NULL in it.
+//!
+//! ### What is refused, and why
+//!
+//! * **`min`/`max` on a table with any tombstone.** A granule's `(min, max)`
+//!   bounds the rows it was *built* from, and deleting the row that held the
+//!   minimum does not narrow them -- so the fold would answer with a value
+//!   that is no longer in the table. Approximate is wrong, so the shortcut is
+//!   refused and the scan runs. (`count` has no such problem: the delete
+//!   masks are exact and are what makes it exact.)
+//! * **A pending delta.** Every read flushes first
+//!   (`Session::exec_statement`), so parts *are* the table by the time this
+//!   runs, and the scan next door would be equally wrong if they were not.
+//!   Refused anyway: it is one `is_empty` against a class of bug a
+//!   differential test cannot see.
+//! * **`count(x)`, `count(DISTINCT x)`, `sum`, and every other aggregate.**
+//!   `count(x)` counts non-NULL values, which no granule header records.
+//! * **A conjunct that is not `col <op> literal`.** The predicate the
+//!   operator falls back to on a straddling granule is `ScanNode::filters`
+//!   itself, so the two must be the *same* predicate: the zone tests are
+//!   derived here from the filter list rather than read out of
+//!   `ScanNode::zone_filters`, which is a deliberately lossy summary (an `IN`
+//!   list becomes a `[min, max]` range) and would over-count if trusted as an
+//!   equivalent.
+//!
 //! ## What this is deliberately *not*
 //!
 //! Not a cost model. There are no statistics beyond "how many live rows does
@@ -130,7 +217,7 @@ use crate::types::{DataType, PhysicalType, Schema, Value};
 use crate::exec::exchange;
 use crate::exec::operators::window::WindowNode;
 
-use super::logical::{BoundAgg, BoundExpr, LogicalPlan, ScanNode, SortKey};
+use super::logical::{BoundAgg, BoundExpr, CmpOp, LogicalPlan, ScanNode, SortKey, ZoneFilter};
 
 /// How many rows of sequential scan one index probe is worth.
 ///
@@ -189,11 +276,61 @@ pub struct IndexPath<'a> {
     pub keys: Vec<u64>,
 }
 
+/// An aggregate answered out of part metadata: no granule decoded, no row read.
+///
+/// This replaces the whole `Aggregate`-over-`Scan` subtree, not just the scan
+/// under it -- the point is that there is no input stream at all. See the
+/// module docs for what is refused and why.
+pub struct MetaPath<'a> {
+    /// The scan this replaces. The table to snapshot, the projection that maps
+    /// a predicate column back to storage, and -- for the granules the zone
+    /// maps cannot decide -- the PREWHERE list to fall back to.
+    pub node: &'a ScanNode,
+    /// The aggregate's output schema. One row of it is the entire result.
+    pub schema: &'a Schema,
+    /// The aggregates, for `EXPLAIN` and for the output column types.
+    pub aggs: &'a [BoundAgg],
+    /// What to compute, one per output column, parallel to `aggs`.
+    pub what: Vec<MetaAgg>,
+    /// One entry per conjunct of `node.filters`, or empty for an unfiltered
+    /// aggregate. Equivalent to `node.filters` by construction -- see
+    /// [`meta_preds`], and *not* the same thing as `node.zone_filters`.
+    pub preds: Vec<MetaPred>,
+    /// How many threads walk the granules. `1` is serial, and is always the
+    /// answer for an unfiltered aggregate, which has no walk. See
+    /// [`meta_degree`].
+    pub workers: usize,
+}
+
+/// One output column of a [`MetaPath`].
+pub enum MetaAgg {
+    /// `count()` / `count(*)`: live rows.
+    Count,
+    /// `min(c)` / `max(c)` over **table** column `col`, from the zone maps.
+    Extreme { col: usize, max: bool },
+}
+
+/// One `col <op> literal` conjunct, in both directions.
+///
+/// Both `col` fields are **table** column indices -- already mapped through
+/// `ScanNode::projection`, unlike the projected-schema indices that
+/// `ScanNode::zone_filters` carries.
+pub struct MetaPred {
+    /// The conjunct. `may_match` false means the granule holds no matching
+    /// row, exactly as in the scan's own pruning.
+    pub pred: ZoneFilter,
+    /// Its negation. `may_match` false means no row *fails* the conjunct, so
+    /// -- given the column has no NULL in this granule -- every row matches.
+    pub not: ZoneFilter,
+}
+
 pub enum PhysicalPlan<'a> {
     /// Sequential scan with zone-map pruning and PREWHERE.
     Scan(&'a ScanNode),
     /// Primary-key point/batch lookup.
     IndexLookup(Box<IndexPath<'a>>),
+    /// An aggregate folded out of part metadata instead of rows.
+    MetaAggregate(Box<MetaPath<'a>>),
     Filter {
         input: Box<PhysicalPlan<'a>>,
         predicate: &'a BoundExpr,
@@ -315,11 +452,16 @@ fn lower_at<'a>(
         LogicalPlan::Project { input, exprs, schema } => {
             PhysicalPlan::Project { input: down(input)?, exprs, schema }
         }
-        LogicalPlan::Aggregate { input, group, aggs, schema } => fan_out(
-            PhysicalPlan::Aggregate { input: down(input)?, group, aggs, schema },
-            catalog,
-            par,
-        ),
+        LogicalPlan::Aggregate { input, group, aggs, schema } => {
+            match meta_path(input, group, aggs, schema, catalog) {
+                Some(m) => PhysicalPlan::MetaAggregate(Box::new(m)),
+                None => fan_out(
+                    PhysicalPlan::Aggregate { input: down(input)?, group, aggs, schema },
+                    catalog,
+                    par,
+                ),
+            }
+        }
         LogicalPlan::Window { input, node } => {
             PhysicalPlan::Window { input: Box::new(lower_at(input, catalog, d, false)?), node }
         }
@@ -328,6 +470,18 @@ fn lower_at<'a>(
             catalog,
             par,
         ),
+        // `LIMIT 0` is a query that asks for no rows, so it is one that has to
+        // produce none -- whatever is underneath. Cutting the subtree here
+        // rather than building it and throwing every batch away is the same
+        // trade `fuse_top_k` already makes one level down, including its one
+        // visible consequence: an expression that would have overflowed on a
+        // row nobody asked for no longer gets the chance. `LIMIT` is allowed
+        // to spare you the rows you did not ask for.
+        LogicalPlan::Limit { input, limit: Some(0), .. } => {
+            // `&'a LogicalPlan` in, so the borrow is the caller's, not this
+            // frame's -- which is why the schema can be handed to `Empty`.
+            PhysicalPlan::Empty { schema: input.schema() }
+        }
         LogicalPlan::Limit { input, limit, offset } => {
             let mut inner = lower_at(input, catalog, d, par)?;
             if let Some(l) = limit {
@@ -589,6 +743,197 @@ fn fan_out<'a>(plan: PhysicalPlan<'a>, catalog: &Catalog, par: bool) -> Physical
     }
 }
 
+// ---------------------------------------------------- 4. metadata answers
+
+/// Recognize an aggregate the part headers can answer, or `None` to run it.
+///
+/// Every gate is a refusal to approximate. The module docs list them and say
+/// why each one is a wrong answer rather than a slow one; this is the code.
+fn meta_path<'a>(
+    input: &'a LogicalPlan,
+    group: &'a [BoundExpr],
+    aggs: &'a [BoundAgg],
+    schema: &'a Schema,
+    catalog: &Catalog,
+) -> Option<MetaPath<'a>> {
+    // A `GROUP BY` needs per-group counts, which no header records. An empty
+    // aggregate list is `SELECT FROM t GROUP BY ()`-shaped and has no output
+    // column to put an answer in.
+    if !group.is_empty() || aggs.is_empty() {
+        return None;
+    }
+    // Directly over the scan, not over a `Filter` or a `Join`: the predicate
+    // has to be the one the scan node carries, or the fallback the operator
+    // applies to a straddling granule would not be the query's predicate.
+    let LogicalPlan::Scan(node) = input else { return None };
+
+    // A missing table is `Scan::new`'s error to raise, with the message the
+    // tests expect -- so fall through silently, as `index_path` does.
+    let table = catalog.table_by_path(&node.table).ok()?;
+    let ncols = table.schema().len();
+    if node.projection.iter().any(|&c| c >= ncols) {
+        return None;
+    }
+    // Parts are the whole table only once the write buffer is empty, which
+    // every read guarantees by flushing before it plans. See the module docs.
+    if table.has_pending_writes() {
+        return None;
+    }
+
+    let preds = meta_preds(&node.filters, &node.projection)?;
+    // Only on the column the table is *sorted* by.
+    //
+    // Measured, and the reason this gate exists: `count() WHERE latency > 500`
+    // over 2M rows, where `latency` is uncorrelated with the sort key, decides
+    // exactly zero granules -- every one straddles, so the operator decodes
+    // the whole table *serially* while the plan it replaced would have decoded
+    // it across 14 workers. A/B interleaved, best-of-5 x 5 rounds:
+    // **1.26 ms -> 2.92 ms, 0.43x**. Right answer, 2.3x slower.
+    //
+    // A zone map only decides a granule when the column is clustered, and the
+    // sort column is the one the engine guarantees that for -- so this is the
+    // gate that makes the filtered path monotone. With it, the same table
+    // measures `ts >= <90% cut>` at 279 us -> 48 us (5.8x) and the undecidable
+    // shapes stay on the parallel scan where they belong.
+    //
+    // Rejected alternative: sampling ~32 granules at plan time and taking the
+    // path only if most of them decide. It adapts to correlated-but-unsorted
+    // columns, which this gate gives up on -- but it costs a snapshot walk on
+    // every aggregate, it needs a threshold nobody can defend, and it makes
+    // the plan depend on data the `EXPLAIN` reader cannot see.
+    if !preds.is_empty() {
+        let sort_col = table.sort_col()?;
+        if preds.iter().any(|p| p.pred.col != sort_col) {
+            return None;
+        }
+    }
+    // A predicate the primary-key index can answer beats this: the index reads
+    // one granule after one MPH probe, while a metadata count still walks
+    // every granule's zone map to find the one that straddles. On a 2M-row
+    // table that is ~4 us against ~50 us for `count() WHERE id = k` -- right,
+    // and 12x slower, which is a performance bug in the other direction. The
+    // scan lowering below would have chosen the index; so does this.
+    if index_path(node, catalog).is_some() {
+        return None;
+    }
+
+    // One `RwLock::read` + `Arc` clone (~40 ns), reached only once the shape
+    // has matched, and the same argument `index_path` makes applies: lowering
+    // and building run under one `&Catalog` borrow, which excludes every
+    // mutation, so the operator's own snapshot is this same set.
+    //
+    // Inside a transaction this is the transaction's overlay -- the same view
+    // `Scan` would take -- so read-your-own-writes needs nothing here.
+    let snap = table.snapshot();
+    // `AUTO_COMPACT_PARTS` caps this at 16 iterations, and it is one null
+    // check per part for every table that has never had a row deleted.
+    let tombstoned = (0..snap.len()).any(|i| snap.deletes(i).is_some_and(|d| d.count() > 0));
+
+    let mut what = Vec::with_capacity(aggs.len());
+    for a in aggs {
+        // `count(DISTINCT x)` and `min(x) FILTER`-style parameters are other
+        // aggregates wearing the same name.
+        if a.distinct || !a.params.is_empty() {
+            return None;
+        }
+        what.push(match a.func.name {
+            // `count()` and `count(*)` both bind to an empty argument list;
+            // `count(x)` counts non-NULLs and does not.
+            "count" if a.args.is_empty() => MetaAgg::Count,
+            // A tombstone widens no granule's bounds but can remove the row
+            // that set one, so with any delete anywhere the fold is only an
+            // envelope. Refuse the whole path rather than answer 8 for a
+            // column whose largest live value is 7.
+            "min" | "max" if !tombstoned && preds.is_empty() => {
+                // The argument has to be a bare column of the scan, and a
+                // predicate would mean the extreme is over a subset the
+                // bounds do not describe.
+                let field = a.args.first()?.as_column()?;
+                MetaAgg::Extreme { col: *node.projection.get(field)?, max: a.func.name == "max" }
+            }
+            _ => return None,
+        });
+    }
+    let workers = if preds.is_empty() {
+        1
+    } else {
+        meta_degree((0..snap.len()).map(|i| snap.part(i).granule_count()).sum())
+    };
+    Some(MetaPath { node, schema, aggs, what, preds, workers })
+}
+
+/// Threads for a filtered fold's granule walk.
+///
+/// The walk it parallelizes is the *same* walk the scan does, and the scan's
+/// runs inside the exchange's fleet -- so a serial fold was 14x behind on
+/// exactly the queries where pruning is the whole cost. `count() WHERE ts
+/// BETWEEN <1000 rows>` over 2M rows measured **62 us scanned vs 97 us folded
+/// (0.6x)** with the walk serial: the right answer, from metadata, slower than
+/// reading the two granules in parallel. With the fleet the same query is
+/// 54 us vs 46 us (1.2x), and every other filtered shape gained too -- the
+/// 50% cut went 20.6x -> 32x and the 1% cut 2.0x -> 3.1x. That is the whole
+/// justification for `workers` existing.
+///
+/// The floor is per *worker*, not per query: a zone test is ~50 ns, so 512
+/// granules is ~25 us of work, comfortably more than waking the pool costs.
+/// Below that -- half a million rows -- the walk is over before a fleet
+/// finishes assembling, and `1` is a refusal every caller honours.
+fn meta_degree(granules: usize) -> usize {
+    crate::common::pool::global().threads().min(granules / 512).max(1)
+}
+
+/// The scan's PREWHERE list as zone tests, or `None` if any conjunct is not
+/// one.
+///
+/// All-or-nothing on purpose. A conjunct left out would be a predicate the
+/// covering test never checks, so a granule could be called covered while some
+/// of its rows fail -- which over-counts. `ScanNode::zone_filters` is not used
+/// for this precisely because it is *allowed* to be lossy: `x IN (1, 99)`
+/// becomes `x >= 1 AND x <= 99` there, which prunes correctly and covers
+/// wrongly.
+fn meta_preds(filters: &[BoundExpr], projection: &[usize]) -> Option<Vec<MetaPred>> {
+    let mut out = Vec::with_capacity(filters.len());
+    for f in filters {
+        let BoundExpr::Binary { left, op, right, .. } = f else { return None };
+        let cmp = CmpOp::from_binary(*op)?;
+        let (field, op, value) = match (left.as_column(), right.as_column()) {
+            (Some(c), _) => (c, cmp, right.as_literal()?),
+            // `5 < x` is `x > 5`, the same flip the optimizer's own
+            // extraction makes.
+            (_, Some(c)) => (c, cmp.flip(), left.as_literal()?),
+            _ => return None,
+        };
+        // A comparison against NULL is NULL, never TRUE, so no row matches and
+        // no row fails: both directions of the zone test would be misleading.
+        // Rare enough not to be worth reasoning about; scan it.
+        if value.is_null() {
+            return None;
+        }
+        let col = *projection.get(field)?;
+        out.push(MetaPred {
+            pred: ZoneFilter { col, op, value: value.clone() },
+            not: ZoneFilter { col, op: negate(op), value: value.clone() },
+        });
+    }
+    Some(out)
+}
+
+/// The comparison that is true exactly where `op` is false, for non-NULL
+/// operands.
+///
+/// Lives here rather than on `CmpOp` because it is only meaningful under that
+/// caveat, and `logical.rs` is not this task's file.
+fn negate(op: CmpOp) -> CmpOp {
+    match op {
+        CmpOp::Eq => CmpOp::NotEq,
+        CmpOp::NotEq => CmpOp::Eq,
+        CmpOp::Lt => CmpOp::GtEq,
+        CmpOp::LtEq => CmpOp::Gt,
+        CmpOp::Gt => CmpOp::LtEq,
+        CmpOp::GtEq => CmpOp::Lt,
+    }
+}
+
 // ------------------------------------------------------------------ EXPLAIN
 
 impl PhysicalPlan<'_> {
@@ -596,6 +941,7 @@ impl PhysicalPlan<'_> {
         match self {
             PhysicalPlan::Scan(s) => &s.schema,
             PhysicalPlan::IndexLookup(i) => &i.node.schema,
+            PhysicalPlan::MetaAggregate(m) => m.schema,
             PhysicalPlan::Filter { input, .. }
             | PhysicalPlan::Sort { input, .. }
             | PhysicalPlan::Limit { input, .. }
@@ -616,6 +962,7 @@ impl PhysicalPlan<'_> {
         match self {
             PhysicalPlan::Scan(_)
             | PhysicalPlan::IndexLookup(_)
+            | PhysicalPlan::MetaAggregate(_)
             | PhysicalPlan::Values { .. }
             | PhysicalPlan::Empty { .. } => Vec::new(),
             PhysicalPlan::Filter { input, .. }
@@ -670,6 +1017,31 @@ impl PhysicalPlan<'_> {
                 }
                 out
             }
+            // The line has to say *from metadata*, or nobody can tell whether
+            // the decision fired: a query that reads no rows and one that
+            // reads two million produce the same answer and, without this,
+            // the same plan text. It is also how the tests assert it.
+            PhysicalPlan::MetaAggregate(m) => {
+                let a: Vec<String> = m.aggs.iter().map(agg_call).collect();
+                let mut out =
+                    format!("MetaAggregate {} [{}] from part metadata", m.node.table, a.join(", "));
+                if !m.node.filters.is_empty() {
+                    let fs: Vec<String> = m.node.filters.iter().map(|f| f.to_string()).collect();
+                    // Named for what it costs: the granules the zone maps
+                    // cannot decide either way are still decoded.
+                    out.push_str(&format!(
+                        " where={} (straddling granules read)",
+                        fs.join(" AND ")
+                    ));
+                }
+                // The width belongs in the plan text for the reason the
+                // `Exchange` line exists: a fold that quietly stopped fanning
+                // out would show up nowhere else.
+                if m.workers > 1 {
+                    out.push_str(&format!(" {} workers", m.workers));
+                }
+                out
+            }
             PhysicalPlan::Filter { predicate, .. } => format!("Filter {predicate}"),
             PhysicalPlan::Project { exprs, schema, .. } => {
                 let items: Vec<String> = exprs
@@ -681,13 +1053,7 @@ impl PhysicalPlan<'_> {
             }
             PhysicalPlan::Aggregate { group, aggs, .. } => {
                 let g: Vec<String> = group.iter().map(|e| e.to_string()).collect();
-                let a: Vec<String> = aggs
-                    .iter()
-                    .map(|a| {
-                        let args: Vec<String> = a.args.iter().map(|x| x.to_string()).collect();
-                        format!("{}({})", a.func.name, args.join(", "))
-                    })
-                    .collect();
+                let a: Vec<String> = aggs.iter().map(agg_call).collect();
                 format!("Aggregate group=[{}] aggs=[{}]", g.join(", "), a.join(", "))
             }
             PhysicalPlan::Sort { keys, fetch, .. } => {
@@ -747,6 +1113,12 @@ impl PhysicalPlan<'_> {
             c.explain_into(depth + 1, out);
         }
     }
+}
+
+/// `name(arg, arg)`, the way both aggregate-bearing labels render a call.
+fn agg_call(a: &BoundAgg) -> String {
+    let args: Vec<String> = a.args.iter().map(|x| x.to_string()).collect();
+    format!("{}({})", a.func.name, args.join(", "))
 }
 
 fn col_names(s: &Schema) -> String {
@@ -1021,14 +1393,19 @@ mod tests {
         // and `exchange::build` hands `Window` to `build_physical`, so neither
         // can honour a fleet. Printing one there would be the same lie in the
         // other direction: a plan that promises parallelism and runs serially.
+        // `sum`, not `count(*)`: a bare unfiltered count no longer reaches the
+        // exchange at all -- it is answered from part metadata -- so it would
+        // pass the negative assertions for the wrong reason and fail the
+        // positive one. Every shape here needs an aggregate that still has to
+        // read rows.
         let mut s = session("UInt64", 100_000);
-        let u = phys(&mut s, "SELECT count(*) FROM t UNION ALL SELECT count(*) FROM t");
+        let u = phys(&mut s, "SELECT sum(v) FROM t UNION ALL SELECT sum(v) FROM t");
         assert!(!u.contains("Exchange"), "a UNION branch is built serially:\n{u}");
         let w = phys(&mut s, "SELECT id, row_number() OVER (ORDER BY v) FROM t");
         assert!(!w.contains("Exchange"), "a window's sort is built serially:\n{w}");
         // The same aggregate outside a UNION still fans out, so the flag is
         // doing the narrow thing and not simply switching parallelism off.
-        assert!(phys(&mut s, "SELECT count(*) FROM t").contains("Exchange"));
+        assert!(phys(&mut s, "SELECT sum(v) FROM t").contains("Exchange"));
     }
 
     #[test]
@@ -1041,6 +1418,97 @@ mod tests {
         let e = phys(&mut s, "SELECT v FROM t ORDER BY id DESC LIMIT 10");
         assert!(e.contains("Exchange"), "{e}");
         assert!(e.contains("TopK 10"), "the limit must reach the sort under the exchange:\n{e}");
+    }
+
+    // ------------------------------------------------- 4. metadata answers
+
+    #[test]
+    fn an_aggregate_the_headers_can_answer_says_so_in_the_plan() {
+        let mut s = session("UInt64", 20_000);
+        let e = phys(&mut s, "SELECT count() FROM t");
+        assert!(e.contains("MetaAggregate default.t [count()] from part metadata"), "{e}");
+        // The scan is gone, not merely bypassed -- that is the claim.
+        assert!(!e.contains("Scan default.t"), "{e}");
+        assert!(!e.contains("Exchange"), "there is nothing left to fan out:\n{e}");
+        // The extremes name the columns they fold.
+        let x = phys(&mut s, "SELECT min(v), max(id) FROM t");
+        assert!(x.contains("[min(v#1), max(id#0)]"), "{x}");
+        // A filtered fold prints the predicate it still has to honour, and
+        // says that a straddling granule is read rather than folded.
+        let f = phys(&mut s, "SELECT count() FROM t WHERE id >= 7");
+        assert!(f.contains("MetaAggregate"), "{f}");
+        assert!(f.contains("where=(id#0 >= 7)"), "{f}");
+        assert!(f.contains("straddling granules read"), "{f}");
+        // 20 granules is far under the fan-out floor, so no width is claimed.
+        assert!(!f.contains("workers"), "{f}");
+    }
+
+    #[test]
+    fn the_aggregates_that_must_still_read_rows() {
+        let mut s = session("UInt64", 20_000);
+        for q in [
+            // counts non-NULL values, which no header records
+            "SELECT count(v) FROM t",
+            "SELECT count(DISTINCT id) FROM t",
+            // not a count or an extreme
+            "SELECT sum(v) FROM t",
+            // one unfoldable column refuses the whole path
+            "SELECT count(), sum(v) FROM t",
+            // per-group counts are not in any header
+            "SELECT id, count() FROM t GROUP BY id",
+            // an expression, not a column of the scan
+            "SELECT min(v * 2) FROM t",
+            // an extreme under a predicate describes a subset the bounds do not
+            "SELECT max(id) FROM t WHERE id < 100",
+            // a predicate off the sort column decides no granule, so the fold
+            // would serialize what the scan spreads across every core
+            "SELECT count() FROM t WHERE v > 100",
+            // a predicate no zone test can express
+            "SELECT count() FROM t WHERE id % 3 = 0",
+            "SELECT count() FROM t WHERE id IN (1, 2, 3)",
+            // the index answers this in one probe; the fold would still walk
+            // every zone map looking for the granule that straddles
+            "SELECT count() FROM t WHERE id = 5",
+        ] {
+            let e = phys(&mut s, q);
+            assert!(!e.contains("MetaAggregate"), "`{q}` must read rows:\n{e}");
+        }
+    }
+
+    #[test]
+    fn a_tombstone_takes_min_and_max_off_the_fold_but_not_the_count() {
+        let mut s = session("UInt64", 20_000);
+        assert!(phys(&mut s, "SELECT max(id) FROM t").contains("MetaAggregate"));
+        s.catalog.table_by_path_mut("default.t").unwrap().delete_key(&Value::UInt(19_999)).unwrap();
+        // A granule's bounds still describe the row that was deleted, so the
+        // fold would answer 19999 for a table whose largest live id is 19998.
+        assert!(!phys(&mut s, "SELECT max(id) FROM t").contains("MetaAggregate"));
+        // The delete masks are exact, so the count is still exact.
+        assert!(phys(&mut s, "SELECT count() FROM t").contains("MetaAggregate"));
+    }
+
+    #[test]
+    fn meta_degree_refuses_before_it_divides() {
+        let threads = crate::common::pool::global().threads();
+        assert_eq!(meta_degree(0), 1);
+        assert_eq!(meta_degree(511), 1, "one worker's worth of walk is not worth a fleet");
+        assert_eq!(meta_degree(1_024), 2.min(threads));
+        assert!(meta_degree(1 << 20) <= threads);
+    }
+
+    #[test]
+    fn a_limit_of_zero_is_lowered_to_nothing_at_all() {
+        let mut s = session("UInt64", 20_000);
+        for q in [
+            "SELECT v FROM t LIMIT 0",
+            "SELECT sum(v) FROM t LIMIT 0",
+            "SELECT v FROM t ORDER BY id DESC LIMIT 0",
+            "SELECT v FROM t LIMIT 0 OFFSET 10",
+        ] {
+            assert_eq!(phys(&mut s, q).trim(), "Empty", "{q}");
+        }
+        // ... and one more row asked for is a whole pipeline again.
+        assert!(phys(&mut s, "SELECT v FROM t LIMIT 1").contains("Scan default.t"));
     }
 
     #[test]

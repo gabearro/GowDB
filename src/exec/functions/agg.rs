@@ -79,10 +79,13 @@
 //! `topK` is **not** implemented -- see the module note at the bottom.
 
 use super::{Accumulator, AggFn};
-use crate::common::{hash_bytes, splitmix64, Error, FastSet, Result};
+use crate::common::{
+    hash_bytes, i64_to_lane, lane_to_i64, splitmix64, Error, FastSet, Result,
+};
 use crate::types::value::{DECIMAL_MAX_UNITS, POW10};
 use crate::types::{Column, ColumnData, DataType, PhysicalType, Value};
 use std::any::Any;
+use std::cell::Cell;
 use std::cmp::Ordering;
 use std::sync::Arc;
 
@@ -111,6 +114,41 @@ fn each_valid(col: &Column, sel: &[u32], mut f: impl FnMut(usize)) {
                 let i = r as usize;
                 if !nulls.get(i) {
                     f(i);
+                }
+            }
+        }
+    }
+}
+
+/// Append `f(src[r])` for every non-NULL row `r` in `sel`.
+///
+/// The no-nulls arm is one `extend` over a `TrustedLen` iterator, so the vector
+/// grows once per *block* and the loop that follows has no capacity check and
+/// no length store per row -- which `each_valid` plus `Vec::push` cannot give,
+/// because the check does not hoist out of the closure. Landed and measured
+/// together with the rest of the quantile rework; see [`QuantileAcc`].
+///
+/// `sel` must hold valid indices into `col`, which is [`Accumulator::update`]'s
+/// contract; the bounds check that enforces it here is one predictable branch
+/// per row and the only one in the loop.
+#[inline]
+fn append_lanes<T: Copy>(
+    out: &mut Vec<u64>,
+    col: &Column,
+    sel: &[u32],
+    src: &[T],
+    f: impl Fn(T) -> u64,
+) {
+    match &col.nulls {
+        None => out.extend(sel.iter().map(|&r| f(src[r as usize]))),
+        // Filtering drops `TrustedLen`, so reserve by hand and let `push` run;
+        // a column with nulls is paying the mask read per row regardless.
+        Some(nulls) => {
+            out.reserve(sel.len());
+            for &r in sel {
+                let i = r as usize;
+                if !nulls.get(i) {
+                    out.push(f(src[i]));
                 }
             }
         }
@@ -938,16 +976,37 @@ struct HllAcc {
     regs: Vec<u8>,
 }
 
+/// One row into the sketch.
+///
+/// `regs` is a fixed-size **array** reference, not a slice: `idx` is a 14-bit
+/// shift so the index is provably below `HLL_M`, and only the array type lets
+/// the compiler see that and drop the bounds check plus its panic edge from a
+/// loop that runs once per row.
 #[inline]
-fn hll_add(regs: &mut [u8], h: u64) {
+fn hll_add(regs: &mut [u8; HLL_M], h: u64) {
     // Top `p` bits address the register, the remaining 50 pick the rank. The
     // `| 1<<(p-1)` guarantees a set bit inside the payload so `leading_zeros`
     // is bounded by 50 and the +1 rank fits a u8.
     let idx = (h >> (64 - HLL_P)) as usize;
     let rho = ((h << HLL_P) | (1u64 << (HLL_P - 1))).leading_zeros() as u8 + 1;
-    if rho > regs[idx] {
-        regs[idx] = rho;
-    }
+    // `max`, not `if rho > *r { *r = rho }`. The branch is predicted
+    // not-taken (a register that already holds 6 is beaten 1.5% of the time)
+    // and the conditional store is what costs: it orders against every later
+    // load the compiler cannot prove disjoint. Measured interleaved, the two
+    // forms directly against each other, best-of-11 x 3 runs, 2M rows:
+    //
+    //   uniq(user_id)  100k distinct   max 1.51x 1.27x 1.52x  <- the HLL case
+    //   uniq(latency)    900 distinct  max 0.92x 1.15x 0.92x
+    //   uniq(bytes%8)      8 distinct  max 0.89x 1.01x 1.01x
+    //   uniq(country)      8 distinct  max 1.14x 0.92x 1.04x
+    //   controls (sum)                     1.45x 0.95x 0.94x
+    //
+    // Only the first row is outside the noise band the controls set, and it is
+    // the one HLL exists for: at 8 distinct values the store lands on the same
+    // 8 bytes every few rows and the dependency chain eats the win back, but
+    // an 8-value column should be `uniqExact` anyway.
+    let r = &mut regs[idx];
+    *r = (*r).max(rho);
 }
 
 impl HllAcc {
@@ -984,7 +1043,9 @@ impl HllAcc {
 impl Accumulator for HllAcc {
     fn update(&mut self, args: &[Column], sel: &[u32]) -> Result<()> {
         let col = arg_at(args, 0, "uniq")?;
-        let regs = &mut self.regs[..];
+        // Reborrowed as an array once per block; see `hll_add`.
+        let regs: &mut [u8; HLL_M] =
+            (&mut self.regs[..]).try_into().expect("HllAcc::new sizes regs at HLL_M");
         match &col.data {
             ColumnData::U64(v) => each_valid(col, sel, |i| hll_add(regs, splitmix64(v[i]))),
             ColumnData::I64(v) => each_valid(col, sel, |i| hll_add(regs, splitmix64(v[i] as u64))),
@@ -1077,30 +1138,77 @@ impl Accumulator for GroupArrayAcc {
 
 /// `quantile(p)(x)`, `quantileExact(p)(x)`, `median(x)`.
 ///
-/// Both spellings are exact: every value is kept and sorted in `finish`.
-/// `quantile` interpolates linearly between the two neighbouring ranks;
-/// `quantileExact` returns an actual observed element (rank `floor(p*n)`),
-/// which is what makes it "exact" in the ClickHouse sense.
+/// Both spellings are exact -- every value is kept -- and both stay exact here:
+/// no t-digest, no reservoir. `quantile` interpolates linearly between the two
+/// neighbouring ranks; `quantileExact` returns an actual observed element
+/// (rank `floor(p*n)`), which is what makes it "exact" in the ClickHouse sense.
+/// The two contracts are unchanged; what changed is that neither one sorts.
 ///
 /// A decimal argument is collected as raw lanes -- the scale is fixed per
 /// column, so lanes sort exactly as values do -- and the point goes back on in
 /// `finish`.
+///
+/// ## Selection, not sorting
+///
+/// An answer needs one order statistic (`quantileExact`) or two adjacent ones
+/// (`quantile`), never the sorted sequence, so `finish` runs `select_nth_
+/// unstable` -- average `O(n)`, worst case `O(n)` too since std's introselect
+/// falls back to median-of-medians -- instead of `sort_unstable_by`. Selection
+/// *permutes*, so the multiset survives and `finish` stays repeatable, which is
+/// also what lets the buffer be selected **in place** rather than cloned; see
+/// `vals` for how that reaches through `&self`.
+///
+/// Measured interleaved against HEAD's accumulator behind a temporary switch,
+/// both sides in one loop with the leading side alternating, best-of-7..11,
+/// four runs, 2M rows:
+///
+/// ```text
+///   quantile(0.95)(latency)   UInt32,  900 distinct   2.86x 2.59x 2.69x 2.76x
+///   quantileExact(0.95)                               2.60x 2.94x 2.71x 2.55x
+///   median(bytes)             Int64, 65536 distinct   4.54x 4.42x 4.61x 4.23x
+///   quantile(0.5) GROUP BY country, 8 groups          2.23x 2.11x 2.23x 2.32x
+///   controls (ORDER BY, sum, uniq: untouched)         0.94x .. 1.16x
+/// ```
+///
+/// The controls set the noise band on this machine, which is wide. Isolating
+/// `finish` in a standalone single-threaded harness over the same 2M words
+/// splits the win up, best-of-5:
+///
+/// ```text
+///   clone + sort_unstable_by(total_cmp)   -- what this did   12.0 .. 12.7 ms
+///   clone alone                                              0.27 ..  1.18
+///   sort_unstable on the lane, no closure                    10.6 .. 11.6
+///   clone + encode + select_nth_unstable                      2.7 ..  3.4
+///   select_nth_unstable in place, lanes already encoded       2.0 ..  2.3
+/// ```
+///
+/// So the cheap comparator is worth ~10% and *not sorting* is worth 5x; the
+/// clone is 0.3 ms of it and is dropped for the memory, not the clock -- it was
+/// a second copy of the whole group, 16 MB on this shape.
 struct QuantileAcc {
-    /// Every observed value, one word each: **either** `f64` bits or
-    /// `Decimal64` lanes, discriminated by `scale`.
+    /// Every observed value, one word each, as an **order-preserving lane**:
+    /// `f64_ord_key` bits or `i64_to_lane` decimal lanes, discriminated by
+    /// `scale`. Either way a plain `u64` compare is the right compare, so the
+    /// selection below runs on `Ord for u64` and not on a closure.
     ///
     /// A two-variant enum would put a tag word on a struct that exists once per
     /// group (40 bytes -> 48, asserted below), and `scale` already answers the
-    /// question; `f64::to_bits`/`from_bits` are register moves, not work.
+    /// question; the lane codecs are two ALU ops, not work.
     ///
     /// Holding the decimal lanes as integers is a correctness fix, not a
     /// micro-optimization. They used to live in the `f64` store, where a lane
     /// past 2^53 does not survive the round trip: over a `Decimal64(2)` column
     /// holding 1234567890123456.78, `quantileExact` answered
     /// 1234567890123456.80 while `min` and `max` over the same one row answered
-    /// .78. Sorting them as integers is also strictly cheaper than
-    /// `f64::total_cmp`.
-    vals: Vec<u64>,
+    /// .78.
+    ///
+    /// The `Cell` is what lets `finish(&self)` select in place. `Cell::take`
+    /// lends the buffer out and hands it straight back, which is the whole of
+    /// the interior mutability -- no `RefCell` flag word (it would cost the 8
+    /// bytes the enum tag was rejected for), no `unsafe`. It also makes the
+    /// accumulator `!Sync`, which is free: the trait is `Any + Send`, so a
+    /// shared `&dyn Accumulator` never crossed a thread anyway.
+    vals: Cell<Vec<u64>>,
     p: f64,
     interpolate: bool,
     /// The argument's decimal scale, hoisted out of the row loop, and the
@@ -1109,6 +1217,44 @@ struct QuantileAcc {
 }
 
 const _: () = assert!(std::mem::size_of::<QuantileAcc>() == 40);
+
+/// `f64` bits reordered so that a plain `u64` compare *is* `f64::total_cmp`.
+///
+/// Negatives descend as bit patterns, so invert them whole; non-negatives only
+/// need the sign bit set to sort above every negative. Branchless, and exactly
+/// the transformation `total_cmp` documents -- so this is the ordering
+/// `QuantileAcc` has always used, not a new one. Deliberately **not**
+/// [`crate::common::f64_to_lane`], which additionally folds -0.0 into +0.0 and
+/// every NaN into one lane: that is `Value`'s ordering, and adopting it here
+/// would move the answer of `quantileExact` over a column containing -0.0 or a
+/// negative NaN.
+#[inline(always)]
+fn f64_ord_key(x: f64) -> u64 {
+    let b = x.to_bits();
+    b ^ ((((b as i64) >> 63) as u64) | (1 << 63))
+}
+
+/// Inverse of [`f64_ord_key`]; exact on every bit pattern, NaN payloads and
+/// signed zeroes included.
+#[inline(always)]
+fn f64_ord_val(k: u64) -> f64 {
+    f64::from_bits(k ^ if k & (1 << 63) != 0 { 1 << 63 } else { u64::MAX })
+}
+
+/// The `lo`-th and `hi`-th smallest lanes, where `hi` is `lo` or `lo + 1`.
+///
+/// Two selections would re-partition the whole buffer; the second rank is
+/// adjacent, so the tail `select_nth_unstable` already left above `lo` supplies
+/// it as a minimum -- one linear pass with no comparisons that can mispredict.
+#[inline]
+fn nth_pair(v: &mut [u64], lo: usize, hi: usize) -> (u64, u64) {
+    debug_assert!(hi == lo || hi == lo + 1, "ranks must be adjacent");
+    let (_, &mut a, above) = v.select_nth_unstable(lo);
+    if hi == lo {
+        return (a, a);
+    }
+    (a, above.iter().copied().min().unwrap_or(a))
+}
 
 /// Denominator for the interpolation weight, which is the one input to the
 /// decimal path below that an `i128` cannot hold exactly: `p*(n-1)`'s fraction
@@ -1120,11 +1266,11 @@ const QUANTILE_WEIGHT_ONE: i128 = POW10[9];
 impl Accumulator for QuantileAcc {
     fn update(&mut self, args: &[Column], sel: &[u32]) -> Result<()> {
         let col = arg_at(args, 0, "quantile")?;
-        let vals = &mut self.vals;
+        let vals = self.vals.get_mut();
         // The decimal question is asked once per block and never per row, which
         // is the same shape `SumCore::add` and `GroupArrayAcc::update` use.
         match (self.scale, &col.data) {
-            (Some(_), ColumnData::I64(v)) => each_valid(col, sel, |i| vals.push(v[i] as u64)),
+            (Some(_), ColumnData::I64(v)) => append_lanes(vals, col, sel, v, i64_to_lane),
             // A `Decimal64` column is physically `I64` everywhere in the
             // engine, so this is a planner bug rather than a user error --
             // but it must not silently mix two encodings in one `vals`.
@@ -1132,12 +1278,12 @@ impl Accumulator for QuantileAcc {
                 return Err(Error::exec("quantile: decimal accumulator fed a non-decimal column"))
             }
             (None, ColumnData::U64(v)) => {
-                each_valid(col, sel, |i| vals.push((v[i] as f64).to_bits()))
+                append_lanes(vals, col, sel, v, |x| f64_ord_key(x as f64))
             }
             (None, ColumnData::I64(v)) => {
-                each_valid(col, sel, |i| vals.push((v[i] as f64).to_bits()))
+                append_lanes(vals, col, sel, v, |x| f64_ord_key(x as f64))
             }
-            (None, ColumnData::F64(v)) => each_valid(col, sel, |i| vals.push(v[i].to_bits())),
+            (None, ColumnData::F64(v)) => append_lanes(vals, col, sel, v, f64_ord_key),
             (None, ColumnData::Str(_)) => {
                 return Err(Error::exec("quantile requires a numeric column"))
             }
@@ -1146,16 +1292,43 @@ impl Accumulator for QuantileAcc {
     }
     fn merge(&mut self, other: &dyn Accumulator) -> Result<()> {
         let o = downcast::<QuantileAcc>(other, "quantile")?;
-        self.vals.extend_from_slice(&o.vals);
+        // `Cell` has no `borrow`, so the other side's buffer is lent out and
+        // handed straight back. Nothing in between can fail or panic, so `o` is
+        // never observed empty.
+        let ov = o.vals.take();
+        self.vals.get_mut().extend_from_slice(&ov);
+        o.vals.set(ov);
         Ok(())
     }
     fn finish(&self) -> Result<Value> {
-        if self.vals.is_empty() {
+        // Lent out for the duration and handed back on every exit, including
+        // the fallible one at the bottom: `finish` must be repeatable, and a
+        // buffer left in the `Cell` empty would answer NULL the second time.
+        let mut v = self.vals.take();
+        let out = self.answer(&mut v);
+        self.vals.set(v);
+        out
+    }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn boxed_clone(&self) -> Box<dyn Accumulator> {
+        Box::new(QuantileAcc {
+            vals: Cell::new(Vec::new()),
+            p: self.p,
+            interpolate: self.interpolate,
+            scale: self.scale,
+        })
+    }
+}
+
+impl QuantileAcc {
+    /// The answer over `v`, which is left **permuted** rather than sorted --
+    /// the multiset is what the next call needs and permuting preserves it.
+    fn answer(&self, v: &mut [u64]) -> Result<Value> {
+        if v.is_empty() {
             return Ok(Value::Null);
         }
-        // `finish` takes `&self` and must be repeatable, so we sort a copy.
-        // Called once per group, so the extra pass is not on any hot path.
-        let mut v = self.vals.clone();
         let n = v.len();
         // Rank arithmetic is shared; only the decode of `v` differs, and it is
         // decided once here rather than at each of the four reads below.
@@ -1165,24 +1338,25 @@ impl Accumulator for QuantileAcc {
         let hi = (lo + 1).min(n - 1);
 
         let Some(s) = self.scale else {
-            v.sort_unstable_by(|a, b| f64::from_bits(*a).total_cmp(&f64::from_bits(*b)));
-            let g = |i: usize| f64::from_bits(v[i]);
-            return Ok(Value::Float(if self.interpolate {
-                g(lo) + (g(hi) - g(lo)) * frac
-            } else {
-                g(rank(self.p))
-            }));
+            if !self.interpolate {
+                let (k, _) = nth_pair(v, rank(self.p), rank(self.p));
+                return Ok(Value::Float(f64_ord_val(k)));
+            }
+            let (a, b) = nth_pair(v, lo, hi);
+            let (a, b) = (f64_ord_val(a), f64_ord_val(b));
+            // Kept as written, `a + (b - a) * frac`, rather than folded to
+            // `a` when `frac` is zero: at `p = 1` over a column holding an
+            // infinity the difference is `inf - inf`, and the NaN that falls
+            // out of it is the answer this has always given.
+            return Ok(Value::Float(a + (b - a) * frac));
         };
 
-        // Signed compare: the words are `i64` lanes, so an unsigned sort would
-        // rank every negative price above every positive one.
-        v.sort_unstable_by_key(|&b| b as i64);
-        let g = |i: usize| v[i] as i64 as i128;
         if !self.interpolate {
             // An element that was actually observed, so it keeps the argument's
             // own scale and is in range because the column was: nothing was
             // divided, nothing was widened, and nothing went through an `f64`.
-            return Ok(Value::Decimal(v[rank(self.p)] as i64, s));
+            let (k, _) = nth_pair(v, rank(self.p), rank(self.p));
+            return Ok(Value::Decimal(lane_to_i64(k), s));
         }
         // Interpolating between two lanes divides, so it widens like `avg` and
         // `divide` do rather than rounding the answer back onto the argument's
@@ -1191,28 +1365,19 @@ impl Accumulator for QuantileAcc {
         // `10^18 * 10^6 * 10^9`, five digits clear of the top.
         //
         // The rounding is applied to the whole interpolated value, not to the
-        // `(b-a)` increment: sorting makes that increment positive, so rounding
-        // it away from zero would round -1.5 up to -1 while 1.5 went to 2.
+        // `(b-a)` increment: selection makes that increment non-negative, so
+        // rounding it away from zero would round -1.5 up to -1 while 1.5 went
+        // to 2.
         let os = div_out_scale(s);
         let mul = POW10[(os - s) as usize];
-        let (a, b) = (g(lo) * mul, g(hi) * mul);
+        let (a, b) = nth_pair(v, lo, hi);
+        let (a, b) = (lane_to_i64(a) as i128 * mul, lane_to_i64(b) as i128 * mul);
         let w = (frac * QUANTILE_WEIGHT_ONE as f64).round() as i128;
         let u = div_round(a * QUANTILE_WEIGHT_ONE + (b - a) * w, QUANTILE_WEIGHT_ONE);
         // Same widening as `avg`, so the same refusal: at scale 6 the
         // representable magnitude is 10^12, and clamping there answered
         // 999999999999.999999 for a median the column held exactly.
         fit_dec(u, os, "quantile")
-    }
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-    fn boxed_clone(&self) -> Box<dyn Accumulator> {
-        Box::new(QuantileAcc {
-            vals: Vec::new(),
-            p: self.p,
-            interpolate: self.interpolate,
-            scale: self.scale,
-        })
     }
 }
 
@@ -1666,7 +1831,7 @@ fn new_group_array(tys: &[DataType], params: &[Value]) -> Result<Box<dyn Accumul
 fn new_quantile(tys: &[DataType], params: &[Value]) -> Result<Box<dyn Accumulator>> {
     ret_quantile(tys, params)?;
     Ok(Box::new(QuantileAcc {
-        vals: Vec::new(),
+        vals: Cell::new(Vec::new()),
         p: quantile_p(params, "quantile")?,
         interpolate: true,
         scale: tys[0].decimal_scale(),
@@ -1676,7 +1841,7 @@ fn new_quantile(tys: &[DataType], params: &[Value]) -> Result<Box<dyn Accumulato
 fn new_quantile_exact(tys: &[DataType], params: &[Value]) -> Result<Box<dyn Accumulator>> {
     ret_quantile_exact(tys, params)?;
     Ok(Box::new(QuantileAcc {
-        vals: Vec::new(),
+        vals: Cell::new(Vec::new()),
         p: quantile_p(params, "quantileExact")?,
         interpolate: false,
         scale: tys[0].decimal_scale(),
@@ -1686,7 +1851,7 @@ fn new_quantile_exact(tys: &[DataType], params: &[Value]) -> Result<Box<dyn Accu
 fn new_median(tys: &[DataType], params: &[Value]) -> Result<Box<dyn Accumulator>> {
     ret_median(tys, params)?;
     Ok(Box::new(QuantileAcc {
-        vals: Vec::new(),
+        vals: Cell::new(Vec::new()),
         p: 0.5,
         interpolate: true,
         scale: tys[0].decimal_scale(),

@@ -11,6 +11,60 @@
 //! to bucket the row ids. Two linear passes plus one vectorized fold per group
 //! beats one pass that dispatches per row, because the dispatch is what costs.
 //!
+//! ## What a row costs on the way in
+//!
+//! Pass 1 is the only per-row work left, and for a long time it went through
+//! [`Value`] whatever the key was: build one per row, hash it with a
+//! `MixHasher` (which for an integer means an `as_f64`, a `fract()` and three
+//! 128-bit folds), then compare a `&[Value]` slice against the arena. For a
+//! single key column -- which is most of them -- none of that is necessary:
+//!
+//! * an **integer** key is hashed and compared as its own lane
+//!   ([`lane_hash`], [`lane_of`]); the two constant folds `Value::hash` makes
+//!   before it reaches the integer are compile-time constants, so a row's hash
+//!   is one multiply and a genuinely new group is the only thing that ever
+//!   builds a `Value`;
+//! * a **string** key is memoized by the *address* of its decoded `Arc`
+//!   ([`StrMemo`]) -- a granule decodes its dictionary once and clones one
+//!   pointer per row, so eight countries over 8192 rows are eight hashes and
+//!   8184 pointer compares;
+//! * every probe reads its hash **tag out of the slot** rather than out of a
+//!   second array, so ruling a colliding group out costs no memory access at
+//!   all (`Groups::slots`);
+//! * and past the point where the slot array leaves cache, a probe
+//!   software-prefetches twelve rows ahead ([`lane_rows`]).
+//!
+//! Each of those carries its own interleaved measurement where it is decided.
+//! End to end, `benches/engine.rs` over 2M rows, two builds of the whole tree
+//! differing **only** in this file, run alternately, best-of-12 per side, two
+//! runs. Serial (`GRANULAR_THREADS=1`), because fourteen threads on a loaded
+//! machine put a +-20% band on every reading and this has to be readable --
+//! `top-k by sort`, which this file cannot touch, is the control:
+//!
+//! ```text
+//!                                          ms            three runs
+//!   GROUP BY user_id (100k groups)     72.29 -> 40.85   1.89 1.95 1.77
+//!   GROUP BY country (8 groups)        37.94 -> 23.43   1.58 1.49 1.62
+//!   filter + GROUP BY + ORDER + LIMIT  24.22 -> 17.74   1.42 1.30 1.37
+//!   uniq(user_id)          (no GROUP)  11.65 ->  8.89   1.36 1.26 1.31
+//!   sum(bytes)             (no GROUP)  10.64 ->  8.17   1.23 1.63 1.30
+//!   quantile(0.95)(latency)            12.75 -> 10.97   1.29 1.24 1.16
+//!   top-k by sort           (control)   3.22 ->  3.07   1.01 1.00 1.05
+//! ```
+//!
+//! The three bare aggregates move because two of these changes are not about
+//! keys at all: aggregate arguments are borrowed rather than cloned per block
+//! ([`ArgSrc`]) and the counting sort's `order` buffer stopped being zeroed
+//! before it was overwritten. At fourteen threads the same A/B reads 1.31x /
+//! 1.23x on the high-cardinality grouping and 1.52x / 1.34x on `country`,
+//! against a control that swung 1.18x / 0.96x -- consistent with the serial
+//! numbers, and a good illustration of why they were taken serially.
+//!
+//! Every one of those paths must answer exactly what the general path answers.
+//! [`GENERAL_KEYS`] exists so a test can run both over the same rows and
+//! compare the bytes; `tests/golf_aggregate.rs` does, across five
+//! cardinalities, eight key types and the order-sensitive aggregates.
+//!
 //! ## Empty input
 //!
 //! `SELECT count(*) FROM empty` must return one row containing `0`, not zero
@@ -179,6 +233,22 @@ pub(crate) fn protos(aggs: &[BoundAgg]) -> Result<Vec<Box<dyn Accumulator>>> {
         .collect()
 }
 
+/// Force every group key down the general per-row `Value` path.
+///
+/// The fast paths below -- the integer lane loop and the string address memo --
+/// exist only if they answer *exactly* what the general path answers, and the
+/// only honest way to check that is to run the same query both ways and compare
+/// the bytes. `tests/golf_aggregate.rs` is the caller; nothing else ever writes
+/// it. Costs one relaxed load per **block**, hoisted out of the row loop, which
+/// is the same accounting the cancel check already makes.
+pub static GENERAL_KEYS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[inline]
+fn general_keys() -> bool {
+    GENERAL_KEYS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// What the memory budget calls this operator's unbounded state.
 pub(crate) fn guard_name(ngroup: usize) -> &'static str {
     if ngroup == 0 {
@@ -268,6 +338,49 @@ fn worker_ceiling(ctx: &QueryContext) -> usize {
     (share / crate::common::pool::global().threads().max(1)).max(1)
 }
 
+/// Where one aggregate's argument columns come from, decided once per query.
+///
+/// `Accumulator::update` wants a `&[Column]`, and the obvious way to get one --
+/// `expr::eval_all(&a.args, &b)` -- *clones* the column when the argument is a
+/// bare reference, which `sum(bytes)` and `avg(latency)` and almost every
+/// aggregate anyone writes are. A one-column window of the block is already a
+/// `&[Column]`, so the copy is avoidable outright. What is left is one `match`
+/// per (group, aggregate) per block, which against 8192 rows is nothing.
+///
+/// Worth less than it looks. Measured interleaved against a switch that forced
+/// every argument back through `eval_all`, alternating sides in one loop,
+/// best-of-9 per side, 2M rows, **serially** (`GRANULAR_THREADS=1`, because at
+/// fourteen threads this machine's readings on the same code span 3x and the
+/// sign flipped run to run), three runs -- `sum(v)` 1.078 / 1.104 / 1.091,
+/// `GROUP BY i` with `count+sum+min` 1.101 / 1.033 / 1.111, `quantile(0.95)(v)`
+/// 1.028 / 1.184 / 0.994, `GROUP BY s` with `count+avg` 1.001 / 0.939 / 0.970.
+/// So: about **1.09x** where the aggregate reads a plain column, inside the
+/// noise everywhere else, and never a loss outside it. The copy it removes is
+/// 64 KiB per block, which is a memcpy the prefetcher eats -- what is actually
+/// saved is the allocation and the free, once per block per worker. (The
+/// larger bare-aggregate numbers in the module header are this *and* the
+/// `order` memset; neither alone accounts for them.)
+enum ArgSrc {
+    /// `count()`: no arguments, and so no columns to find.
+    Empty,
+    /// A bare column reference: `&block.columns[i..i+1]`.
+    Borrow(usize),
+    /// An expression, evaluated into the block's owned scratch.
+    Eval(usize),
+}
+
+impl ArgSrc {
+    #[inline(always)]
+    fn cols<'b>(&self, b: &'b Block, owned: &'b [Vec<Column>]) -> &'b [Column] {
+        match self {
+            ArgSrc::Empty => &[],
+            // In range: checked once per block, where the error can be raised.
+            ArgSrc::Borrow(i) => &b.columns[*i..*i + 1],
+            ArgSrc::Eval(k) => &owned[*k],
+        }
+    }
+}
+
 /// [`accumulate`], optionally allowed to spill.
 ///
 /// With `spill` set, a group table that fills the budget **freezes** instead of
@@ -354,6 +467,25 @@ pub(crate) fn accumulate_into(
     let mut hits: Vec<u32> = Vec::new();
     let mut miss: Vec<u32> = Vec::new();
     let mut mpart: Vec<u32> = Vec::new();
+    // Address-keyed memo for the single-string key; see [`StrMemo`]. Costs one
+    // allocation for a query that groups by a string and nothing at all for
+    // any other shape.
+    let mut memo = StrMemo::default();
+    // Where each aggregate's argument columns come from, decided once for the
+    // query rather than rebuilt per block. See [`ArgSrc`].
+    let mut nowned = 0usize;
+    let arg_src: Vec<ArgSrc> = aggs
+        .iter()
+        .map(|a| match a.args.as_slice() {
+            [] => ArgSrc::Empty,
+            [BoundExpr::Column { index, .. }] => ArgSrc::Borrow(*index),
+            _ => {
+                nowned += 1;
+                ArgSrc::Eval(nowned - 1)
+            }
+        })
+        .collect();
+    let mut owned: Vec<Vec<Column>> = vec![Vec::new(); nowned];
     let mut frozen = false;
     let forced = if spill.is_some() { super::sort::forced_spill_rows() } else { 0 };
     // Hoisted out of the block loop: `0` for every serial aggregate and for
@@ -374,22 +506,38 @@ pub(crate) fn accumulate_into(
         // Borrow rather than clone: a bare `GROUP BY col` or `sum(col)`
         // would otherwise copy the whole column per block.
         let gcols = expr::eval_all_cow(group, &b)?;
-        // Aggregate arguments stay owned: `Accumulator::update` takes
-        // `&[Column]`, and materializing the borrows per group would clone
-        // once per group instead of once per block.
-        let acols: Vec<Vec<Column>> = aggs
-            .iter()
-            .map(|a| expr::eval_all(&a.args, &b))
-            .collect::<Result<_>>()?;
+        // Only the arguments that are *expressions* are evaluated; a bare
+        // column reference is handed to `update` as a one-column slice of the
+        // block itself. `Accumulator::update` takes `&[Column]`, so a
+        // one-argument aggregate over a plain column -- `sum(bytes)`,
+        // `avg(latency)`, the overwhelming majority -- needs no copy at all,
+        // where `eval_all` cloned the whole column once per block.
+        // The `Borrow` arm's range check is made here rather than in the fold,
+        // so that the fold can slice unconditionally and so that an
+        // out-of-range column is one error per block instead of one per group.
+        for (a, s) in aggs.iter().zip(&arg_src) {
+            match s {
+                ArgSrc::Eval(k) => owned[*k] = expr::eval_all(&a.args, &b)?,
+                ArgSrc::Borrow(ix) if *ix >= b.width() => {
+                    return Err(crate::common::Error::exec(format!(
+                        "aggregate {} reads column #{ix} of a {}-column block",
+                        a.name,
+                        b.width()
+                    )))
+                }
+                _ => {}
+            }
+        }
 
         // Pass 1: resolve each row's group. The only per-row hashing, and
         // it probes the table through `probe` without allocating.
-        row_group.clear();
+        //
         // `None` on the in-memory path, where a row's id *is* its index into
         // `row_group`; `Some(hits)` once frozen, where the rows that missed
         // have been left out. One branch per block, in pass 2.
         let mut ids: Option<&[u32]> = None;
         if frozen {
+            row_group.clear();
             // The frozen path skips the string fast path: it is the slow half
             // of a query that has already lost, and the general loop is the
             // one that has a `find` without an insert.
@@ -421,33 +569,96 @@ pub(crate) fn accumulate_into(
             }
             ids = Some(&hits);
         } else {
+            // Not `clear() + resize`: every one of these slots is written by
+            // the loops below, so zeroing them first was a 32 KiB memset per
+            // block. `resize` alone writes only what a *shorter* previous
+            // block left uncovered, which in steady state is nothing.
             row_group.resize(rows, 0);
-            // The single-string-key case gets its own loop: it is the most
-            // common shape of a GROUP BY, and it is the one where building a
-            // `Value` per row actually costs something (an atomic refcount
-            // bump). Everything else shares the general path.
-            let str_key =
-                ngroup == 1 && matches!(gcols[0].as_ref().data, crate::types::ColumnData::Str(_));
-            if str_key {
-                let col = gcols[0].as_ref();
-                let vals = col.as_str()?;
-                let null_h = super::hash_null_key();
-                for (i, slot) in row_group.iter_mut().enumerate() {
-                    *slot = if col.is_null(i) {
-                        groups.find_or_insert(&[Value::Null], null_h, protos, aggs)
-                    } else {
-                        let h = super::hash_str_key(&vals[i]);
-                        groups.find_or_insert_str(&vals[i], h, protos, aggs)
-                    } as u32;
-                }
-            } else if ngroup > 0 {
-                for (i, slot) in row_group.iter_mut().enumerate() {
-                    for (k, c) in gcols.iter().enumerate() {
-                        probe[k] = c.as_ref().value(i);
+            // A single key column gets its own loop per physical shape. Both
+            // are the same algorithm as the general path with the per-row
+            // `Value` taken out: it is the `Value` -- and the hashing and
+            // comparing that follow from it -- that costs, not the probing.
+            //
+            // What that is worth, measured interleaved against `GENERAL_KEYS`
+            // (which forces this whole `match` down its last arm), alternating
+            // sides in one loop, best-of-7 per side, 2M rows, serial, three
+            // runs per cell, medians:
+            //
+            // ```text
+            //   groups        8        1k      100k
+            //   Int64      2.5x      1.85x     1.7x
+            //   Int64 NULL 1.7x      1.6x      1.6x      <- nullable, per row
+            //   String     2.4x      1.20x     1.2x
+            // ```
+            //
+            // The integer column keeps its factor as the table leaves cache
+            // because what it removed -- an `as_f64`, a `fract()`, three
+            // 128-bit folds and a `Vec<Value>` compare -- is work, not a miss.
+            // The string column's collapses because the memo can only spare
+            // the *hash*: past a few hundred distinct values per block the
+            // probe is a cache miss either way, and the memo's own lookup is a
+            // second one. Parallel (14 threads) reads 1.76x / 1.98x / 1.11x on
+            // the same three integer cells, which is the same story with this
+            // machine's noise on top.
+            let single = (ngroup == 1 && !general_keys()).then(|| gcols[0].as_ref());
+            let lane = single.and_then(lane_col);
+            match (lane, single) {
+                // Integer key: hash and compare the lane itself.
+                (Some(lc), Some(col)) => {
+                    let (kind, mask, guard) = (lc.kind, lc.mask, lc.guard);
+                    let nm = col.nulls.as_ref();
+                    let (rg, gs) = (&mut row_group[..], &mut groups);
+                    match (lc.lanes, nm.is_some()) {
+                        (Lanes::U(v), false) => {
+                            lane_pass::<_, false>(v, nm, mask, guard, kind, rg, gs, protos, aggs)
+                        }
+                        (Lanes::U(v), true) => {
+                            lane_pass::<_, true>(v, nm, mask, guard, kind, rg, gs, protos, aggs)
+                        }
+                        (Lanes::I(v), false) => {
+                            lane_pass::<_, false>(v, nm, mask, guard, kind, rg, gs, protos, aggs)
+                        }
+                        (Lanes::I(v), true) => {
+                            lane_pass::<_, true>(v, nm, mask, guard, kind, rg, gs, protos, aggs)
+                        }
                     }
-                    let h = super::hash_values(&probe);
-                    *slot = groups.find_or_insert(&probe, h, protos, aggs) as u32;
                 }
+                // String key. The owned `Value` (and its `Arc` bump) is built
+                // only for a genuinely new group, and the memo usually spares
+                // even the hash.
+                (None, Some(col)) if matches!(col.data, crate::types::ColumnData::Str(_)) => {
+                    let vals = col.as_str()?;
+                    let null_h = super::hash_null_key();
+                    let nulls = col.has_nulls();
+                    memo.reset(rows);
+                    for (i, slot) in row_group.iter_mut().enumerate() {
+                        if nulls && col.is_null(i) {
+                            *slot = groups.find_or_insert(&[Value::Null], null_h, protos, aggs)
+                                as u32;
+                            continue;
+                        }
+                        let s = &vals[i];
+                        *slot = match memo.get(s) {
+                            Some(g) => g,
+                            None => {
+                                let h = super::hash_str_key(s);
+                                let g = groups.find_or_insert_str(s, h, protos, aggs) as u32;
+                                memo.put(s, g);
+                                g
+                            }
+                        };
+                    }
+                }
+                _ if ngroup > 0 => {
+                    for (i, slot) in row_group.iter_mut().enumerate() {
+                        for (k, c) in gcols.iter().enumerate() {
+                            probe[k] = c.as_ref().value(i);
+                        }
+                        let h = super::hash_values(&probe);
+                        *slot = groups.find_or_insert(&probe, h, protos, aggs) as u32;
+                    }
+                }
+                _ => {}
             }
         }
 
@@ -489,8 +700,16 @@ pub(crate) fn accumulate_into(
             let n = std::mem::replace(&mut counts[g as usize], base);
             base += n;
         }
-        order.clear();
-        order.resize(row_group.len(), 0);
+        // Grown, never cleared, for the same reason `counts` is: the scatter
+        // below writes every one of the first `row_group.len()` slots exactly
+        // once (a counting sort is a permutation), so `clear() + resize(n, 0)`
+        // was a 32 KiB memset per block whose every byte was then overwritten.
+        // A *bare* aggregate paid it too -- one group, 8192 zeroes, every
+        // block -- which is most of why `sum`, `uniq` and `quantile` moved in
+        // the module header's table without their key path changing at all.
+        if order.len() < row_group.len() {
+            order.resize(row_group.len(), 0);
+        }
         // Two scatters rather than one indirection: `order` has to hold *block*
         // row ids either way, and paying an `ids[j]` load per row on the path
         // that does not need it would tax every aggregate that fits in memory.
@@ -528,12 +747,13 @@ pub(crate) fn accumulate_into(
             // so this is one predictable branch per (group, block) rather
             // than an `Option` probe per aggregate.
             if !groups.has_distinct {
-                for (ai, args) in acols.iter().enumerate() {
-                    groups.accs[base + ai].update(args, s)?;
+                for (ai, src) in arg_src.iter().enumerate() {
+                    groups.accs[base + ai].update(src.cols(&b, &owned), s)?;
                 }
                 continue;
             }
-            for (ai, args) in acols.iter().enumerate() {
+            for (ai, src) in arg_src.iter().enumerate() {
+                let args = src.cols(&b, &owned);
                 match groups.seen[base + ai].as_mut() {
                     Some(set) => {
                         fresh.clear();
@@ -934,9 +1154,21 @@ pub(crate) struct Groups {
     nkeys: usize,
     /// Row-major key arena: group `g` occupies `keys[g*nkeys..(g+1)*nkeys]`.
     keys: Vec<Value>,
-    /// Open-addressing slots holding `group + 1`; 0 means empty.
-    slots: Vec<u32>,
+    /// Open-addressing slots holding `(tag << 32) | (group + 1)`; 0 means
+    /// empty (an occupied slot always has a non-zero low half).
+    ///
+    /// The tag is the *high* 32 bits of the key's hash -- disjoint from the low
+    /// bits the bucket index uses -- and it is what keeps a probe to one random
+    /// access instead of three. Equal keys hash equally, so a tag mismatch rules
+    /// a group out without touching `hashes` or `keys`; a tag match still
+    /// compares the key exactly, so a 1-in-4-billion false hit costs a compare
+    /// and never an answer. The old `Vec<u32>` slot had to load `hashes[g]` and
+    /// then `keys[g]` on every probe step, and at a 1/2 load factor half of all
+    /// steps are collisions -- two dependent misses to rule out a group.
+    slots: Vec<u64>,
     /// Cached hash per group, so growing the table never rehashes a key.
+    /// Read by [`Groups::grow`], [`Groups::absorb`] and [`fold_bucket`]; the
+    /// per-row probe reads the tag out of the slot instead.
     hashes: Vec<u64>,
     len: usize,
     /// Flat: group `g`'s accumulator for aggregate `a` is `accs[g*nagg+a]`.
@@ -1011,6 +1243,376 @@ fn replay(acc: &mut dyn Accumulator, agg: &BoundAgg, tuples: &[GroupKey]) -> Res
 /// before trusting the budget on that shape of query.
 const ACC_BYTES: usize = 48;
 
+// ------------------------------------------------------- integer group keys
+
+/// What a single integer group column's raw lane means.
+///
+/// Exactly the arms of [`Column::value`](crate::types::Column::value) that
+/// produce an integral `Value`, minus the two whose lane is not the value:
+/// `Bool` (which narrows to 0/1) and `Decimal64` (whose `Value::hash` takes a
+/// different branch). `Date` keeps a `u32` inside a `u64` lane, hence `MASK`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum LaneKind {
+    Int,
+    UInt,
+    Date,
+    DateTime,
+}
+
+const DATE_MASK: u64 = 0xFFFF_FFFF;
+
+/// The `Value` the general path would have built for this lane. Called once
+/// per *group*, never per row.
+#[inline]
+fn lane_value(kind: LaneKind, lane: u64) -> Value {
+    match kind {
+        LaneKind::Int => Value::Int(lane as i64),
+        LaneKind::UInt => Value::UInt(lane),
+        LaneKind::Date => Value::Date(lane as u32),
+        LaneKind::DateTime => Value::DateTime(lane as i64),
+    }
+}
+
+/// The lane a stored group key was built from, or `None` if it was not built
+/// from one.
+///
+/// This is the *exact* comparison the lane probe makes, so it has to reject
+/// everything [`lane_hash`] does not describe: `Null`, strings, floats and
+/// decimals, and -- the one that is easy to miss -- a `UInt` past `i64::MAX`,
+/// whose `Value::hash` falls off the exact-integer branch into the float lane
+/// and so does not hash as its lane. The block loop routes those rows to the
+/// general path; this keeps the probe from matching them anyway.
+///
+/// All four integral variants map onto one lane space on purpose: `Int(5)`,
+/// `UInt(5)`, `Date(5)` and `DateTime(5)` are one value to `Value`'s `Eq` and
+/// one hash to its `Hash`, so they must be one group here too.
+#[inline(always)]
+fn lane_of(v: &Value) -> Option<u64> {
+    match v {
+        Value::Int(x) => Some(*x as u64),
+        Value::UInt(x) if *x >> 63 == 0 => Some(*x),
+        Value::Date(d) => Some(*d as u64),
+        Value::DateTime(t) => Some(*t as u64),
+        _ => None,
+    }
+}
+
+/// `hash_values(&[Value::Int(x)])` with everything that does not depend on `x`
+/// folded in at compile time.
+///
+/// `Value::hash` writes three words for an integral value: `2u8` (the numeric
+/// equivalence class), `0u8` (the exact-integer discriminant) and then the
+/// `i64`. The first two are constant, and *every* `i64` reaches them -- `x as
+/// f64` is finite, has a zero fractional part and lies inside
+/// `[i64::MIN as f64, i64::MAX as f64]` for all of them -- so a whole
+/// `MixHasher`, an `as_f64`, a `fract()` and two of its three 128-bit folds
+/// collapse to one multiply. `lane_hash_agrees_with_the_general_path` pins the equality this
+/// entire fast path rests on; if `Value::hash` ever changes, that test fails
+/// rather than the grouping silently splitting.
+const LANE_SEED: u64 = {
+    const K: u64 = 0x9E37_79B9_7F4A_7C15;
+    const fn cmum(a: u64, b: u64) -> u64 {
+        let r = (a as u128).wrapping_mul(b as u128);
+        (r as u64) ^ ((r >> 64) as u64)
+    }
+    cmum(cmum(0x243F_6A88_85A3_08D3 ^ 0x102, K) ^ 0x100, K)
+};
+
+#[inline(always)]
+fn lane_hash(lane: u64) -> u64 {
+    crate::common::mum(LANE_SEED ^ lane, 0x9E37_79B9_7F4A_7C15)
+}
+
+/// One integer group column, classified once per block.
+///
+/// `guard` is the largest lane that still hashes as its own integer; rows past
+/// it (only reachable on a `UInt64` column) fall back to the general path.
+struct LaneCol<'c> {
+    kind: LaneKind,
+    mask: u64,
+    guard: u64,
+    lanes: Lanes<'c>,
+}
+
+enum Lanes<'c> {
+    U(&'c [u64]),
+    I(&'c [i64]),
+}
+
+/// The bit pattern a lane vector's element contributes to a group key. `i64`
+/// and `u64` differ only in how the same 64 bits are spelled.
+trait Lane: Copy {
+    fn bits(self) -> u64;
+}
+impl Lane for u64 {
+    #[inline(always)]
+    fn bits(self) -> u64 {
+        self
+    }
+}
+impl Lane for i64 {
+    #[inline(always)]
+    fn bits(self) -> u64 {
+        self as u64
+    }
+}
+
+/// Resolve a whole block's rows against the table, one integer lane at a time.
+///
+/// Generic over the lane vector *and* over whether the column has a null mask,
+/// so both stay out of the row loop: four monomorphizations (doubled again by
+/// the prefetch gate below) rather than branches per row on conditions that
+/// are constant across a whole block. `zip` rather than an index so the bounds
+/// check on `row_group` is proved once.
+///
+/// The NULL group is resolved at most once per block and then cached -- it is
+/// one group, and re-probing it per null row would put the general path's
+/// `Value` cost back on exactly the column that a nullable key is made of.
+#[allow(clippy::too_many_arguments)]
+fn lane_pass<L: Lane, const NULLS: bool>(
+    v: &[L],
+    nulls: Option<&BitSet>,
+    mask: u64,
+    guard: u64,
+    kind: LaneKind,
+    row_group: &mut [u32],
+    groups: &mut Groups,
+    protos: &[Box<dyn Accumulator>],
+    aggs: &[BoundAgg],
+) {
+    // Past this the slot array is bigger than L2 and every probe is a miss the
+    // hardware prefetcher cannot see coming, because the address is a hash.
+    // Below it the table is resident and the prefetch is pure overhead --
+    // hence a monomorphization rather than a branch. See [`lane_rows`].
+    //
+    // Measured interleaved against a switch that turned the prefetch off,
+    // best-of-7 per side, 2M rows, serial, three runs each. **1M groups**
+    // (`count()` 1.233 / 1.112 / 1.155, `count+sum` 1.131 / 1.077 / 1.157) --
+    // ~1.15x, and the sign never flipped. **100k groups** (`count()` 1.050 /
+    // 0.995 / 1.040) -- null, and a string-keyed control that does not reach
+    // this loop at all read 1.004 / 0.977 / 1.048, which is this machine's
+    // noise floor and the reason the 100k column is called null rather than
+    // 3% up. So the gate is a floor and not a tuning knob: it costs nothing
+    // where it fires early and pays where the table leaves cache.
+    if groups.slots.len() >= PREFETCH_FROM {
+        lane_rows::<L, NULLS, true>(v, nulls, mask, guard, kind, row_group, groups, protos, aggs)
+    } else {
+        lane_rows::<L, NULLS, false>(v, nulls, mask, guard, kind, row_group, groups, protos, aggs)
+    }
+}
+
+/// 32768 slots is 256 KiB, which is where a probe stops hitting L2 on the
+/// machines this was measured on.
+const PREFETCH_FROM: usize = 1 << 15;
+
+/// How far ahead to prefetch. Deep enough to cover a memory round trip at the
+/// handful of cycles a probe costs when it hits, shallow enough that the lane
+/// it reads to compute the address is one the sequential walk has already
+/// pulled in.
+const PREFETCH_AHEAD: usize = 12;
+
+#[allow(clippy::too_many_arguments)]
+fn lane_rows<L: Lane, const NULLS: bool, const PF: bool>(
+    v: &[L],
+    nulls: Option<&BitSet>,
+    mask: u64,
+    guard: u64,
+    kind: LaneKind,
+    row_group: &mut [u32],
+    groups: &mut Groups,
+    protos: &[Box<dyn Accumulator>],
+    aggs: &[BoundAgg],
+) {
+    let n = v.len();
+    let mut null_gid: Option<u32> = None;
+    for (i, (slot, &x)) in row_group.iter_mut().zip(v).enumerate() {
+        if PF {
+            // Recomputing the future row's hash is one multiply -- cheaper
+            // than the second pass and the 64 KiB scratch buffer that storing
+            // it would need. `min` rather than a bounds test: the last few
+            // rows just prefetch the last row's slot again.
+            let j = (i + PREFETCH_AHEAD).min(n - 1);
+            let h = lane_hash(v[j].bits() & mask);
+            let at = h as usize & (groups.slots.len() - 1);
+            crate::common::prefetch_read(&groups.slots[at] as *const u64 as *const u8);
+        }
+        if NULLS && nulls.is_some_and(|n| n.get(i)) {
+            *slot = *null_gid.get_or_insert_with(|| {
+                groups.find_or_insert(&[Value::Null], super::hash_null_key(), protos, aggs) as u32
+            });
+            continue;
+        }
+        let lane = x.bits() & mask;
+        // Never taken outside a `UInt64` column holding a value past
+        // `i64::MAX`, which hashes down `Value::hash`'s float branch and so
+        // has to go the long way round. Predictable, and `guard` is a
+        // register.
+        *slot = if lane > guard {
+            let key = [Value::UInt(lane)];
+            groups.find_or_insert(&key, super::hash_values(&key), protos, aggs) as u32
+        } else {
+            groups.find_or_insert_lane(lane, lane_hash(lane), kind, protos, aggs) as u32
+        };
+    }
+}
+
+/// Group ids memoized by the *address* of the string that resolved them.
+///
+/// A granule decodes its dictionary once and then clones one `Arc` per row, so
+/// a block of a string column holds one distinct pointer per distinct value
+/// and repeats it thousands of times -- `country` over eight countries is
+/// eight addresses and 8192 rows. Two rows whose `Arc` names the same
+/// allocation are the same string, so a hit skips the hash, the probe and the
+/// `memcmp` outright and costs one multiply and one compare.
+///
+/// **Cleared per block, and that is a correctness requirement, not tidiness.**
+/// An address is only a witness for as long as the allocation it names is
+/// alive; the block that owns these `Arc`s is dropped at the end of the
+/// iteration, and the next block's decode is free to reuse the same address
+/// for a different string. Within one block the `Arc`s are all held by the
+/// column being walked, so the witness holds.
+///
+/// Open-addressed rather than direct-mapped because a direct map is only as
+/// good as its worst pair: two of eight countries colliding would make every
+/// row of both a miss, and the whole point is a table that low cardinality
+/// makes vanish.
+///
+/// A miss costs a load and a store, so a column whose strings genuinely do not
+/// repeat would pay for a memo it can never use. One block of that -- more
+/// than a quarter of the rows missing -- turns it off for the rest of the
+/// query, arena and all.
+struct StrMemo {
+    /// `(address, group + 1)`; a zero address is empty.
+    slots: Vec<(usize, u32)>,
+    /// Which slots this block wrote, so clearing costs the block's *distinct*
+    /// strings and not the table's size. That is what lets the table be large
+    /// enough to hold a thousand-value dictionary without a 64 KiB memset
+    /// between blocks eating the win.
+    used: Vec<u32>,
+    /// Rows offered, and rows that had to hash, for the block in progress.
+    rows: usize,
+    miss: usize,
+    on: bool,
+}
+
+/// 4096 entries. Sized to swallow a whole granule dictionary, not just a
+/// handful of countries: `GROUP BY` over a thousand distinct strings is common
+/// and, at 8192 rows a block, still repays a memo eight times over.
+const MEMO_SLOTS: usize = 4096;
+/// Stop admitting at half full; past that the probe chains cost more than the
+/// hash they save.
+const MEMO_FULL: usize = MEMO_SLOTS / 2;
+
+impl Default for StrMemo {
+    fn default() -> StrMemo {
+        StrMemo { slots: Vec::new(), used: Vec::new(), rows: 0, miss: 0, on: true }
+    }
+}
+
+impl StrMemo {
+    /// Start a block of `rows`, judging the one just finished.
+    fn reset(&mut self, rows: usize) {
+        if !self.on {
+            return;
+        }
+        if self.miss * 4 > self.rows {
+            self.on = false;
+            self.slots = Vec::new();
+            self.used = Vec::new();
+            return;
+        }
+        // Allocated on the first block of a string grouping and never again.
+        if self.slots.is_empty() {
+            self.slots.resize(MEMO_SLOTS, (0, 0));
+            self.used.reserve(MEMO_FULL);
+        }
+        for &i in &self.used {
+            self.slots[i as usize] = (0, 0);
+        }
+        self.used.clear();
+        self.miss = 0;
+        self.rows = rows;
+    }
+
+    #[inline(always)]
+    fn at(p: usize) -> usize {
+        // Multiply-shift: `Arc` allocations of one dictionary are a short
+        // stride apart, so the low bits are the informative ones and a plain
+        // mask would keep the wrong end. The shift is derived from
+        // `MEMO_SLOTS` rather than written out -- a shift that yields fewer
+        // bits than the table has slots crowds every start index into the
+        // bottom of it, which is a table that still *works* (linear probing
+        // wraps over the whole array) but degrades to long chains exactly
+        // where the memo is supposed to pay, and nothing fails to say so.
+        p.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (usize::BITS - MEMO_SLOTS.trailing_zeros())
+    }
+
+    #[inline(always)]
+    fn get(&self, s: &std::sync::Arc<str>) -> Option<u32> {
+        if !self.on {
+            return None;
+        }
+        let p = s.as_ptr() as usize;
+        let mut i = StrMemo::at(p);
+        loop {
+            let (q, g) = self.slots[i];
+            if q == 0 {
+                return None;
+            }
+            if q == p {
+                return Some(g - 1);
+            }
+            i = (i + 1) & (MEMO_SLOTS - 1);
+        }
+    }
+
+    /// Record the group a *missed* address resolved to. One call per distinct
+    /// address per block, not per row.
+    fn put(&mut self, s: &std::sync::Arc<str>, g: u32) {
+        if !self.on {
+            return;
+        }
+        self.miss += 1;
+        if self.used.len() >= MEMO_FULL {
+            return;
+        }
+        let p = s.as_ptr() as usize;
+        let mut i = StrMemo::at(p);
+        while self.slots[i].0 != 0 {
+            i = (i + 1) & (MEMO_SLOTS - 1);
+        }
+        self.slots[i] = (p, g + 1);
+        self.used.push(i as u32);
+    }
+}
+
+/// Classify a single group column, or refuse it.
+fn lane_col<'c>(c: &'c Column) -> Option<LaneCol<'c>> {
+    use crate::types::ColumnData as D;
+    let (kind, mask, guard) = match (&c.data, c.ty.base()) {
+        (D::I64(_), DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64) => {
+            (LaneKind::Int, u64::MAX, u64::MAX)
+        }
+        // A `DateTime` normally rides a `U64` lane; this arm exists because
+        // `Column::value` has one, and the two must agree on every shape a
+        // column can be in or the fast path would answer a different `Value`
+        // than the general path for the same row.
+        (D::I64(_), DataType::DateTime) => (LaneKind::DateTime, u64::MAX, u64::MAX),
+        (D::U64(_), DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64) => {
+            (LaneKind::UInt, u64::MAX, i64::MAX as u64)
+        }
+        (D::U64(_), DataType::Date) => (LaneKind::Date, DATE_MASK, u64::MAX),
+        (D::U64(_), DataType::DateTime) => (LaneKind::DateTime, u64::MAX, u64::MAX),
+        _ => return None,
+    };
+    let lanes = match &c.data {
+        D::U64(v) => Lanes::U(v),
+        D::I64(v) => Lanes::I(v),
+        _ => return None,
+    };
+    Some(LaneCol { kind, mask, guard, lanes })
+}
+
 impl Groups {
     fn new(nkeys: usize, aggs: &[BoundAgg]) -> Groups {
         Groups {
@@ -1019,6 +1621,13 @@ impl Groups {
             slots: vec![0; 64],
             ..Default::default()
         }
+    }
+
+    /// The half of a slot that identifies the group, and the half that rules
+    /// one out. Split out so the three probe loops cannot disagree.
+    #[inline(always)]
+    fn tag(h: u64) -> u64 {
+        h & 0xFFFF_FFFF_0000_0000
     }
 
     /// Fold a partial table computed over a **later** slice of the same input.
@@ -1169,7 +1778,7 @@ impl Groups {
     /// block that produced it.
     pub(crate) fn bytes(&self) -> usize {
         self.keys.capacity() * size_of::<Value>()
-            + self.slots.capacity() * size_of::<u32>()
+            + self.slots.capacity() * size_of::<u64>()
             + self.hashes.capacity() * size_of::<u64>()
             + self.accs.capacity() * (size_of::<Box<dyn Accumulator>>() + ACC_BYTES)
             + self.seen.capacity() * size_of::<Option<FastSet<GroupKey>>>()
@@ -1218,15 +1827,17 @@ impl Groups {
     #[inline]
     fn find(&self, key: &[Value], h: u64) -> Option<usize> {
         let mask = self.slots.len() - 1;
-        let mut i = h as usize & mask;
+        let (tag, mut i) = (Groups::tag(h), h as usize & mask);
         loop {
             let s = self.slots[i];
             if s == 0 {
                 return None;
             }
-            let g = s as usize - 1;
-            if self.hashes[g] == h && self.key_of(g) == key {
-                return Some(g);
+            if Groups::tag(s) == tag {
+                let g = s as u32 as usize - 1;
+                if self.key_of(g) == key {
+                    return Some(g);
+                }
             }
             i = (i + 1) & mask;
         }
@@ -1249,22 +1860,71 @@ impl Groups {
             self.grow();
         }
         let mask = self.slots.len() - 1;
-        let mut i = h as usize & mask;
+        let (tag, mut i) = (Groups::tag(h), h as usize & mask);
         loop {
             let s = self.slots[i];
             if s == 0 {
                 let g = self.len;
-                self.slots[i] = g as u32 + 1;
+                self.slots[i] = tag | (g as u64 + 1);
                 self.keys.extend_from_slice(key);
                 self.hashes.push(h);
                 self.len += 1;
                 return (g, true);
             }
-            let g = s as usize - 1;
-            // Compare the cached hash first: a mismatch rules the group out
-            // without touching the arena, which is the expensive part.
-            if self.hashes[g] == h && self.key_of(g) == key {
-                return (g, false);
+            // Compare the slot's own hash tag first: a mismatch rules the group
+            // out without touching either arena, which is the expensive part.
+            if Groups::tag(s) == tag {
+                let g = s as u32 as usize - 1;
+                if self.key_of(g) == key {
+                    return (g, false);
+                }
+            }
+            i = (i + 1) & mask;
+        }
+    }
+
+    /// Single integer key, probed straight off the block's lane.
+    ///
+    /// The general path builds a `Value` per row, hashes it through
+    /// `MixHasher` (three folds, a float round-trip and a `fract()`) and then
+    /// compares a `&[Value]` slice. Here the hash is one multiply
+    /// ([`lane_hash`]), the probe reads the tag out of the slot, and the
+    /// compare is one `u64`; nothing but a genuinely new group ever
+    /// materializes a `Value`.
+    #[inline]
+    fn find_or_insert_lane(
+        &mut self,
+        lane: u64,
+        h: u64,
+        kind: LaneKind,
+        protos: &[Box<dyn Accumulator>],
+        aggs: &[BoundAgg],
+    ) -> usize {
+        debug_assert_eq!(self.nkeys, 1);
+        if (self.len + 1) * 2 >= self.slots.len() {
+            self.grow();
+        }
+        let mask = self.slots.len() - 1;
+        let (tag, mut i) = (Groups::tag(h), h as usize & mask);
+        loop {
+            let s = self.slots[i];
+            if s == 0 {
+                let g = self.len;
+                self.slots[i] = tag | (g as u64 + 1);
+                self.keys.push(lane_value(kind, lane));
+                self.hashes.push(h);
+                self.len += 1;
+                self.push_group(protos, aggs);
+                return g;
+            }
+            if Groups::tag(s) == tag {
+                let g = s as u32 as usize - 1;
+                // Exact, not a tag: `lane_of` is `None` for every key this
+                // lane space does not describe, so a `Null` group (or a
+                // `UInt` past `i64::MAX`) sharing a tag can never be matched.
+                if lane_of(&self.keys[g]) == Some(lane) {
+                    return g;
+                }
             }
             i = (i + 1) & mask;
         }
@@ -1287,21 +1947,26 @@ impl Groups {
             self.grow();
         }
         let mask = self.slots.len() - 1;
-        let mut i = h as usize & mask;
+        let (tag, mut i) = (Groups::tag(h), h as usize & mask);
         loop {
             let s = self.slots[i];
             if s == 0 {
                 let g = self.len;
-                self.slots[i] = g as u32 + 1;
+                self.slots[i] = tag | (g as u64 + 1);
                 self.keys.push(Value::Str(key.clone()));
                 self.hashes.push(h);
                 self.len += 1;
                 self.push_group(protos, aggs);
                 return g;
             }
-            let g = s as usize - 1;
-            if self.hashes[g] == h && self.keys[g].as_str() == Some(&**key) {
-                return g;
+            // The tag rules out a colliding group before the `Arc` is chased:
+            // on a string key the exact compare is two dependent loads and a
+            // `memcmp`, so it is the one this most wants not to reach.
+            if Groups::tag(s) == tag {
+                let g = s as u32 as usize - 1;
+                if self.keys[g].as_str() == Some(&**key) {
+                    return g;
+                }
             }
             i = (i + 1) & mask;
         }
@@ -1310,13 +1975,14 @@ impl Groups {
     fn grow(&mut self) {
         let cap = (self.slots.len() * 2).max(64);
         let mask = cap - 1;
-        let mut slots = vec![0u32; cap];
+        let mut slots = vec![0u64; cap];
         for g in 0..self.len {
-            let mut i = self.hashes[g] as usize & mask;
+            let h = self.hashes[g];
+            let mut i = h as usize & mask;
             while slots[i] != 0 {
                 i = (i + 1) & mask;
             }
-            slots[i] = g as u32 + 1;
+            slots[i] = Groups::tag(h) | (g as u64 + 1);
         }
         self.slots = slots;
     }
@@ -1968,6 +2634,89 @@ mod tests {
         let out = out_schema(vec![("a", DataType::Float64)]);
         let ctx = QueryContext::new();
         assert!(Aggregate::new(Box::new(Values::new(&rows, &s)), &[], &aggs, &out, &ctx).is_err());
+    }
+
+    // -------------------------------------------------- the integer lane key
+
+    /// The equality the whole lane fast path rests on.
+    ///
+    /// If `Value::hash` ever stops folding an integral value as
+    /// `2u8, 0u8, i64`, this fails -- which is the point. The alternative to
+    /// pinning it here is a `GROUP BY` that quietly puts one key in two groups
+    /// on whichever build changed it.
+    #[test]
+    fn lane_hash_agrees_with_the_general_path() {
+        let mut lanes: Vec<u64> = vec![
+            0,
+            1,
+            2,
+            7,
+            255,
+            65_535,
+            1 << 31,
+            (1u64 << 62) - 1,
+            i64::MAX as u64,
+            (-1i64) as u64,
+            (-2i64) as u64,
+            (i64::MIN) as u64,
+        ];
+        for i in 0..512u64 {
+            lanes.push(crate::common::splitmix64(i) >> 1);
+        }
+        for &l in &lanes {
+            for kind in [LaneKind::Int, LaneKind::UInt, LaneKind::Date, LaneKind::DateTime] {
+                // The two narrow kinds only ever see lanes their `Value` can
+                // hold; `lane_col` masks `Date` and the column supplies the
+                // rest.
+                let l = match kind {
+                    LaneKind::Date => l & DATE_MASK,
+                    LaneKind::UInt => l & (i64::MAX as u64),
+                    _ => l,
+                };
+                let v = lane_value(kind, l);
+                assert_eq!(
+                    lane_hash(l),
+                    super::super::hash_values(std::slice::from_ref(&v)),
+                    "{kind:?} lane {l:#x} ({v})"
+                );
+                assert_eq!(lane_of(&v), Some(l), "{kind:?} lane {l:#x} does not round-trip");
+            }
+        }
+    }
+
+    /// Everything the lane probe must refuse, because its hash is not
+    /// `lane_hash` and a match would merge two different keys.
+    #[test]
+    fn lane_of_refuses_what_it_does_not_describe() {
+        for v in [
+            Value::Null,
+            Value::str("7"),
+            Value::Float(7.0),
+            Value::Decimal(700, 2),
+            Value::Bool(true),
+            Value::UInt(i64::MAX as u64 + 1),
+            Value::UInt(u64::MAX),
+        ] {
+            assert_eq!(lane_of(&v), None, "{v} must not be reachable from a lane probe");
+        }
+        // And the one that would otherwise be a silent merge: a `UInt` past
+        // `i64::MAX` hashes down `Value::hash`'s float branch, so its lane and
+        // its hash disagree.
+        let big = Value::UInt(1u64 << 63);
+        assert_ne!(lane_hash(1u64 << 63), super::super::hash_values(&[big]));
+    }
+
+    /// A slot carries both halves, and neither reads the other's bits.
+    #[test]
+    fn a_slot_holds_a_tag_and_a_group_without_overlapping() {
+        for h in [0u64, u64::MAX, 0x1234_5678_9ABC_DEF0] {
+            for g in [0u64, 1, 4095, u32::MAX as u64 - 1] {
+                let s = Groups::tag(h) | (g + 1);
+                assert_eq!(Groups::tag(s), Groups::tag(h));
+                assert_eq!(s as u32 as u64 - 1, g);
+                assert_ne!(s, 0, "an occupied slot must never read as empty");
+            }
+        }
     }
 
     // ------------------------------------------------ budget & cancellation

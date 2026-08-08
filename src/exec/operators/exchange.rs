@@ -1130,8 +1130,15 @@ mod tests {
         // in-order merge is supposed to reproduce first-seen group order and
         // stable sort ties exactly, not merely produce the same multiset.
         for q in [
-            // bare aggregates, one per merge shape
-            "SELECT count(*) FROM t",
+            // bare aggregates, one per merge shape.
+            //
+            // `count(*)` is paired with a `sum` throughout this list because a
+            // count that is *only* a count no longer reaches the exchange:
+            // `physical::meta_path` answers it from part metadata, so it would
+            // sit here failing `goes_parallel` while testing nothing. The pair
+            // still exercises the `CountAcc` merge, which is what this line is
+            // for.
+            "SELECT count(*), sum(k) FROM t",
             "SELECT sum(k), min(k), max(k), avg(k) FROM t",
             "SELECT sum(f), avg(f) FROM t",
             "SELECT any(s), anyLast(s) FROM t",
@@ -1158,12 +1165,13 @@ mod tests {
             "SELECT s, count(DISTINCT k), sum(DISTINCT k), count(k) FROM t GROUP BY s",
             "SELECT count(DISTINCT n) FROM t",
             // filters and projections between the scan and the top
-            "SELECT count(*) FROM t WHERE k = 3",
+            "SELECT count(*), sum(k) FROM t WHERE k = 3",
             "SELECT sum(k) FROM t WHERE id > 100000",
             "SELECT s, count(*) FROM t WHERE n IS NOT NULL GROUP BY s",
             "SELECT sum(k * 2 + 1) FROM t WHERE s != 'ann'",
             // an empty result from a filter nothing survives
             "SELECT count(*), sum(k) FROM t WHERE k = 99",
+            "SELECT count(*) FROM t WHERE id % 3 = 0",
             "SELECT k, count(*) FROM t WHERE k = 99 GROUP BY k",
             // ORDER BY: full sorts on both strategies, and top-K
             "SELECT id FROM t ORDER BY id DESC",
@@ -1220,12 +1228,15 @@ mod tests {
             sql.push_str(&format!("({i},{})", i % 7));
         }
         s.execute(&sql).unwrap();
-        assert!(!goes_parallel(&mut s, "SELECT count(*) FROM small"));
+        // `sum`, because a bare `count(*)` is answered from part metadata at
+        // every size and so is serial on both sides of the threshold -- which
+        // would make the last assertion here unfalsifiable.
+        assert!(!goes_parallel(&mut s, "SELECT sum(v) FROM small"));
         assert!(!goes_parallel(&mut s, "SELECT v, count(*) FROM small GROUP BY v"));
         assert!(!goes_parallel(&mut s, "SELECT id FROM small ORDER BY id LIMIT 5"));
         // ... and one more row tips it over.
         s.execute(&format!("INSERT INTO small VALUES ({MIN_PARALLEL_ROWS}, 1)")).unwrap();
-        assert!(goes_parallel(&mut s, "SELECT count(*) FROM small"));
+        assert!(goes_parallel(&mut s, "SELECT sum(v) FROM small"));
     }
 
     #[test]
@@ -1278,7 +1289,10 @@ mod tests {
     #[test]
     fn counters_add_up_across_the_workers() {
         let mut s = session();
-        let plan = plan_of(&mut s, "SELECT count(*) FROM t");
+        // `sum`, not `count(*)`: the metadata path reads no rows at all, so
+        // `rows_read` would be zero on both sides and prove nothing about the
+        // split.
+        let plan = plan_of(&mut s, "SELECT sum(k) FROM t");
         let ctx = QueryContext::new();
         let (_, serial) = operators::execute_ctx(&plan, &s.catalog, &ctx).unwrap();
         let (_, par) = execute_ctx(&plan, &s.catalog, &ctx).unwrap();
@@ -1407,7 +1421,10 @@ mod tests {
         s.catalog.flush_all().unwrap();
         assert!(s.catalog.table_by_path("default.t").unwrap().part_count() >= 2);
         for q in [
-            "SELECT count(*) FROM t WHERE id >= 500000",
+            // ... and a `sum` beside the count, because a lone count under a
+            // zone-decidable predicate is answered from part metadata and
+            // never reaches a worker.
+            "SELECT count(*), sum(k) FROM t WHERE id >= 500000",
             "SELECT k, count(*), min(id), max(id) FROM t WHERE id > 100000 GROUP BY k",
             "SELECT id FROM t WHERE id >= 550000 ORDER BY id LIMIT 25",
             "SELECT s, count(DISTINCT k) FROM t WHERE id < 600000 GROUP BY s",

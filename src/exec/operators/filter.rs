@@ -9,6 +9,28 @@
 //! whole batch must not hand an empty block upstream, because `None` is the
 //! only end-of-stream signal and a caller that stopped at the first empty
 //! block would truncate the query.
+//!
+//! ## Where this operator's time actually goes, and why none of it is here
+//!
+//! Measured serially over 2M rows, best-of-15: `Scan[Int64]` alone 3.84 ms,
+//! `Scan + Filter(keeps everything)` 7.00 ms, `Scan + Filter(keeps half)`
+//! 8.35 ms. So the *gather* -- the only copy this file makes -- is 1.35 ms for
+//! a million rows, and **evaluating the predicate is 3.16 ms**, more than the
+//! scan under it. That cost is all in [`crate::exec::expr::eval_predicate`], which for
+//! `col > lit` allocates and fills four buffers per block: a `Vec` clone of the
+//! column (a bare column reference has to come back owned), a `Column::constant`
+//! broadcast of the literal, the boolean result, and the selection vector.
+//! There is nothing to hoist *here* -- the fix is a fused compare in `expr`,
+//! and duplicating three-valued logic in this file to reuse one 32 KB
+//! selection buffer would buy ~25 us of the 3160 against a second source of
+//! truth for `NULL`.
+//!
+//! Rejected, and not because it is slow: **coalescing survivors to
+//! `BLOCK_SIZE`** the way [`super::scan`] does, so a selective filter stops
+//! handing 50-row blocks to the operator above. It costs one `Block::extend`
+//! copy per surviving row, and it makes `WHERE <rare> LIMIT 1` read 8192
+//! survivors before answering where today it answers on the first. A latency
+//! cliff on a point-ish query is not worth a batching win on a scan-ish one.
 
 use crate::common::Result;
 use crate::exec::expr;

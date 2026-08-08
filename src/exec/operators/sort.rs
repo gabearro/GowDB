@@ -7,16 +7,19 @@
 //!
 //! ## Two strategies
 //!
-//! *Radix* when there is a single key that is non-nullable and non-string. The
-//! key goes through [`crate::common`]'s order-preserving lane codec, so four
-//! branchless 16-bit LSD passes over `(lane, row)` pairs replace `n log n`
-//! comparisons -- and [`radix_sort`] skips any pass whose 16 bits are uniform,
-//! which for clustered data is usually the top two.
+//! *Radix* when there is a single non-string key. The key goes through
+//! [`crate::common`]'s order-preserving lane codec, so four branchless 16-bit
+//! LSD passes over `(lane, row)` pairs replace `n log n` comparisons -- and
+//! [`radix_sort`] skips any pass whose 16 bits are uniform, which for clustered
+//! data is usually the top two. A NULL has no lane (every 64-bit pattern is
+//! some value's), so [`radix_permutation`] partitions the NULL rows out and
+//! puts them back at whichever end `nulls_first` names; that is one extra pass
+//! and it keeps nullable keys off the comparison path, where they used to cost
+//! 10x.
 //!
-//! *Comparison* otherwise: nullable keys, string keys, or several keys. NULL
-//! placement and per-key direction are the reason -- a lane cannot encode
-//! "NULLS LAST on a descending key", and string lanes are per-granule
-//! dictionary codes with no global meaning.
+//! *Comparison* otherwise: string keys, or several keys. Per-key direction and
+//! per-key NULL placement are the reason a tuple cannot be one lane, and string
+//! lanes are per-granule dictionary codes with no global meaning.
 //!
 //! ## Descending without losing stability
 //!
@@ -40,6 +43,12 @@
 //! side was already on the fast radix path), `ORDER BY country, ts LIMIT 100`
 //! 592ms -> 45ms (13.1x). Peak sort memory falls from the whole relation to
 //! roughly `1.5k` rows, which is the part that matters here.
+//!
+//! That test is now two tests, and on the shape [`radix_permutation`] handles
+//! neither of them builds a `Value`: [`Sort::survivors`] asks the block whether
+//! *anything* in it beats the threshold before it asks which rows do, both as
+//! `u64` lane compares. That is where the remaining 2.3-3.4x on
+//! `ORDER BY latency DESC LIMIT 5` came from; the table is on `survivors`.
 //!
 //! It is not unconditional: past a certain `k` the fusion starts losing, and
 //! [`Sort::worth_fusing`] carries the table of where.
@@ -160,9 +169,11 @@ impl<'a> Sort<'a> {
     /// would be a coin flip. Above them the plain sort runs and little is
     /// lost -- at `k = n/4` the memory saving was small anyway.
     pub(crate) fn worth_fusing(keys: &[SortKey], k: usize) -> bool {
-        let radix = keys.len() == 1
-            && keys[0].expr.ty().physical() != PhysicalType::Str
-            && !keys[0].expr.ty().is_nullable();
+        // Nullability dropped from this test when `radix_permutation` learned
+        // to partition NULLs out: a `Nullable(Int64)` key is now four linear
+        // passes like any other, so it wants the radix ceiling, not the
+        // comparison one.
+        let radix = keys.len() == 1 && keys[0].expr.ty().physical() != PhysicalType::Str;
         k <= if radix { 64 << 10 } else { 1 << 20 }
     }
 
@@ -321,6 +332,9 @@ impl<'a> Sort<'a> {
         let mut sel: Vec<u32> = Vec::new();
         let mut probe: Vec<Value> = vec![Value::Null; nk];
         let mut worst: Vec<Value> = Vec::new();
+        // The same threshold as `worst`, as an order-preserving lane, for the
+        // single-scalar-key shape. See [`Sort::survivors`].
+        let mut worst_lane: Option<u64> = None;
 
         loop {
             self.ctx.check()?;
@@ -330,28 +344,13 @@ impl<'a> Sort<'a> {
             }
 
             // The buffer is full, so only rows that beat the current k-th best
-            // can change the answer. Strictly-less is what keeps this stable:
-            // a row that ties the k-th best sorts after it and would be
-            // dropped again anyway.
+            // can change the answer.
             let b = if worst.is_empty() {
                 b
+            } else if self.survivors(&b, &worst, worst_lane, &mut sel, &mut probe)? {
+                b.take(&sel)
             } else {
-                let kc = key_columns(self.keys, &b)?;
-                sel.clear();
-                for i in 0..b.rows() {
-                    for (slot, c) in probe.iter_mut().zip(kc.iter()) {
-                        *slot = c.as_ref().value(i);
-                    }
-                    if compare_keys(&probe, &worst, self.keys) == Ordering::Less {
-                        sel.push(i as u32);
-                    }
-                }
-                if sel.is_empty() {
-                    continue;
-                }
-                let kept = b.take(&sel);
-                drop(kc);
-                kept
+                continue;
             };
 
             let mut combined = match top.take() {
@@ -363,7 +362,7 @@ impl<'a> Sort<'a> {
             };
             guard.grow_to(combined.bytes() + combined.rows() * scratch_per_row)?;
             if combined.rows() >= trim_at {
-                combined = self.trim(combined, k, &mut worst)?;
+                combined = self.trim(combined, k, &mut worst, &mut worst_lane)?;
             }
             top = Some(combined);
         }
@@ -371,13 +370,85 @@ impl<'a> Sort<'a> {
         // The buffer holds up to `trim_at` rows in whatever order the last
         // merge left them, so the final trim is not optional.
         if let Some(all) = top {
-            self.out = chunk(self.trim(all, k, &mut worst)?);
+            self.out = chunk(self.trim(all, k, &mut worst, &mut worst_lane)?);
         }
         Ok(())
     }
 
+    /// Which rows of `b` can still make the answer, into `sel`; `false` when
+    /// none can and the whole block is dropped.
+    ///
+    /// Strictly-better is what keeps this stable: a row that ties the k-th best
+    /// sorts after it and would be dropped again anyway.
+    ///
+    /// ## Why the lane path exists
+    ///
+    /// The general path materializes one `Value` per key per row and runs
+    /// [`compare_keys`] on it -- for `ORDER BY latency DESC LIMIT 5` that is
+    /// 2M `Value`s built and thrown away to answer a question about five rows.
+    /// On the single non-nullable scalar key that [`radix_permutation`] already
+    /// handles, the same question is a `u64` compare against a hoisted
+    /// threshold, and the threshold is read with the *same* lane codec the
+    /// sort itself uses, so the filter and the sort cannot disagree about an
+    /// edge a `Value` round trip would round off.
+    ///
+    /// Better still, the block-level question ("does anything here beat the
+    /// threshold?") separates from the row-level one. It is a branchless
+    /// reduction, it vectorizes, and once the buffer is warm it answers *no*
+    /// for essentially every block -- for `k = 5` over 2M rows the expected
+    /// number of contributing rows in a block is 0.02 -- so the common block
+    /// never touches `sel` and never mispredicts a store.
+    ///
+    /// Measured interleaved against the `Value` loop behind a temporary switch,
+    /// both sides in one loop with the leading side alternating, best-of-7..11,
+    /// four runs, 2M rows:
+    ///
+    /// ```text
+    ///   ORDER BY latency DESC LIMIT 5     2.74x 2.90x 2.32x 2.68x
+    ///   ORDER BY ts LIMIT 5               2.87x 2.78x 3.15x 3.36x
+    ///   ORDER BY latency DESC LIMIT 1000  2.15x 2.24x 2.34x 2.19x
+    ///   ORDER BY nbytes LIMIT 5 (nullable, falls back)  1.77x 2.01x 1.63x 1.79x
+    ///   ORDER BY country, ts LIMIT 100 (two keys, no lane)  1.03x .. 1.14x
+    /// ```
+    ///
+    /// The last row is the control: two keys have no single lane, so that shape
+    /// runs the same code it ran before. The nullable row improves only because
+    /// its `trim` moved onto [`radix_permutation`]; its filter still takes the
+    /// `Value` path, which is the obvious next thing to do here.
+    fn survivors(
+        &self,
+        b: &Block,
+        worst: &[Value],
+        worst_lane: Option<u64>,
+        sel: &mut Vec<u32>,
+        probe: &mut [Value],
+    ) -> Result<bool> {
+        let kc = key_columns(self.keys, b)?;
+        if let (Some(w), [c]) = (worst_lane, kc.as_slice()) {
+            if let Some(any) = lane_filter(c.as_ref(), self.keys[0].asc, w, sel) {
+                return Ok(any);
+            }
+        }
+        sel.clear();
+        for i in 0..b.rows() {
+            for (slot, c) in probe.iter_mut().zip(kc.iter()) {
+                *slot = c.as_ref().value(i);
+            }
+            if compare_keys(probe, worst, self.keys) == Ordering::Less {
+                sel.push(i as u32);
+            }
+        }
+        Ok(!sel.is_empty())
+    }
+
     /// Sort the buffer, keep its first `k` rows, and republish the threshold.
-    fn trim(&self, b: Block, k: usize, worst: &mut Vec<Value>) -> Result<Block> {
+    fn trim(
+        &self,
+        b: Block,
+        k: usize,
+        worst: &mut Vec<Value>,
+        worst_lane: &mut Option<u64>,
+    ) -> Result<Block> {
         let cols = key_columns(self.keys, &b)?;
         let refs: Vec<&Column> = cols.iter().map(|c| c.as_ref()).collect();
         let perm = permutation(&refs, self.keys, b.rows())?;
@@ -392,9 +463,84 @@ impl<'a> Sort<'a> {
             for c in &kc {
                 worst.push(c.as_ref().value(k - 1));
             }
+            *worst_lane = match kc.as_slice() {
+                [c] => lane_at(c.as_ref(), k - 1),
+                _ => None,
+            };
         }
         Ok(out)
     }
+}
+
+/// One row's sort lane, or `None` where the column has no global lane -- the
+/// same two exclusions [`lane_comparable`] makes, for the same two reasons.
+fn lane_at(c: &Column, i: usize) -> Option<u64> {
+    if c.has_nulls() {
+        return None;
+    }
+    match &c.data {
+        ColumnData::U64(v) => Some(v[i]),
+        ColumnData::I64(v) => Some(i64_to_lane(v[i])),
+        ColumnData::F64(v) => Some(f64_to_lane(v[i])),
+        ColumnData::Str(_) => None,
+    }
+}
+
+/// Rows of `c` whose lane beats `w`, into `sel`; `Some(false)` when none do and
+/// `None` when `c` has no lane and the caller must fall back.
+fn lane_filter(c: &Column, asc: bool, w: u64, sel: &mut Vec<u32>) -> Option<bool> {
+    if c.has_nulls() {
+        return None;
+    }
+    Some(match &c.data {
+        ColumnData::U64(v) => beats(v, w, asc, |x| x, sel),
+        ColumnData::I64(v) => beats(v, w, asc, i64_to_lane, sel),
+        ColumnData::F64(v) => beats(v, w, asc, f64_to_lane, sel),
+        ColumnData::Str(_) => return None,
+    })
+}
+
+/// Rows whose lane beats `w`, in the key's direction. The direction is resolved
+/// here, once per block, so [`scan`] below is a loop over one fixed predicate.
+#[inline]
+fn beats<T: Copy>(v: &[T], w: u64, asc: bool, lane: impl Fn(T) -> u64, sel: &mut Vec<u32>) -> bool {
+    if asc {
+        scan(v, sel, |x| lane(x) < w)
+    } else {
+        scan(v, sel, |x| lane(x) > w)
+    }
+}
+
+/// Two flat passes: does *anything* satisfy `hit`, and only then, which rows do.
+///
+/// Deliberately two rather than one. The reduction has no stores and no
+/// branches, so it vectorizes; the collect stores and cannot. Once the top-K
+/// buffer is warm almost no block has a survivor -- for `k = 5` over 2M rows the
+/// expected number of contributing rows per 8192-row block is 0.02 -- so paying
+/// the collect's throughput on every block is paying it for nothing.
+///
+/// Measured against the fused single loop in a standalone harness, 244 blocks
+/// of 8192 `u64`, both sides in one loop with the leading side alternating,
+/// best-of-15, twice:
+///
+/// ```text
+///   nothing beats the threshold    0.79 -> 0.21 ms   3.66x  3.70x
+///   1 row in 900 beats it          0.85 -> 1.04      0.82x  0.81x
+///   1 row in 9 beats it            2.56 -> 2.82      0.91x  0.91x
+/// ```
+///
+/// So the split costs 10-20% when every block contributes and pays 3.7x back
+/// when none does. Only the first row is a shape top-K actually spends its time
+/// in: a threshold that a nine-hundredth of the rows clear is a threshold about
+/// to be raised by the next trim.
+#[inline]
+fn scan<T: Copy>(v: &[T], sel: &mut Vec<u32>, hit: impl Fn(T) -> bool) -> bool {
+    if !v.iter().fold(false, |a, &x| a | hit(x)) {
+        return false;
+    }
+    sel.clear();
+    sel.extend(v.iter().enumerate().filter(|&(_, &x)| hit(x)).map(|(i, _)| i as u32));
+    true
 }
 
 /// The key columns of a block, borrowed where the key is a plain column.
@@ -415,10 +561,17 @@ fn key_columns<'b>(keys: &[SortKey], b: &'b Block) -> Result<Vec<Cow<'b, Column>
 /// What [`permutation`] will allocate for `rows`: the id vector always, plus
 /// either the radix `(lane, row)` pairs or the materialized key tuples.
 fn scratch_bytes(rows: usize, keys: &[SortKey], cols: &[&Column]) -> usize {
-    let per_row = if keys.len() == 1 && radix_eligible(cols[0]) {
-        12
-    } else {
-        keys.len() * size_of::<Value>()
+    let per_row = match () {
+        // `(lane, row)` pairs, plus -- when the column carries a mask -- the
+        // NULL list and the concatenation `radix_permutation` assembles.
+        _ if keys.len() == 1 && radix_eligible(cols[0]) => {
+            if cols[0].has_nulls() {
+                20
+            } else {
+                12
+            }
+        }
+        _ => keys.len() * size_of::<Value>(),
     };
     rows * (4 + per_row)
 }
@@ -473,10 +626,16 @@ fn est_scratch_per_row(keys: &[SortKey]) -> usize {
     if keys.is_empty() {
         return 4;
     }
-    let radix = keys.len() == 1
-        && keys[0].expr.ty().physical() != PhysicalType::Str
-        && !keys[0].expr.ty().is_nullable();
-    4 + if radix { 12 } else { keys.len() * size_of::<Value>() }
+    let radix = keys.len() == 1 && keys[0].expr.ty().physical() != PhysicalType::Str;
+    4 + match (radix, keys[0].expr.ty().is_nullable()) {
+        // The declared type is all a buffer still filling has to go on, so a
+        // nullable key is charged the NULL-partitioning peak even when its
+        // blocks turn out to hold no NULLs. That direction is the safe one and
+        // it is 8 B/row.
+        (true, true) => 20,
+        (true, false) => 12,
+        _ => keys.len() * size_of::<Value>(),
+    }
 }
 
 /// Test knob: spill every `n` buffered rows (or, in the hash aggregate, every
@@ -1035,7 +1194,7 @@ fn lane_of(k: &Keyed<'_>, i: usize, pos: usize) -> u64 {
         Keyed::I(v) => i64_to_lane(v[i][pos]),
         Keyed::F(v) => f64_to_lane(v[i][pos]),
         // `Heads::new` admits the lane comparator only when every run's key
-        // column is `radix_eligible`, which excludes strings outright.
+        // column is `lane_comparable`, which excludes strings outright.
         Keyed::Cols(_) => {
             debug_assert!(false, "the lane comparator was given a string key");
             0
@@ -1048,7 +1207,7 @@ impl Heads {
         // Every run has to be lane-eligible, not just the first: one worker's
         // slice can hold a NULL where another's does not, and a NULL's lane is
         // a stored zero that would sort as a real value.
-        let lane = keys.len() == 1 && rs.iter().all(|r| radix_eligible(key_col(r, &at[0])));
+        let lane = keys.len() == 1 && rs.iter().all(|r| lane_comparable(key_col(r, &at[0])));
         Heads {
             vals: if lane { Vec::new() } else { vec![Value::Null; rs.len() * keys.len()] },
             lanes: if lane { vec![0; rs.len()] } else { Vec::new() },
@@ -1119,7 +1278,7 @@ pub(crate) fn permutation(cols: &[&Column], keys: &[SortKey], rows: usize) -> Re
         return Ok((0..rows as u32).collect());
     }
     if keys.len() == 1 && radix_eligible(cols[0]) {
-        return radix_permutation(cols[0], keys[0].asc);
+        return radix_permutation(cols[0], &keys[0]);
     }
     // Comparison fallback. Materializing the key tuples once up front turns
     // `O(n log n)` `Column::value` calls into `O(n)` of them.
@@ -1147,46 +1306,120 @@ pub(crate) fn permutation(cols: &[&Column], keys: &[SortKey], rows: usize) -> Re
     Ok(idx)
 }
 
+/// Can this column be **sorted** by lane? Only a string cannot: its dictionary
+/// codes are per granule, so there is no global lane. NULLs used to disqualify
+/// a column here too and no longer do -- [`radix_permutation`] partitions them
+/// out instead of trying to give them one.
 fn radix_eligible(c: &Column) -> bool {
-    // Strings have no global lane (dictionary codes are per granule), and a
-    // NULL's lane is a stored zero that would sort as a real value.
-    !c.has_nulls() && c.ty.physical() != PhysicalType::Str
+    c.ty.physical() != PhysicalType::Str
 }
 
-fn radix_permutation(c: &Column, asc: bool) -> Result<Vec<u32>> {
-    let mut keyed: Vec<(u64, u32)> = match &c.data {
-        ColumnData::U64(v) => v.iter().enumerate().map(|(i, &x)| (x, i as u32)).collect(),
-        ColumnData::I64(v) => v
-            .iter()
-            .enumerate()
-            .map(|(i, &x)| (i64_to_lane(x), i as u32))
-            .collect(),
-        ColumnData::F64(v) => v
-            .iter()
-            .enumerate()
-            .map(|(i, &x)| (f64_to_lane(x), i as u32))
-            .collect(),
+/// Can this column's rows be **compared** by reading their lanes where they
+/// lie? Strictly stronger than [`radix_eligible`], and a NULL mask is the whole
+/// difference: a sort gets to move the NULLs aside once, while a comparator
+/// reading a stored lane has nowhere to put them, and a NULL's lane is a stored
+/// zero that would sort as a real value.
+///
+/// The two were one predicate until the sort learned about masks, and the merge
+/// silently inherited the wrong one: `SELECT n FROM t ORDER BY n` over a
+/// nullable column came back in a different order from fourteen workers than
+/// from one. Kept separate, and named for the question each asks.
+fn lane_comparable(c: &Column) -> bool {
+    !c.has_nulls() && radix_eligible(c)
+}
+
+/// `(lane, row)` pairs for the non-NULL rows, and the NULL rows separately.
+///
+/// Splitting rather than giving NULL a lane is forced: `NULLS LAST` would want
+/// `u64::MAX`, which is exactly `i64::MAX`'s lane and `NaN`'s, so the NULLs
+/// would *interleave* with those instead of following every value. Nothing
+/// else would do either -- every 64-bit pattern is some value's lane.
+#[inline]
+fn split_lanes<T: Copy>(
+    v: &[T],
+    c: &Column,
+    f: impl Fn(T) -> u64,
+    keyed: &mut Vec<(u64, u32)>,
+    nulls: &mut Vec<u32>,
+) {
+    match &c.nulls {
+        None => keyed.extend(v.iter().enumerate().map(|(i, &x)| (f(x), i as u32))),
+        Some(m) => {
+            for (i, &x) in v.iter().enumerate() {
+                if m.get(i) {
+                    nulls.push(i as u32);
+                } else {
+                    keyed.push((f(x), i as u32));
+                }
+            }
+        }
+    }
+}
+
+/// The radix path, for one non-string key, nullable or not.
+///
+/// A nullable key used to be excluded and fell all the way to the `n log n`
+/// `Value` comparison sort -- a cliff, since nothing about the *values* stops
+/// being lane-sortable when a mask appears beside them. The NULLs come out as
+/// one run in input order, which is what stability requires of a set of rows
+/// that all compare equal, and `nulls_first` decides which end it goes on;
+/// that is the same absolute placement [`compare_keys`] gives, applied before
+/// the descending flip rather than reversed with it.
+///
+/// Measured interleaved against the comparison path behind a temporary switch,
+/// both sides in one loop with the leading side alternating, best-of-7..11,
+/// four runs, 2M rows, a `Nullable(Int64)` key one row in eight NULL:
+///
+/// ```text
+///   ORDER BY nbytes                    241 -> 84 ms   2.73x 2.67x 2.88x 2.76x
+///   ORDER BY nbytes DESC NULLS FIRST   257 -> 19 ms  16.0x 12.2x 13.6x 11.7x
+///   ORDER BY latency (non-nullable, untouched)  1.00x 1.00x 0.94x 1.02x
+/// ```
+///
+/// The two directions differ by 4x *after* the change and not before, which is
+/// [`merge_runs`] and not this: NULLS FIRST puts each worker's NULL run at the
+/// front, ties break toward the lower run index, and the merge then hands back
+/// long single-run stretches that take its bulk-slice path instead of the
+/// per-row gather. Worth knowing before reading much into either number alone.
+fn radix_permutation(c: &Column, key: &SortKey) -> Result<Vec<u32>> {
+    let n = c.len();
+    let mut keyed: Vec<(u64, u32)> = Vec::with_capacity(n);
+    let mut nulls: Vec<u32> = Vec::new();
+    match &c.data {
+        ColumnData::U64(v) => split_lanes(v, c, |x| x, &mut keyed, &mut nulls),
+        ColumnData::I64(v) => split_lanes(v, c, i64_to_lane, &mut keyed, &mut nulls),
+        ColumnData::F64(v) => split_lanes(v, c, f64_to_lane, &mut keyed, &mut nulls),
         ColumnData::Str(_) => {
             return Err(Error::exec("string columns have no global sort lane"))
         }
-    };
+    }
     radix_sort(&mut keyed);
-    if asc {
+    if !key.asc {
+        // Descending: reverse, then un-reverse each run of equal keys so the
+        // sort stays stable.
+        keyed.reverse();
+        let mut s = 0;
+        while s < keyed.len() {
+            let mut e = s + 1;
+            while e < keyed.len() && keyed[e].0 == keyed[s].0 {
+                e += 1;
+            }
+            keyed[s..e].reverse();
+            s = e;
+        }
+    }
+    if nulls.is_empty() {
         return Ok(keyed.into_iter().map(|(_, i)| i).collect());
     }
-    // Descending: reverse, then un-reverse each run of equal keys so the sort
-    // stays stable.
-    keyed.reverse();
-    let mut s = 0;
-    while s < keyed.len() {
-        let mut e = s + 1;
-        while e < keyed.len() && keyed[e].0 == keyed[s].0 {
-            e += 1;
-        }
-        keyed[s..e].reverse();
-        s = e;
+    let mut out: Vec<u32> = Vec::with_capacity(n);
+    if key.nulls_first {
+        out.append(&mut nulls);
     }
-    Ok(keyed.into_iter().map(|(_, i)| i).collect())
+    out.extend(keyed.iter().map(|&(_, i)| i));
+    // Drains, so the second call is a no-op when the first one ran; that is
+    // cheaper than deciding twice and it cannot get the two ends out of step.
+    out.append(&mut nulls);
+    Ok(out)
 }
 
 /// Lexicographic comparison honouring each key's `asc` and `nulls_first`.

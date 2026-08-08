@@ -1,10 +1,12 @@
-//! The two table access paths: sequential [`Scan`] and [`IndexLookup`].
+//! The three table access paths: sequential [`Scan`], [`IndexLookup`], and
+//! [`MetaAggregate`], which reads no table at all.
 //!
 //! Which one a query gets is decided in [`crate::planner::physical`], not here.
-//! Both produce the same thing -- blocks of the scan node's projected schema,
-//! already narrowed by its PREWHERE list -- so nothing above them can tell them
-//! apart, and swapping one for the other is an access-path decision rather than
-//! a plan rewrite.
+//! The first two produce the same thing -- blocks of the scan node's projected
+//! schema, already narrowed by its PREWHERE list -- so nothing above them can
+//! tell them apart, and swapping one for the other is an access-path decision
+//! rather than a plan rewrite. The third replaces the aggregate above the scan
+//! as well, because its whole point is that there is no row stream.
 //!
 //! # Sequential scan
 //!
@@ -85,15 +87,34 @@
 //!     MPH would then name one row of a run the scan returns whole. Parts are
 //!     sorted by that key, so proving the run has length one costs two lane
 //!     reads. See [`collect_run`].
+//!
+//! # Metadata aggregate
+//!
+//! [`MetaAggregate`] answers `count()`, `min(c)` and `max(c)` by folding the
+//! numbers a part already carries -- granule row counts, delete masks, zone
+//! maps -- and emits the single row the aggregate above it would have
+//! produced. Its cost is the *part* count for an unfiltered `count` and the
+//! *granule* count for the rest, so `SELECT count() FROM t` stops being a
+//! throughput number (2.2-2.4 ms over 2M rows) and becomes a latency one:
+//! 5.8 us at 2M rows, 5.8 us at 4M, 5.2 us at 8M.
+//! [`crate::planner::physical`] holds the full table of measurements and,
+//! more importantly, the list of shapes it refuses.
+//!
+//! The one thing it shares with `Scan` is the fallback: a granule whose zone
+//! maps cannot decide the predicate either way is decoded and filtered exactly
+//! as `Scan::next` would have done it, which is why an over-eager covering
+//! test would be the only way to a wrong answer -- and why `covers` is defined
+//! as "the pruning test, applied to the negation" rather than as new
+//! reasoning.
 
 use crate::catalog::Catalog;
 use crate::common::{hash_key, Error, Result, BLOCK_SIZE, FP_SEED, GRANULE_SIZE, G_SHIFT};
 use crate::exec::expr;
 use crate::planner::logical::ScanNode;
-use crate::planner::physical::IndexPath;
+use crate::planner::physical::{IndexPath, MetaAgg, MetaPath};
 use crate::storage::part::{Deletes, Snapshot};
 use crate::storage::{Part, Stats};
-use crate::types::{Block, Schema};
+use crate::types::{Block, Column, ColumnBuilder, Schema, Value};
 
 use super::{Operator, ScanStats};
 
@@ -541,6 +562,395 @@ fn prev_row(p: &Part, pos: usize) -> Option<usize> {
     let gi = pos >> G_SHIFT;
     let g = p.granules.get(gi.checked_sub(1)?)?;
     (g.len > 0).then(|| ((gi - 1) << G_SHIFT) + g.len - 1)
+}
+
+// ------------------------------------------------------ metadata aggregate
+
+/// An aggregate answered out of part headers: the numbers, not the rows.
+///
+/// Emits exactly one block of one row -- the row the [`Aggregate`] it replaced
+/// would have produced -- and then end of stream. Which aggregates may take
+/// this path, and which are refused because the headers would only
+/// approximate them, is decided by `meta_path` in
+/// [`crate::planner::physical`].
+///
+/// [`Aggregate`]: super::aggregate::Aggregate
+pub struct MetaAggregate<'a> {
+    path: MetaPath<'a>,
+    snap: Snapshot,
+    /// Live-row selection of the granule in hand, reused across granules --
+    /// the same buffer, for the same reason, as `Scan`'s.
+    sel: Vec<u32>,
+    /// Running `min`/`max`, one slot per output column; a `Count` column's
+    /// slot stays `None`. Allocated once here so the fold allocates nothing.
+    ext: Vec<Option<Value>>,
+    done: bool,
+    stats: ScanStats,
+}
+
+impl<'a> MetaAggregate<'a> {
+    pub fn new(path: MetaPath<'a>, catalog: &Catalog) -> Result<MetaAggregate<'a>> {
+        let table = catalog.table_by_path(&path.node.table)?;
+        // The same check, with the same message, `Scan::new` makes: this path
+        // replaces a scan, so a plan that names a column off the end of the
+        // table has to fail the way it always did.
+        let ncols = table.schema().len();
+        for &c in &path.node.projection {
+            if c >= ncols {
+                return Err(Error::exec(format!(
+                    "scan of `{}` projects column #{c}, but the table has {ncols}",
+                    path.node.table
+                )));
+            }
+        }
+        let ext = vec![None; path.what.len()];
+        Ok(MetaAggregate {
+            snap: table.snapshot(),
+            path,
+            sel: Vec::new(),
+            ext,
+            done: false,
+            stats: ScanStats::default(),
+        })
+    }
+
+    pub fn stats(&self) -> ScanStats {
+        self.stats
+    }
+
+    /// Live rows in granule `gi`, by the arithmetic the scan itself uses.
+    ///
+    /// Deliberately *not* `g.len - d.granule_deleted(gi)`: that counts the
+    /// whole 1024-bit window, which for a part's partial final granule
+    /// includes the padding past its last row. `live_selection_into` is the
+    /// function `Scan::next` picks rows with, so routing the dirty case
+    /// through it is what makes "live" mean one thing in this engine rather
+    /// than two. The clean case -- one `u16` load -- is the one that has to be
+    /// free, and is.
+    fn live(p: &Part, gi: usize, del: Option<&Deletes>, sel: &mut Vec<u32>) -> usize {
+        let n = p.granules[gi].len;
+        match del {
+            None => n,
+            Some(d) if d.granule_deleted(gi) == 0 => n,
+            Some(d) => p.live_selection_into(gi, Some(d), sel).map_or(n, |s| s.len()),
+        }
+    }
+
+    /// Live rows of the whole snapshot: the unfiltered `count()`.
+    ///
+    /// `Part::n_rows` is the sum of its granule lengths by construction, so a
+    /// table nobody has deleted from costs one add per part and nothing per
+    /// granule -- which is what makes this independent of the table's size.
+    /// Only a part carrying tombstones pays the granule walk.
+    fn count_all(&mut self) -> u64 {
+        let mut n = 0u64;
+        for pi in 0..self.snap.len() {
+            let p = self.snap.part(pi);
+            self.stats.granules_pruned += p.granule_count() as u64;
+            match self.snap.deletes(pi) {
+                Some(d) if d.count() > 0 => {
+                    for gi in 0..p.granule_count() {
+                        n += Self::live(p, gi, Some(d), &mut self.sel) as u64;
+                    }
+                }
+                _ => n += p.n_rows as u64,
+            }
+        }
+        n
+    }
+
+    /// `count()` under a predicate the zone maps can decide for whole
+    /// granules.
+    ///
+    /// The general case of [`count_all`](Self::count_all): a covered granule
+    /// contributes its live rows, an excluded one contributes zero, and only
+    /// a straddler is decoded -- through the same three steps, in the same
+    /// order, that `Scan::next` runs.
+    fn count_where(&mut self) -> Result<u64> {
+        if self.path.workers > 1 {
+            return self.count_where_parallel();
+        }
+        let mut n = 0u64;
+        for pi in 0..self.snap.len() {
+            let p = self.snap.part(pi);
+            let del = self.snap.deletes(pi);
+            for gi in 0..p.granule_count() {
+                n += fold_granule(&self.path, p, del, gi, &mut self.sel, &mut self.stats)?;
+            }
+        }
+        Ok(n)
+    }
+
+    /// [`count_where`](Self::count_where) across the pool.
+    ///
+    /// The walk this spreads is the same walk `Scan` does, and `Scan`'s runs
+    /// inside the exchange's fleet -- so leaving this serial handed the
+    /// parallel scan a 14x head start on precisely the queries whose entire
+    /// cost is pruning. The width is [`MetaPath::workers`], chosen at plan
+    /// time and printed by `EXPLAIN`; this obeys it rather than re-deciding,
+    /// exactly as `exchange::build` obeys its own node.
+    fn count_where_parallel(&mut self) -> Result<u64> {
+        // `(part, granule)` pairs so a claim can cross a part boundary, the
+        // same shape `Table::scan_fold_in` uses. One allocation per query --
+        // 16 KB for a 2M-row table, ~0.6 us to build, against the 90 us walk
+        // it is spreading.
+        let work: Vec<(u32, u32)> = (0..self.snap.len())
+            .flat_map(|pi| {
+                (0..self.snap.part(pi).granule_count()).map(move |g| (pi as u32, g as u32))
+            })
+            .collect();
+        let cursor = std::sync::atomic::AtomicUsize::new(0);
+        let (snap, path, work) = (&self.snap, &self.path, &work);
+
+        let parts: Vec<Result<(u64, ScanStats)>> =
+            crate::common::pool::global().map(path.workers, |_| {
+                // One scratch buffer per worker for the whole walk, not one
+                // per granule: only a straddler touches it at all.
+                let mut sel = Vec::new();
+                let mut st = ScanStats::default();
+                let mut n = 0u64;
+                loop {
+                    let at = cursor.fetch_add(META_CLAIM, std::sync::atomic::Ordering::Relaxed);
+                    if at >= work.len() {
+                        break;
+                    }
+                    let end = (at + META_CLAIM).min(work.len());
+                    for &(pi, gi) in &work[at..end] {
+                        let p = snap.part(pi as usize);
+                        let del = snap.deletes(pi as usize);
+                        n += fold_granule(path, p, del, gi as usize, &mut sel, &mut st)?;
+                    }
+                }
+                Ok((n, st))
+            });
+
+        let mut n = 0u64;
+        for r in parts {
+            let (c, st) = r?;
+            n += c;
+            self.stats.merge(&st);
+        }
+        Ok(n)
+    }
+
+    /// Fold every granule's zone map into the `min`/`max` slots.
+    ///
+    /// Only reachable with no predicate and no tombstone anywhere in the
+    /// snapshot -- the planner refuses otherwise -- so a granule's bounds
+    /// describe exactly the rows a scan would have seen.
+    fn fold_extremes(&mut self) {
+        for pi in 0..self.snap.len() {
+            let p = self.snap.part(pi);
+            for g in &p.granules {
+                for (slot, w) in self.ext.iter_mut().zip(&self.path.what) {
+                    let MetaAgg::Extreme { col, max } = w else { continue };
+                    let Some(pc) = g.columns.get(*col) else { continue };
+                    // These ignore NULL rows -- which is what SQL `min`/`max`
+                    // do -- and decode a string through the granule's own
+                    // dictionary, so what comes back is a value and the
+                    // comparison below is over values, not lanes.
+                    let v = if *max { pc.max_value() } else { pc.min_value() };
+                    // An empty or all-NULL granule reports `Null` bounds, and
+                    // `Value`'s order puts NULL below every number: offering
+                    // it would answer `min` with NULL for a table that has a
+                    // perfectly good smallest row.
+                    if v.is_null() {
+                        continue;
+                    }
+                    offer(slot, v, *max);
+                }
+            }
+        }
+    }
+
+    /// The one row, built the way `aggregate::finish_block` builds it.
+    fn emit(&self, count: u64) -> Result<Block> {
+        let mut cols: Vec<Column> = Vec::with_capacity(self.path.what.len());
+        for (i, w) in self.path.what.iter().enumerate() {
+            // `aggregate::out_types`' rule: the plan's schema wins where it
+            // has an opinion, the aggregate's own type is the fallback.
+            let ty = if i < self.path.schema.len() {
+                self.path.schema.ty(i).clone()
+            } else {
+                self.path.aggs[i].ty.clone()
+            };
+            let v = match w {
+                MetaAgg::Count => Value::UInt(count),
+                MetaAgg::Extreme { .. } => self.ext[i].clone().unwrap_or(Value::Null),
+            };
+            let mut b = ColumnBuilder::with_capacity(ty, 1);
+            b.push_value(&v)?;
+            let mut c = b.finish();
+            // `min` of nothing is NULL whatever the column was declared as, so
+            // a column can acquire a mask the schema did not promise. A live
+            // mask must never sit on a non-Nullable type.
+            if c.has_nulls() && !c.ty.is_nullable() {
+                c.ty = c.ty.to_nullable();
+            }
+            cols.push(c);
+        }
+        Block::new(cols)
+    }
+}
+
+impl Operator for MetaAggregate<'_> {
+    fn schema(&self) -> &Schema {
+        self.path.schema
+    }
+
+    fn stats(&self) -> ScanStats {
+        self.stats
+    }
+
+    fn next(&mut self) -> Result<Option<Block>> {
+        if self.done {
+            return Ok(None);
+        }
+        self.done = true;
+        let n = if self.path.preds.is_empty() {
+            let n = self.count_all();
+            if self.path.what.iter().any(|w| matches!(w, MetaAgg::Extreme { .. })) {
+                self.fold_extremes();
+            }
+            n
+        } else {
+            self.count_where()?
+        };
+        // Exactly one row, always -- a global aggregate over an empty table
+        // still answers `0` for `count` and `NULL` for `min`, and returning
+        // end-of-stream instead would lose the row rather than the work.
+        Ok(Some(self.emit(n)?))
+    }
+}
+
+/// Granules one worker claims at a time.
+///
+/// A zone test is ~50 ns, so 64 granules is ~3 us of work per claim: the
+/// shared counter costs well under 1% of that, and the tail a straggler can
+/// leave is the same 3 us. `Table::scan_fold_in` claims 8, because its unit is
+/// a *decoded* granule -- three orders of magnitude more expensive -- and the
+/// tail it is protecting against is correspondingly longer.
+const META_CLAIM: usize = 64;
+
+/// One granule's contribution to a filtered count.
+///
+/// The whole body of the walk, so the serial and parallel loops cannot drift:
+/// the only difference between them is who calls this and where the counters
+/// land. A straddler goes through the same three steps, in the same order,
+/// that `Scan::next` runs -- select live rows, decode the projection, apply
+/// the PREWHERE list -- because agreeing with the scan is the entire
+/// specification.
+fn fold_granule(
+    path: &MetaPath<'_>,
+    p: &Part,
+    del: Option<&Deletes>,
+    gi: usize,
+    sel: &mut Vec<u32>,
+    stats: &mut ScanStats,
+) -> Result<u64> {
+    match verdict(path, p, gi) {
+        Verdict::Empty => {
+            stats.granules_pruned += 1;
+            Ok(0)
+        }
+        Verdict::All => {
+            stats.granules_pruned += 1;
+            Ok(MetaAggregate::live(p, gi, del, sel) as u64)
+        }
+        Verdict::Mixed => {
+            stats.granules_read += 1;
+            let live = p.live_selection_into(gi, del, sel);
+            let mut blk = p.read_columns(gi, &path.node.projection, live)?;
+            stats.rows_read += blk.rows() as u64;
+            for f in &path.node.filters {
+                if blk.rows() == 0 {
+                    break;
+                }
+                let s = expr::eval_predicate(f, &blk)?;
+                if s.len() < blk.rows() {
+                    blk = blk.take(&s);
+                }
+            }
+            Ok(blk.rows() as u64)
+        }
+    }
+}
+
+/// What one granule's zone maps say about the predicate, before decoding it.
+enum Verdict {
+    /// No row can match: the granule contributes nothing.
+    Empty,
+    /// Every row matches: the granule contributes its live row count.
+    All,
+    /// Neither is provable. Decode it.
+    Mixed,
+}
+
+/// Decide granule `gi` from its zone maps alone.
+///
+/// The `Empty` half is the scan's own pruning test, unchanged. The `All` half
+/// is *the same test applied to the negated comparison*: no row fails the
+/// conjunct, so every row satisfies it. Writing it that way rather than as a
+/// fresh `min >= v`-style rule is the point -- pruning is already load-bearing
+/// for correctness everywhere else in the engine, so the covering test cannot
+/// be wrong in a way the scan is not already wrong, and there is no second
+/// comparison to drift from the evaluator's.
+///
+/// NULLs are the one thing the negation does not cover: under three-valued
+/// logic a NULL row satisfies neither the conjunct nor its negation, so a
+/// granule with a NULL in a predicate column is never `All` however tight its
+/// bounds are. `min_value`/`max_value` already exclude NULL rows, which is why
+/// the bounds cannot be trusted to reveal them.
+fn verdict(path: &MetaPath<'_>, p: &Part, gi: usize) -> Verdict {
+    let g = &p.granules[gi];
+    let mut all = true;
+    for mp in &path.preds {
+        // A part built before an `ALTER TABLE ... ADD COLUMN` is short. Not a
+        // reason to guess; decode it.
+        let Some(pc) = g.columns.get(mp.pred.col) else { return Verdict::Mixed };
+        let (min, max) = (pc.min_value(), pc.max_value());
+        if !mp.pred.may_match(&min, &max) {
+            return Verdict::Empty;
+        }
+        // Kept going rather than returning `Mixed` here: a later conjunct may
+        // still prove the granule empty, which is the cheaper answer.
+        if all && (mp.not.may_match(&min, &max) || has_nulls(pc, g.len)) {
+            all = false;
+        }
+    }
+    if all {
+        Verdict::All
+    } else {
+        Verdict::Mixed
+    }
+}
+
+/// Does this granule hold a NULL in `pc`?
+///
+/// `count_ones_upto` is 16 popcounts for a full granule, and it is only
+/// reached for a column that has a mask at all -- i.e. a `Nullable` one that
+/// really did store a NULL somewhere in the part.
+#[inline]
+fn has_nulls(pc: &crate::storage::PackedColumn, len: usize) -> bool {
+    pc.nulls().is_some_and(|b| b.count_ones_upto(len) > 0)
+}
+
+/// The `min`/`max` merge rule, character for character the one `MinMaxAcc`
+/// uses in `exec::functions::agg`: strictly better replaces, a tie keeps what
+/// was already there. Two rules here would show up as `min` disagreeing with
+/// itself depending on which access path the planner chose.
+#[inline]
+fn offer(slot: &mut Option<Value>, v: Value, max: bool) {
+    let better = match slot {
+        None => true,
+        Some(cur) => {
+            let ord = v.cmp(cur);
+            ord != std::cmp::Ordering::Equal && (ord == std::cmp::Ordering::Greater) == max
+        }
+    };
+    if better {
+        *slot = Some(v);
+    }
 }
 
 #[cfg(test)]
