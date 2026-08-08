@@ -18,7 +18,14 @@ pub mod exchange;
 ///
 /// A drop-in replacement for [`operators::execute_ctx`]: same signature, same
 /// answers, same `ScanStats`. It is a separate entry point rather than a flag
-/// because the decision belongs to the caller that knows whether this query is
-/// worth a fleet -- and because, until `build_physical` itself consults
-/// `exchange::try_build`, this is the only way to reach a parallel pipeline.
+/// because `operators::build_physical` drops a `PhysicalPlan::Exchange` on the
+/// floor -- it has no operator that can honour one -- so this is the only way
+/// to reach a parallel pipeline.
+///
+/// `execute_parallel` is the one to call: it takes the [`QueryContext`] that
+/// carries the query's memory budget, deadline and cancel flag.
+/// `execute_parallel_stats` is the convenience for a caller that has none yet
+/// and makes a fresh default one per query.
+///
+/// [`QueryContext`]: operators::QueryContext
 pub use exchange::{execute_ctx as execute_parallel, execute_with_stats as execute_parallel_stats};

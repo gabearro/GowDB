@@ -41,14 +41,44 @@
 //! println!("{rs}");
 //! # Ok::<(), granular::Error>(())
 //! ```
+//!
+//! ## Concurrency
+//!
+//! A [`Session`] is one connection: it owns the catalog and its write API
+//! takes `&mut self`. To read from several threads at once, move it behind a
+//! [`Db`] and take a [`Reader`] per thread -- `Send + Sync + Clone`, with no
+//! lifetime, so a pool can hold them.
+//!
+//! ```no_run
+//! use granular::Session;
+//!
+//! let db = Session::in_memory().into_shared();
+//! db.execute("CREATE TABLE t (id UInt64) ENGINE = MergeTree ORDER BY id")?;
+//! let reader = db.reader();
+//! std::thread::scope(|scope| {
+//!     for _ in 0..4 {
+//!         let r = reader.clone();
+//!         scope.spawn(move || r.query("SELECT count() FROM t").unwrap());
+//!     }
+//! });
+//! # Ok::<(), granular::Error>(())
+//! ```
+//!
+//! Isolation is snapshot: a query pins one part set per table and a writer
+//! publishes a new one, so a reader never sees half a commit. Writers
+//! serialize with each other and with readers only for the length of one
+//! statement. Large results stream through [`Session::read_stream`] or
+//! [`Reader::cursor`] rather than materializing.
 
 pub mod common;
 pub mod encoding;
 pub mod exec;
 pub mod index;
+pub mod io;
 pub mod persist;
 pub mod planner;
 pub mod session;
+pub mod settings;
 pub mod catalog;
 pub mod sort;
 pub mod sql;
@@ -56,5 +86,5 @@ pub mod storage;
 pub mod types;
 
 pub use common::{Error, Result};
-pub use session::{ResultSet, Session};
+pub use session::{Cursor, Db, Reader, ResultSet, Session, StreamItem, Writer};
 pub use types::{Block, Column, DataType, Field, Schema, Value};

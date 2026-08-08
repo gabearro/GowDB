@@ -460,6 +460,8 @@ impl Parser<'_> {
                     ExplainKind::Pipeline
                 } else if self.eat_kw("AST") || self.eat_kw("SYNTAX") {
                     ExplainKind::Ast
+                } else if self.eat_kw("ANALYZE") {
+                    ExplainKind::Analyze
                 } else {
                     ExplainKind::Plan
                 };
@@ -867,7 +869,8 @@ impl Parser<'_> {
         self.err("`TABLES`, `DATABASES` or `CREATE TABLE`")
     }
 
-    /// `SETTINGS k = v, ...`, checked against [`SETTINGS_TABLE`].
+    /// `SETTINGS k = v, ...`, checked against [`crate::settings::SPECS`] and
+    /// then [`SETTINGS_TABLE`].
     ///
     /// This used to be `skip_settings`: it validated the *syntax* and dropped
     /// the result, so `SELECT 1 SETTINGS max_threads = 2` returned `Ok` with
@@ -876,7 +879,14 @@ impl Parser<'_> {
     /// acknowledged, and dropped -- except that a setting is *only* an
     /// instruction, so dropping it discards 100% of what was asked.
     ///
-    /// Three outcomes now, one per column of the table:
+    /// Four outcomes:
+    ///   * a setting the runtime registry implements -- refused *here*, with
+    ///     the spelling that works, because the statement path applies a
+    ///     query-level `SETTINGS` clause before the text ever reaches this
+    ///     parser (`settings::Handle::intercept`). Reaching this function with
+    ///     one therefore means the caller is a path that applies no settings,
+    ///     and accepting it would be the silent drop this whole function
+    ///     exists to stop;
     ///   * a setting this engine has already fixed, at the value it is fixed
     ///     at -- honoured, because it asks for exactly what happens;
     ///   * the same setting at any other value, or a recognised setting that
@@ -1017,8 +1027,11 @@ const SETTINGS_TABLE: &[SettingSpec] = &[
         name: "max_threads",
         scope: SettingScope::Query,
         fixed: None,
-        note: "the exchange operator sizes its own fan-out from the part count and \
-               the core count; there is no per-query override",
+        note: "the exchange operator sizes its own fan-out from the part count and the \
+               core count. The pool is process-wide and started once, so the only \
+               override is the `GRANULAR_THREADS` environment variable, read before the \
+               first parallel query; a per-query width would have to be plumbed through \
+               `physical::lower` into `PhysicalPlan::Exchange`",
     },
     SettingSpec {
         name: "max_block_size",
@@ -1027,31 +1040,6 @@ const SETTINGS_TABLE: &[SettingSpec] = &[
         fixed: Some("8192"),
         note: "blocks are a compile-time 8192 rows (common::BLOCK_SIZE); every \
                operator's reused scratch buffers are sized off it",
-    },
-    SettingSpec {
-        name: "max_insert_block_size",
-        scope: SettingScope::Query,
-        // Deliberately not `Some("8192")` even though its read-side twin is:
-        // `BLOCK_SIZE` governs what a *scan* hands the executor, and nothing
-        // re-chunks an INSERT on the way in -- a 100k-row VALUES list arrives
-        // as one 100k-row block. Claiming 8192 here would be a false accept in
-        // a table whose whole purpose is to stop those.
-        fixed: None,
-        note: "an INSERT is ingested as the one block it arrives as; nothing splits it \
-               on the way in, so there is no insert block size to cap",
-    },
-    SettingSpec {
-        name: "max_memory_usage",
-        scope: SettingScope::Query,
-        fixed: None,
-        note: "there is no per-query memory accounting, so this would not fail the \
-               query at the limit -- it would let it run to the OOM killer instead",
-    },
-    SettingSpec {
-        name: "max_execution_time",
-        scope: SettingScope::Query,
-        fixed: None,
-        note: "there is no deadline check in the operator loop",
     },
     SettingSpec {
         name: "max_result_rows",
@@ -1071,19 +1059,25 @@ const SETTINGS_TABLE: &[SettingSpec] = &[
         fixed: None,
         note: "there is no read quota",
     },
+    // Both notes used to read "does not spill, so this threshold has nothing to
+    // trigger". Spilling landed, so the notes were false in the direction that
+    // matters -- they described a capability as absent while it worked -- and
+    // that is the same class of stale claim this table exists to prevent.
     SettingSpec {
         name: "max_bytes_before_external_group_by",
         scope: SettingScope::Query,
         fixed: None,
-        note: "aggregation is in-memory; it does not spill, so this threshold has \
-               nothing to trigger",
+        note: "aggregation does spill, but on the query's own budget rather than on a \
+               separate threshold: it starts writing partitions when `max_memory_usage` \
+               refuses it. Set that instead -- one number, so the two can never disagree",
     },
     SettingSpec {
         name: "max_bytes_before_external_sort",
         scope: SettingScope::Query,
         fixed: None,
-        note: "the sort is in-memory; it does not spill, so this threshold has \
-               nothing to trigger",
+        note: "the sort does spill, but on the query's own budget rather than on a \
+               separate threshold: it turns the buffer into a sorted run when \
+               `max_memory_usage` refuses it. Set that instead",
     },
     SettingSpec {
         name: "join_use_nulls",
@@ -1108,6 +1102,59 @@ const SETTINGS_TABLE: &[SettingSpec] = &[
     },
 ];
 
+/// What this engine has to say about a setting name it does not implement.
+///
+/// Exposed so `settings::Settings::set` — the `SET` statement's path, which
+/// only knows the runtime registry — produces the same sentence for
+/// `max_bytes_before_external_sort` that a `SETTINGS` clause does, instead of
+/// falling through to "unknown setting" on a name that is perfectly well
+/// known. One table, two callers.
+/// Whether this engine recognises `name` as a ClickHouse setting at all, even
+/// one it cannot honour.
+///
+/// Split out because [`compat_note`] answers `None` for two unrelated reasons —
+/// "the value matches what the engine already does, so accept it" and "never
+/// heard of it" — and the caller must tell them apart. Conflating them is
+/// exactly the bug that let `SETTINGS not_a_real_setting = 'zzz'` through.
+pub(crate) fn knows_setting(name: &str) -> bool {
+    SETTINGS_TABLE.iter().any(|s| s.name.eq_ignore_ascii_case(name))
+}
+
+#[cold]
+pub(crate) fn compat_note(name: &str, value: &str) -> Option<Error> {
+    let spec = SETTINGS_TABLE.iter().find(|s| s.name.eq_ignore_ascii_case(name))?;
+    // A value that already equals what the engine does is a true statement
+    // about it, so it is accepted rather than refused -- `SETTINGS
+    // index_granularity = 1024` appears in essentially every ClickHouse DDL
+    // script, and failing it would cost compatibility to say nothing the
+    // reader did not already agree with. Only a value that DIFFERS is a
+    // promise this engine cannot keep. This mirrors `check_setting`'s `fixed`
+    // arm exactly; the two paths reach the same table by different roads
+    // (`SET` and a `SETTINGS` clause) and must not disagree.
+    // Deliberately NOT scope-checked here, and the reason is worth stating
+    // because the obvious change breaks the other half: both scopes reach this
+    // function, so refusing a table-scoped name would reject
+    // `CREATE TABLE ... SETTINGS index_granularity = 1024`, which is the clause
+    // essentially every ClickHouse DDL script carries. A value that matches
+    // what the engine already does asserts nothing false on either scope, so it
+    // is accepted on both; a value that DIFFERS is refused on both, which is
+    // where the promise would have been broken. Scope placement is still
+    // enforced for every setting that is not `fixed` -- see `check_setting`.
+    if let Some(v) = spec.fixed {
+        if value.trim_matches('\'') == v {
+            return None;
+        }
+        return Some(Error::unsupported(format!(
+            "`{}` is fixed at {v} in this engine and cannot be set to {value}: {}",
+            spec.name, spec.note
+        )));
+    }
+    Some(Error::unsupported(format!(
+        "`{}` is recognised but not settable here: {}",
+        spec.name, spec.note
+    )))
+}
+
 /// Judge one `k = v` pair. Split out of [`Parser::settings`] so the table and
 /// the three messages sit together, and so the parser body stays a loop.
 #[cold]
@@ -1118,6 +1165,29 @@ fn check_setting(
     scope: SettingScope,
     at: usize,
 ) -> Result<()> {
+    // The runtime registry is consulted first so the two lists cannot drift:
+    // a name that becomes implemented is added to `settings::SPECS` and stops
+    // being described here as absent, in one edit rather than two.
+    if let Some(sp) = crate::settings::spec(name) {
+        if scope == SettingScope::Table {
+            return Err(Error::parse(
+                format!("`{}` is a runtime setting, not a table one; it belongs on a \
+                         query or in `SET`", sp.name),
+                at,
+            ));
+        }
+        return Err(Error::unsupported(format!(
+            "`SETTINGS {}` is applied by the statement path -- `Session::run`, which is \
+             what `Session::query` and the CLI use -- and is stripped there before the \
+             text reaches this parser. Arriving here means this caller applies no \
+             settings (a `&self` read), so accepting the clause would drop it silently. \
+             Run `SET {} = {}{value}` on the session first. {}",
+            sp.name,
+            sp.name,
+            if neg { "-" } else { "" },
+            sp.doc
+        )));
+    }
     let Some(spec) = SETTINGS_TABLE.iter().find(|s| s.name.eq_ignore_ascii_case(name)) else {
         return Err(Error::parse(
             format!("unknown setting `{name}`; this engine recognises only settings it \
@@ -2814,11 +2884,25 @@ mod tests {
             ("SELECT a FROM t SETTINGS z = -1", "unknown setting"),
             ("SELECT a FROM t SETTINGS max_block_size = 4096", "8192"),
             ("SELECT a FROM t SETTINGS join_use_nulls = 0", "NULL"),
-            // Recognised, and *not* honoured at its read-side twin's value:
-            // nothing re-chunks an INSERT, so there is no cap to agree with.
-            ("SELECT a FROM t SETTINGS max_insert_block_size = 8192", "arrives as"),
             // Right name, wrong clause: reported as misplaced, not unknown.
             ("SELECT a FROM t SETTINGS index_granularity = 1024", "CREATE TABLE"),
+            // Inverted with the streaming importer. This case used to assert
+            // "arrives as", from a note reading "an INSERT is ingested as the
+            // one block it arrives as; nothing splits it on the way in". That
+            // stopped being true when `INSERT ... FROM INFILE` landed --
+            // `max_insert_block_size` is now the number of rows it hands
+            // storage per block -- so the setting moved to `settings::SPECS`
+            // and the refusal here names the spelling that applies it.
+            ("SELECT a FROM t SETTINGS max_insert_block_size = 8192", "SET max_insert_block_size"),
+            ("SELECT a FROM t SETTINGS max_memory_usage = 1024", "SET max_memory_usage"),
+            ("SELECT a FROM t SETTINGS max_execution_time = 30", "SET max_execution_time"),
+            // Runtime settings are not table settings, and say so rather than
+            // falling through to "unknown".
+            (
+                "CREATE TABLE t (a UInt64) ENGINE = MergeTree ORDER BY a \
+                 SETTINGS max_memory_usage = 1024",
+                "runtime setting",
+            ),
         ] {
             let e = parse(sql).unwrap_err().to_string();
             assert!(e.contains(word), "{sql}: `{word}` missing from {e}");

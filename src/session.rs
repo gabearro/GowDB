@@ -61,6 +61,34 @@
 //! effect, costs one fsync instead of one per block. Single-block statements,
 //! which is every `INSERT ... VALUES`, never open one.
 //!
+//! ## One writer, many readers
+//!
+//! Every SQL entry point used to take `&mut self`, and not because a query
+//! mutates: because [`Session::plan`] opened with `catalog.flush_all()`, so a
+//! `SELECT` on one table took exclusive write access to every other one. The
+//! cost was not contention, it was the type system -- eight identical 2M-row
+//! queries behind an `Arc<Mutex<Session>>` measured 33.03 ms on one thread,
+//! 32.34 on two and 31.58 on four. Perfectly flat, because nothing overlapped.
+//!
+//! The split is three things:
+//!
+//!   * [`Session::read`] and friends take `&self`. They never flush; the
+//!     `&mut` half does that, and [`Catalog::has_pending_writes`] is what
+//!     tells a reader when it must.
+//!   * [`Db`] holds one `Session` behind an `RwLock` and hands out [`Reader`]s
+//!     (`Send + Sync + Clone`, `'static`) and a [`Writer`] guard. N readers
+//!     run at once under the shared lock; the writer takes it exclusively for
+//!     the duration of one statement.
+//!   * every read carries a [`QueryContext`] built from the session's own
+//!     limits, so a memory budget, a deadline and a cancel flag are finally
+//!     reachable from the facade rather than only from the operator tests.
+//!
+//! Isolation is snapshot, not MVCC: `Scan` pins one `Arc<PartSet>` per table
+//! at build time and reads nothing else, and a writer publishes by storing a
+//! new `Arc` over the old one. There are no version chains, no per-row
+//! visibility test and no reader/writer interlock beyond the `RwLock` that
+//! keeps `&Catalog` and `&mut Catalog` apart.
+//!
 //! ### The multi-table caveat
 //!
 //! Logs are per table, so a transaction spanning N tables writes N commit
@@ -73,11 +101,14 @@
 
 use std::fs::File;
 use std::path::Path;
-use std::time::Instant;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, RwLock, RwLockWriteGuard};
+use std::time::{Duration, Instant};
 
 use crate::catalog::Catalog;
 use crate::common::{Error, Result};
 use crate::exec::operators;
+use crate::exec::operators::{MemGuard, QueryContext};
 use crate::planner::{
     binder::Binder,
     logical::{BoundExpr, LogicalPlan, ZoneFilter},
@@ -99,8 +130,20 @@ pub struct QueryStats {
     pub rows_scanned: u64,
 }
 
+/// What a streaming read hands its sink.
+///
+/// `Head` arrives exactly once, before any row and even when there are none:
+/// a sink that has to describe the result before sending it -- a wire
+/// protocol's `RowDescription`, a CSV header, a portal -- must not have to
+/// wait for a first block that may never come. `Rows` blocks are owned, so a
+/// sink can keep one without copying it.
+pub enum StreamItem<'a> {
+    Head(&'a Schema),
+    Rows(Block),
+}
+
 /// A materialized result. Small by construction: anything large should be
-/// streamed through [`operators::build`] instead.
+/// streamed through [`Session::read_stream`] instead.
 #[derive(Debug)]
 pub struct ResultSet {
     pub schema: Schema,
@@ -317,6 +360,66 @@ pub struct Session {
     /// The open transaction, if any. `None` on every autocommit path, and the
     /// only thing `BEGIN` has to write.
     txn: Option<Txn>,
+    /// Session-scoped settings, and the hook `SET` / `SHOW SETTINGS` /
+    /// `SETTINGS` reach the engine through. Per-session rather than global on
+    /// purpose: two `Session`s in one process -- which `Db` and most of the
+    /// test files create -- would otherwise report each other's values.
+    settings: crate::settings::Handle,
+    /// Opened with a *shared* directory lock: every mutating statement is
+    /// refused, so several such sessions -- in this process or another -- can
+    /// read one directory at once. See [`Session::open_read_only`].
+    read_only: bool,
+    /// Budget, deadline and cancel flag handed to every query this session
+    /// runs. Three words, read on the read path and nowhere else.
+    limits: Limits,
+}
+
+/// The per-query governance a session applies, as *settings* rather than as a
+/// live [`QueryContext`].
+///
+/// A `QueryContext` cannot be reused across queries and that is deliberate:
+/// its deadline is an absolute `Instant`, and its `MemTracker` is a single
+/// atomic whose reservations would accumulate across queries (a query that
+/// failed between `grow_to` and the guard's drop leaks its charge forever).
+/// So the session stores the *policy* and mints one context per query --
+/// exactly one `Arc` allocation, against a query that has already parsed,
+/// bound and lowered a plan.
+///
+/// `cancel` is the one thing shared rather than minted: a handle taken once
+/// must be able to stop whatever the session runs next, and every query after
+/// it, which is what a client-disconnect or a Ctrl-C handler needs.
+#[derive(Clone, Debug)]
+struct Limits {
+    mem: i64,
+    timeout: Option<Duration>,
+    cancel: Arc<AtomicBool>,
+}
+
+impl Default for Limits {
+    fn default() -> Limits {
+        Limits {
+            mem: crate::exec::operators::DEFAULT_MEM_BUDGET,
+            timeout: None,
+            cancel: Arc::new(AtomicBool::new(false)),
+        }
+    }
+}
+
+impl Limits {
+    /// One context for one query. `deadline_in` is applied here rather than
+    /// stored, so a session-wide timeout means "per statement" and not "from
+    /// whenever the setting was made".
+    fn context(&self) -> QueryContext {
+        let ctx = QueryContext {
+            cancel: Arc::clone(&self.cancel),
+            deadline: None,
+            mem: crate::exec::operators::MemTracker::with_limit(self.mem),
+        };
+        match self.timeout {
+            Some(d) => ctx.deadline_in(d),
+            None => ctx,
+        }
+    }
 }
 
 /// The tables an open transaction has written to.
@@ -358,6 +461,16 @@ struct Enlisted {
     fold: bool,
 }
 
+/// What the subquery folder carries down the AST: how much nesting is left,
+/// and the context whose budget and deadline the nested runs answer to.
+///
+/// Two words passed by `&mut` through a recursion that already existed, rather
+/// than a second parameter on eight signatures.
+struct Sub<'a> {
+    left: usize,
+    ctx: &'a QueryContext,
+}
+
 /// Transaction control. Not in the SQL grammar -- `src/sql` is not this
 /// module's to extend -- so [`Session::run`] recognises it ahead of the parser.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -377,6 +490,9 @@ impl Session {
             // with anyone, so it must never take (or contend for) the lock.
             _lock: None,
             txn: None,
+            settings: crate::settings::Handle::new(Default::default()),
+            read_only: false,
+            limits: Limits::default(),
         }
     }
 
@@ -393,7 +509,7 @@ impl Session {
         // watermark and can truncate a log, which is already a mutation a
         // second process must not be racing.
         let root = catalog.dir().expect("on_disk always sets a directory").to_path_buf();
-        let lock = lock_data_dir(&root)?;
+        let lock = lock_data_dir(&root, LockMode::Exclusive)?;
         crate::persist::load_catalog(&mut catalog)?;
         Ok(Session {
             catalog,
@@ -401,7 +517,80 @@ impl Session {
             wal_enabled: true,
             _lock: lock,
             txn: None,
+            settings: crate::settings::Handle::new(Default::default()),
+            read_only: false,
+            limits: Limits::default(),
         })
+    }
+
+    /// Open `dir` for queries only, under a **shared** directory lock.
+    ///
+    /// Several read-only sessions -- in this process or in others -- hold the
+    /// lock together; a writer's `LOCK_EX` excludes them all and they exclude
+    /// it, which is the same single-writer rule [`Session::open`] enforces,
+    /// only now with the reader side allowed to be plural. That is the whole
+    /// of it: the exclusion the exclusive lock exists for is *two writers
+    /// allocating the same part sequence number*, and a session that cannot
+    /// write cannot do that.
+    ///
+    /// Every mutating statement is refused with an error naming the mode, and
+    /// the write-ahead log is never opened, so nothing here can create or
+    /// extend a file. Recovery still runs -- a log left behind by a crashed
+    /// writer is replayed **into memory only**, so this session sees the
+    /// acknowledged writes without persisting anything.
+    pub fn open_read_only(dir: impl AsRef<Path>) -> Result<Session> {
+        let mut catalog = Catalog::on_disk(dir)?;
+        let root = catalog.dir().expect("on_disk always sets a directory").to_path_buf();
+        let lock = lock_data_dir(&root, LockMode::Shared)?;
+        crate::persist::load_catalog(&mut catalog)?;
+        Ok(Session {
+            catalog,
+            wals: Default::default(),
+            wal_enabled: false,
+            _lock: lock,
+            txn: None,
+            settings: crate::settings::Handle::new(Default::default()),
+            read_only: true,
+            limits: Limits::default(),
+        })
+    }
+
+    pub fn is_read_only(&self) -> bool {
+        self.read_only
+    }
+
+    // ------------------------------------------------------- query governance
+
+    /// Cap the memory one query of this session may reserve. The default is
+    /// [`operators::DEFAULT_MEM_BUDGET`].
+    ///
+    /// Per *query*, not per session: two queries running concurrently on two
+    /// readers each get this much, which is the only reading under which the
+    /// number means anything -- a shared budget makes two innocent queries
+    /// refuse each other.
+    pub fn set_memory_limit(&mut self, bytes: i64) {
+        self.limits.mem = bytes;
+    }
+
+    /// Stop any query of this session that runs longer than `d`. Measured
+    /// per statement, from the moment it starts.
+    pub fn set_timeout(&mut self, d: Option<Duration>) {
+        self.limits.timeout = d;
+    }
+
+    /// A flag another thread can set to stop this session's queries.
+    ///
+    /// Shared, not snapshotted: setting it stops the query in flight *and*
+    /// every one after it, until [`Session::resume`] clears it. That is what a
+    /// disconnected client wants; a one-shot cancel would race the next
+    /// statement.
+    pub fn cancel_handle(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.limits.cancel)
+    }
+
+    /// Clear a cancellation, so the session takes queries again.
+    pub fn resume(&self) {
+        self.limits.cancel.store(false, Ordering::Relaxed);
     }
 
     /// Turn write-ahead logging off for this session.
@@ -412,7 +601,7 @@ impl Session {
     /// after a crash anyway. Writes are then durable only at
     /// [`Session::checkpoint`].
     pub fn set_wal_enabled(&mut self, on: bool) {
-        self.wal_enabled = on && self.catalog.is_persistent();
+        self.wal_enabled = on && self.catalog.is_persistent() && !self.read_only;
     }
 
     /// Persist everything: flush write buffers, rewrite parts, and truncate
@@ -424,6 +613,9 @@ impl Session {
     /// transaction durable that ROLLBACK is still entitled to erase, and then
     /// truncate the log that was the only record of the boundary.
     pub fn checkpoint(&mut self) -> Result<()> {
+        if self.read_only {
+            return Err(read_only_err("CHECKPOINT"));
+        }
         if self.txn.is_some() {
             return Err(Error::unsupported(
                 "cannot checkpoint inside a transaction: it would persist \
@@ -822,6 +1014,20 @@ impl Session {
         if mentions_txn_keyword(sql) {
             return self.run_mixed(sql);
         }
+        // `SET` / `SHOW SETTINGS` / `SETTINGS` are recognised here rather than
+        // in the grammar, for the same mechanical reason transaction control is
+        // just above: `Statement` is matched exhaustively across this file, so a
+        // new variant would not compile in the modules that would have to
+        // introduce it. `intercept` byte-sniffs first and answers `None` for
+        // everything else, so ordinary SQL reaches `parse` unchanged.
+        //
+        // The clone ends the borrow of `self` before `intercept` takes
+        // `&mut Session`; the state is behind an `Arc`, so it is two atomics
+        // per *statement* against a statement about to be lexed, parsed, bound
+        // and lowered.
+        if let Some(r) = self.settings.clone().intercept(self, sql) {
+            return r;
+        }
         // Poisoning is applied here rather than inside `exec_statement`,
         // because a parse error is a statement that failed too -- and one that
         // never reaches `exec_statement`.
@@ -915,8 +1121,25 @@ impl Session {
                  ROLLBACK first",
             ));
         }
+        // `USE` is not a read -- it moves the session's current database --
+        // but it writes nothing, and a read-only session that could not
+        // change database would be able to query only one of them.
+        if self.read_only && !is_read(stmt) && !matches!(stmt, Statement::Use(_)) {
+            return Err(read_only_err(stmt_kind(stmt)));
+        }
+        // The read set goes through the `&self` path, and the only thing the
+        // `&mut` half adds is the flush -- which is exactly the line that used
+        // to make a read exclusive. Two entry points, one implementation.
+        if is_read(stmt) {
+            self.catalog.flush_all()?;
+            let mut rs = self.read_statement(stmt, &self.limits.context())?;
+            rs.stats.elapsed_us = t0.elapsed().as_micros();
+            if rs.stats.rows == 0 {
+                rs.stats.rows = rs.rows();
+            }
+            return Ok(rs);
+        }
         let mut rs = match stmt {
-            Statement::Query(q) => self.run_query(q)?,
             Statement::Insert(i) => self.run_insert(i)?,
             Statement::CreateTable(c) => self.run_create_table(c)?,
             Statement::CreateDatabase { name, if_not_exists } => {
@@ -969,33 +1192,10 @@ impl Session {
             Statement::AlterDropColumn { table, column, if_exists } => {
                 self.run_drop_column(table, column, *if_exists)?
             }
-            Statement::ShowDatabases => {
-                ResultSet::one_string_column("name", self.catalog.database_names())?
-            }
-            Statement::ShowTables { database } => ResultSet::one_string_column(
-                "name",
-                self.catalog.table_names(database.as_deref())?,
-            )?,
-            Statement::ShowCreateTable(name) => {
-                let t = self.catalog.table(name)?;
-                let ddl = render_create_table(t.schema(), &t.def);
-                ResultSet::one_string_column("statement", vec![ddl])?
-            }
-            Statement::Describe(name) => {
-                let t = self.catalog.table(name)?;
-                let schema = Schema::new(vec![
-                    Field::new("name", DataType::String),
-                    Field::new("type", DataType::String),
-                ])?;
-                let rows = t
-                    .schema()
-                    .fields()
-                    .iter()
-                    .map(|f| vec![Value::str(f.name.clone()), Value::str(f.ty.to_string())])
-                    .collect();
-                ResultSet::from_rows(schema, rows)?
-            }
-            Statement::Explain { kind, statement } => self.run_explain(*kind, statement)?,
+            // Every read arm lives in `read_statement`, which the branch above
+            // took. Reaching one here would mean `is_read` and the dispatcher
+            // disagree, which is a bug rather than a statement.
+            other => return Err(Error::exec(format!("unhandled statement: {other:?}"))),
         };
         // DDL is persisted immediately. A table that exists only in memory but
         // already has a write-ahead log on disk is an orphan: the log records
@@ -1013,14 +1213,176 @@ impl Session {
         Ok(rs)
     }
 
+    // ------------------------------------------------------------ the read set
+    //
+    // `&self`, all of it. What each one is allowed to touch is the whole
+    // design: a read may pin an `Arc<PartSet>`, decode from it and read the
+    // catalog's metadata, and it may not flush, publish, log or checkpoint.
+    // That is the line that lets N of these run at once on one catalog.
+
+    /// Run one read-only statement: SELECT, EXPLAIN, SHOW, DESCRIBE.
+    ///
+    /// Refuses anything else rather than falling through to a `&mut` path it
+    /// does not have -- a reader that silently did nothing would be the same
+    /// class of lie as a query that silently missed rows.
+    pub fn read(&self, sql: &str) -> Result<ResultSet> {
+        self.read_with(sql, &self.limits.context())
+    }
+
+    /// [`Session::read`] under a caller-supplied budget, deadline and cancel
+    /// flag, for a pool that governs each connection separately.
+    pub fn read_with(&self, sql: &str, ctx: &QueryContext) -> Result<ResultSet> {
+        let stmt = self.one_read_stmt(sql)?;
+        self.read_statement(&stmt, ctx)
+    }
+
+    /// Stream a `SELECT`'s blocks to `sink` without ever holding more than one.
+    ///
+    /// The `Vec<Block>` a `ResultSet` carries is the last unbounded buffer in
+    /// the engine; this is the way past it, and the thing a `COPY TO`, a wire
+    /// protocol's portal, or any client that consumes as it goes should call.
+    /// Returns the row count the sink saw.
+    pub fn read_stream(
+        &self,
+        sql: &str,
+        ctx: &QueryContext,
+        sink: &mut dyn FnMut(StreamItem<'_>) -> Result<()>,
+    ) -> Result<usize> {
+        let stmt = self.one_read_stmt(sql)?;
+        let Statement::Query(q) = &stmt else {
+            // SHOW/DESCRIBE/EXPLAIN produce one small block by construction;
+            // routing them through here would buy nothing and would give the
+            // caller a second shape to handle.
+            return Err(Error::unsupported(
+                "streaming is for SELECT; use `read` for SHOW, DESCRIBE and EXPLAIN",
+            ));
+        };
+        let mut rows = 0;
+        self.stream_in(q, ctx, &mut |item| {
+            if let StreamItem::Rows(b) = &item {
+                rows += b.rows();
+            }
+            sink(item)
+        })?;
+        Ok(rows)
+    }
+
+    /// Parse `sql` down to exactly one statement and refuse it unless it reads.
+    ///
+    /// The gate is here, on the parsed statement, rather than on the text: a
+    /// scan for "SELECT" cannot tell `SELECT` from `/* SELECT */ DROP TABLE`.
+    fn one_read_stmt(&self, sql: &str) -> Result<Statement> {
+        let mut stmts = parse(sql)?;
+        match stmts.len() {
+            1 => {}
+            0 => return Err(Error::exec("no statement to run")),
+            n => return Err(Error::exec(format!("expected a single statement, got {n}"))),
+        }
+        let stmt = stmts.pop().expect("length checked");
+        if !is_read(&stmt) {
+            return Err(Error::unsupported(format!(
+                "{} is a write and this is a read-only path: run it through a \
+                 `&mut Session` (or `Db::writer`)",
+                stmt_kind(&stmt)
+            )));
+        }
+        // The two gates below are about *rows*, so they are asked only of the
+        // statements that read rows. `SHOW TABLES` and `DESCRIBE` answer out
+        // of the catalog, which neither a buffered write nor an open
+        // transaction can change -- DDL inside a transaction is refused --
+        // and failing them because an unrelated table has an unflushed delta
+        // would be a refusal with no cause.
+        if !reads_rows(&stmt) {
+            return Ok(stmt);
+        }
+        // A reader must not see an open transaction's private overlay:
+        // `Table::snapshot` hands the overlay to whoever asks once `begin_txn`
+        // has run, so a read here would be a dirty read of uncommitted rows.
+        // `Db::transaction` holds the writer lock across the whole block,
+        // which is why this is reachable only by driving BEGIN through a raw
+        // `Db::writer` guard and then dropping it.
+        if self.catalog.any_in_txn() {
+            return Err(Error::unsupported(
+                "a transaction is open on this database: a concurrent read would see \
+                 its uncommitted rows. COMMIT or ROLLBACK first, or hold the writer \
+                 for the whole transaction with `Db::transaction`",
+            ));
+        }
+        // Scans read parts. Buffered rows are invisible to them, and a reader
+        // cannot flush -- so it says so instead of answering short. The
+        // `Reader` on the other side of `Db` takes the writer lock for one
+        // flush and retries; see `Reader::with_session`.
+        if self.catalog.has_pending_writes() {
+            return Err(Error::exec(PENDING_WRITES));
+        }
+        Ok(stmt)
+    }
+
+    /// The read set's dispatcher. `&self` end to end.
+    fn read_statement(&self, stmt: &Statement, ctx: &QueryContext) -> Result<ResultSet> {
+        match stmt {
+            Statement::Query(q) => self.query_in(q, ctx),
+            Statement::ShowDatabases => {
+                ResultSet::one_string_column("name", self.catalog.database_names())
+            }
+            Statement::ShowTables { database } => ResultSet::one_string_column(
+                "name",
+                self.catalog.table_names(database.as_deref())?,
+            ),
+            Statement::ShowCreateTable(name) => {
+                let t = self.catalog.table(name)?;
+                ResultSet::one_string_column(
+                    "statement",
+                    vec![render_create_table(t.schema(), &t.def)],
+                )
+            }
+            Statement::Describe(name) => {
+                let t = self.catalog.table(name)?;
+                let schema = Schema::new(vec![
+                    Field::new("name", DataType::String),
+                    Field::new("type", DataType::String),
+                ])?;
+                let rows = t
+                    .schema()
+                    .fields()
+                    .iter()
+                    .map(|f| vec![Value::str(f.name.clone()), Value::str(f.ty.to_string())])
+                    .collect();
+                ResultSet::from_rows(schema, rows)
+            }
+            Statement::Explain { kind, statement } => self.run_explain(*kind, statement, ctx),
+            other => Err(Error::unsupported(format!(
+                "{} is not a read",
+                stmt_kind(other)
+            ))),
+        }
+    }
+
     // --------------------------------------------------------------- queries
 
+    /// Plan a query, flushing first. The `&mut self` half of the split.
+    ///
+    /// Scans read parts, not the write buffer, so everything buffered has to
+    /// land in a part first. See the storage::table module docs for why this
+    /// beats teaching every operator to merge a hash map.
+    ///
+    /// The flush is *here* rather than inside [`Session::plan_in`], and that
+    /// one line is the whole reason reads used to serialize: it made a
+    /// `SELECT` on `a` take exclusive write access to `b`, `c` and `d`, and
+    /// may synchronously rewrite them.
     fn plan(&mut self, q: &crate::sql::ast::Query) -> Result<LogicalPlan> {
-        // Scans read parts, not the write buffer, so everything buffered has to
-        // land in a part first. See the storage::table module docs for why this
-        // beats teaching every operator to merge a hash map.
         self.catalog.flush_all()?;
-        let q = self.resolve_subqueries(q)?;
+        self.plan_in(q, &self.limits.context())
+    }
+
+    /// Plan a query against the catalog exactly as it stands.
+    ///
+    /// The read path's planner: `&self`, no flush, no mutation of anything.
+    /// The caller is responsible for the buffered rows -- either it flushed
+    /// (the `&mut` path) or it checked [`Catalog::has_pending_writes`] and
+    /// refused (the `&self` path).
+    fn plan_in(&self, q: &crate::sql::ast::Query, ctx: &QueryContext) -> Result<LogicalPlan> {
+        let q = self.resolve_subqueries(q, ctx)?;
         let plan = Binder::new(&self.catalog).bind_query(&q)?;
         optimizer::optimize(plan)
     }
@@ -1040,14 +1402,30 @@ impl Session {
     /// A *correlated* subquery references an outer column, so running it alone
     /// fails to bind; that failure is caught and reported as the unsupported
     /// feature it is, rather than as a confusing unknown-column error.
-    fn resolve_subqueries(&mut self, q: &crate::sql::ast::Query) -> Result<crate::sql::ast::Query> {
+    /// ## Nothing is cloned unless something is folded
+    ///
+    /// The rewrite is in-place, so it needs an owned AST -- and this used to
+    /// clone the whole query on *every* statement, subqueries or not, which is
+    /// 330 ns and a dozen allocations for `SELECT id FROM t WHERE id = ?` and
+    /// 1.07 us for an ordinary analytic query (measured, best of 5 over 200k
+    /// clones). [`has_subquery`] answers the same question by walking the
+    /// borrowed AST with no allocation at all, and the overwhelming majority
+    /// of statements answer "no".
+    fn resolve_subqueries<'q>(
+        &self,
+        q: &'q crate::sql::ast::Query,
+        ctx: &QueryContext,
+    ) -> Result<std::borrow::Cow<'q, crate::sql::ast::Query>> {
+        if !has_subquery(q) {
+            return Ok(std::borrow::Cow::Borrowed(q));
+        }
         let mut out = q.clone();
-        let mut budget = 64usize;
-        self.rewrite_query(&mut out, &mut budget)?;
-        Ok(out)
+        let mut st = Sub { left: 64, ctx };
+        self.rewrite_query(&mut out, &mut st)?;
+        Ok(std::borrow::Cow::Owned(out))
     }
 
-    fn rewrite_query(&mut self, q: &mut crate::sql::ast::Query, budget: &mut usize) -> Result<()> {
+    fn rewrite_query(&self, q: &mut crate::sql::ast::Query, budget: &mut Sub<'_>) -> Result<()> {
         use crate::sql::ast::SetExpr;
         for cte in q.with.iter_mut() {
             self.rewrite_query(&mut cte.query, budget)?;
@@ -1069,7 +1447,7 @@ impl Session {
         Ok(())
     }
 
-    fn rewrite_setexpr(&mut self, s: &mut crate::sql::ast::SetExpr, budget: &mut usize) -> Result<()> {
+    fn rewrite_setexpr(&self, s: &mut crate::sql::ast::SetExpr, budget: &mut Sub<'_>) -> Result<()> {
         use crate::sql::ast::{SelectItem, SetExpr};
         match s {
             SetExpr::Select(sel) => {
@@ -1109,7 +1487,7 @@ impl Session {
         Ok(())
     }
 
-    fn rewrite_tableref(&mut self, t: &mut crate::sql::ast::TableRef, budget: &mut usize) -> Result<()> {
+    fn rewrite_tableref(&self, t: &mut crate::sql::ast::TableRef, budget: &mut Sub<'_>) -> Result<()> {
         use crate::sql::ast::{JoinConstraint, TableRef};
         match t {
             TableRef::Table { .. } => {}
@@ -1125,7 +1503,7 @@ impl Session {
         Ok(())
     }
 
-    fn rewrite_expr(&mut self, e: &mut crate::sql::ast::Expr, budget: &mut usize) -> Result<()> {
+    fn rewrite_expr(&self, e: &mut crate::sql::ast::Expr, budget: &mut Sub<'_>) -> Result<()> {
         use crate::sql::ast::Expr;
         // Depth-first, so a subquery nested inside another is resolved first.
         match e {
@@ -1214,20 +1592,23 @@ impl Session {
     /// Run a subquery and return column 0. `max_rows` caps a scalar subquery
     /// at one row, per SQL semantics.
     fn eval_subquery(
-        &mut self,
+        &self,
         q: &crate::sql::ast::Query,
-        budget: &mut usize,
+        budget: &mut Sub<'_>,
         what: &str,
         max_rows: usize,
     ) -> Result<Vec<Value>> {
-        if *budget == 0 {
+        if budget.left == 0 {
             return Err(Error::unsupported(format!(
                 "{what}: subquery nesting is too deep"
             )));
         }
-        *budget -= 1;
+        budget.left -= 1;
 
-        let plan = self.plan(q).map_err(|e| match e {
+        // `plan_in`, not `plan`: the outer statement flushed already if it was
+        // going to, and a subquery must not be the thing that decides a read
+        // needs `&mut`.
+        let plan = self.plan_in(q, budget.ctx).map_err(|e| match e {
             // A correlated subquery cannot bind on its own, and the resulting
             // "unknown column" is a confusing way to say so.
             Error::Bind(m) => Error::unsupported(format!(
@@ -1241,46 +1622,127 @@ impl Session {
                 plan.schema().len()
             )));
         }
-        let blocks = operators::execute(&plan, &self.catalog)?;
+        // Streamed rather than collected: an `IN (SELECT ...)` over a million
+        // rows used to hold the blocks *and* the values at once, and the
+        // blocks were thrown away one line later. This also puts the budget
+        // and the deadline around a subquery, which `operators::execute`'s
+        // ambient context could not.
         let mut out = Vec::new();
-        for b in &blocks {
+        let mut op = operators::build(&plan, &self.catalog, budget.ctx)?;
+        while let Some(b) = {
+            budget.ctx.check()?;
+            op.next()?
+        } {
+            out.reserve(b.rows());
+            let col = b.column(0);
             for r in 0..b.rows() {
-                out.push(b.column(0).value(r));
+                out.push(col.value(r));
+            }
+            // Bounded here rather than after the loop: a scalar subquery over
+            // a huge table stopped only once every value was materialized.
+            if max_rows == 1 && out.len() > 1 {
+                break;
             }
         }
         if max_rows == 1 && out.len() > 1 {
+            // No row count in the message any more, because the loop above
+            // stops at the second row rather than draining the table to find
+            // out how wrong it was.
             return Err(Error::exec(format!(
-                "{what} returned {} rows, expected at most 1",
-                out.len()
+                "{what} returned more than one row, expected at most 1"
             )));
         }
         Ok(out)
     }
 
-    fn run_query(&mut self, q: &crate::sql::ast::Query) -> Result<ResultSet> {
-        let plan = self.plan(q)?;
-        let schema = plan.schema().clone();
-        // Through the exchange, which decides per query whether to go parallel
-        // (see `exchange::degree`) and falls back to the serial pipeline below
-        // its row threshold. Identical signature and return type to the serial
-        // entry point it replaced -- the decision is in the operator, not here.
-        let (blocks, st) = crate::exec::execute_parallel_stats(&plan, &self.catalog)?;
-        let rows = blocks.iter().map(|b| b.rows()).sum();
+    /// The read path, end to end, from `&self`: plan, run, collect.
+    ///
+    /// One function behind every reader -- [`Session::read`], [`Reader::query`]
+    /// and the `&mut` [`Session::query`] all land here -- so there is no second
+    /// pipeline to drift, which is the defect this phase exists to stop.
+    fn query_in(&self, q: &crate::sql::ast::Query, ctx: &QueryContext) -> Result<ResultSet> {
+        let mut blocks = Vec::new();
+        let mut schema = Schema::empty();
+        // The result set is the one buffer in the engine that grew without a
+        // ceiling: every operator above `BLOCK_SIZE` charges its footprint to
+        // the tracker, and then the rows it produced were accumulated here
+        // uncharged. `SELECT * FROM t` on a table larger than RAM was an OOM
+        // rather than an error. The guard is released when this returns, which
+        // is right: from there on the memory is the caller's, and the budget
+        // describes one query's peak, not the lifetime of what it handed back.
+        let mut held = MemGuard::new(ctx, "the result set");
+        let mut bytes = 0usize;
+        let stats = self.stream_in(q, ctx, &mut |item| {
+            match item {
+                StreamItem::Head(s) => schema = s.clone(),
+                StreamItem::Rows(b) => {
+                    bytes += retained_bytes(&b);
+                    held.grow_to(bytes)?;
+                    blocks.push(b);
+                }
+            }
+            Ok(())
+        })?;
         Ok(ResultSet {
             schema,
-            blocks,
             stats: QueryStats {
-                rows,
+                rows: blocks.iter().map(|b| b.rows()).sum(),
                 elapsed_us: 0,
-                granules_read: st.granules_read,
-                granules_pruned: st.granules_pruned,
-                rows_scanned: st.rows_read,
+                granules_read: stats.granules_read,
+                granules_pruned: stats.granules_pruned,
+                rows_scanned: stats.rows_read,
             },
+            blocks,
             affected: None,
         })
     }
 
-    fn run_explain(&mut self, kind: ExplainKind, stmt: &Statement) -> Result<ResultSet> {
+    /// Run `q` and hand each block to `sink` as it is produced.
+    ///
+    /// The streaming primitive: nothing above one block is held by this
+    /// function, so exporting a billion rows costs a block of memory rather
+    /// than a billion rows of it. A blocking operator (a sort, a hash
+    /// aggregate) still builds its own state -- that is the operator's
+    /// footprint, charged to `ctx` where it is built -- but the *result* no
+    /// longer has to exist all at once, which is what a `COPY TO`, a portal
+    /// fetch, or any client that reads faster than it can buffer needs.
+    ///
+    /// The schema is delivered *before* the first block and unconditionally,
+    /// including for an empty result: a client that has to describe the rows
+    /// before it sends them (every wire protocol) cannot wait to find out.
+    fn stream_in(
+        &self,
+        q: &crate::sql::ast::Query,
+        ctx: &QueryContext,
+        sink: &mut dyn FnMut(StreamItem<'_>) -> Result<()>,
+    ) -> Result<crate::exec::operators::ScanStats> {
+        let plan = self.plan_in(q, ctx)?;
+        sink(StreamItem::Head(plan.schema()))?;
+        // Through the exchange, which decides per query whether to go parallel
+        // (see `exchange::degree`) and falls back to the serial pipeline below
+        // its row threshold. The decision is in the operator, not here.
+        let mut op = crate::exec::exchange::build(
+            crate::planner::physical::lower(&plan, &self.catalog)?,
+            &self.catalog,
+            ctx,
+        )?;
+        while let Some(b) = {
+            ctx.check()?;
+            op.next()?
+        } {
+            if b.rows() > 0 {
+                sink(StreamItem::Rows(b))?;
+            }
+        }
+        Ok(op.stats())
+    }
+
+    fn run_explain(
+        &self,
+        kind: ExplainKind,
+        stmt: &Statement,
+        ctx: &QueryContext,
+    ) -> Result<ResultSet> {
         let text = match (kind, stmt) {
             (ExplainKind::Ast, s) => format!("{s:#?}"),
             // PIPELINE renders the *physical* plan, which is the only place the
@@ -1289,10 +1751,23 @@ impl Session {
             // shows the logical tree where that choice does not exist yet.
             // Without this, index selection is unprovable from the outside.
             (ExplainKind::Pipeline, Statement::Query(q)) => {
-                let logical = self.plan(q)?;
+                let logical = self.plan_in(q, ctx)?;
                 crate::planner::physical::lower(&logical, &self.catalog)?.explain()
             }
-            (_, Statement::Query(q)) => self.plan(q)?.explain(),
+            // The one EXPLAIN that runs the statement, and the only way to see
+            // the counters `run_query` computes and drops on the floor. Same
+            // plan, same builder, same loop as `Session::query` -- a diagnostic
+            // that measured a differently built pipeline would be measuring
+            // something nobody runs.
+            (ExplainKind::Analyze, Statement::Query(q)) => {
+                // The session's own context, so an ANALYZE honours the same
+                // budget, deadline and cancel flag the query it measures would
+                // have got. It used to mint a default one, which made EXPLAIN
+                // ANALYZE the one way to run a query the session could not stop.
+                let logical = self.plan_in(q, ctx)?;
+                crate::exec::exchange::explain_analyze(&logical, &self.catalog, ctx)?
+            }
+            (_, Statement::Query(q)) => self.plan_in(q, ctx)?.explain(),
             // A mutation is not a relation, so it is not a `LogicalPlan` and
             // does not reach the arms above -- but the plan that finds its rows
             // is an ordinary one, and this is the only way to see from outside
@@ -1935,6 +2410,390 @@ impl Session {
     }
 }
 
+// ----------------------------------------------------- one writer, N readers
+
+/// One database, shared: a single writer and any number of concurrent readers.
+///
+/// ## Why an `RwLock<Session>` and not an `Arc<Catalog>` snapshot
+///
+/// The reader has to hand the executor a `&Catalog` that outlives the query --
+/// `operators::build` takes one, `physical::lower` takes one, and `Scan`
+/// resolves its table through one. So a reader owns either a *borrow* of the
+/// writer's catalog or a *copy* of it, and both alternatives were tried on
+/// paper first:
+///
+///   * **A copy** (`Arc<Catalog>` snapshot). Building one means building a
+///     `Table` per table over the pinned `Arc<PartSet>`, and the only public
+///     constructors take `Vec<Part>` by value while a `PartSet` holds
+///     `Arc<Part>` *plus the delete masks beside them*. A copy through
+///     `from_parts` silently drops the masks, which resurrects every deleted
+///     row. Sharing a part set into a fresh `Table` needs one constructor
+///     `storage::table` does not expose (see the report).
+///   * **A borrow** (`Reader<'a>`). Free, `Send + Sync`, and it makes the
+///     writer unreachable for as long as any reader exists -- the borrow
+///     checker enforces single-writer by *forbidding* the concurrency the
+///     phase is about. A pool cannot write while a connection is open.
+///
+/// So the shared thing is the `Session` itself, behind one `RwLock`. Readers
+/// take it shared and run at once; the writer takes it exclusively for the
+/// length of one statement. That is the decided single-writer / multi-reader
+/// position expressed with the one primitive that can express it, and it costs
+/// a reader one uncontended `read()` per *query* -- against a query that has
+/// already parsed, bound, lowered and scanned.
+///
+/// A `Reader` is `Send + Sync + Clone` and owns no lifetime, which is what a
+/// connection pool and a wire server's per-connection model need: hand each
+/// connection a clone, and they run in parallel.
+#[derive(Clone)]
+pub struct Db {
+    inner: Arc<RwLock<Session>>,
+}
+
+impl Db {
+    pub fn in_memory() -> Db {
+        Session::in_memory().into_shared()
+    }
+
+    pub fn open(dir: impl AsRef<Path>) -> Result<Db> {
+        Ok(Session::open(dir)?.into_shared())
+    }
+
+    /// [`Session::open_read_only`], shared. Several of these coexist in one
+    /// process and across processes; a writer excludes them all.
+    pub fn open_read_only(dir: impl AsRef<Path>) -> Result<Db> {
+        Ok(Session::open_read_only(dir)?.into_shared())
+    }
+
+    /// A handle that can run reads concurrently with every other one.
+    ///
+    /// Cheap: one `Arc` clone and the session's current limits. Take one per
+    /// connection and give each its own budget and deadline.
+    pub fn reader(&self) -> Reader {
+        let limits = self.inner.read().unwrap_or_else(|e| e.into_inner()).limits.clone();
+        Reader { inner: Arc::clone(&self.inner), limits }
+    }
+
+    /// Exclusive access, for the write set. Held until the guard drops, so a
+    /// caller that wants several statements to be one unit simply keeps it.
+    ///
+    /// Readers block for exactly this long, which is why the guard should not
+    /// be parked in a local across a `BEGIN`: use [`Db::transaction`].
+    ///
+    /// One rule: do not take a [`Reader`] query on the thread that holds this
+    /// guard -- it would wait for a lock the same thread already owns. The
+    /// guard derefs to `Session`, so `writer().read(sql)` answers the same
+    /// question without a second acquisition.
+    pub fn writer(&self) -> Writer<'_> {
+        Writer { g: self.inner.write().unwrap_or_else(|e| e.into_inner()) }
+    }
+
+    /// Run `f` with exclusive access, wrapped in `BEGIN`/`COMMIT`.
+    ///
+    /// The writer lock is held across the whole transaction, which is what
+    /// makes a concurrent reader see the transaction as one step: it cannot
+    /// acquire the shared lock while the overlay exists, so it observes the
+    /// state either wholly before or wholly after. Without this the reader
+    /// would have to *refuse* -- an uncommitted overlay is what
+    /// `Table::snapshot` hands out, so reading through it is a dirty read.
+    ///
+    /// `f` gets the `Session` itself, so it can read its own writes with
+    /// [`Session::query`]. It must not reach for a [`Reader`]: that waits on
+    /// the lock this call is holding, on this thread.
+    pub fn transaction<R>(&self, f: impl FnOnce(&mut Session) -> Result<R>) -> Result<R> {
+        let mut w = self.writer();
+        w.begin()?;
+        match f(&mut w) {
+            Ok(v) => {
+                w.commit()?;
+                Ok(v)
+            }
+            Err(e) => {
+                let _ = w.rollback();
+                Err(e)
+            }
+        }
+    }
+
+    /// Run one or more write statements. Convenience for `writer().execute`.
+    pub fn execute(&self, sql: &str) -> Result<()> {
+        self.writer().execute(sql)
+    }
+}
+
+impl Session {
+    /// Move this session behind a shared handle: one writer, many readers.
+    ///
+    /// By value, because that is the honest signature: the whole point is that
+    /// nobody keeps a `&mut Session` on the side while readers are running.
+    pub fn into_shared(self) -> Db {
+        Db { inner: Arc::new(RwLock::new(self)) }
+    }
+}
+
+/// Exclusive access to the session behind a [`Db`]. Derefs to `Session`, so
+/// the entire existing write API is reachable unchanged.
+pub struct Writer<'a> {
+    g: RwLockWriteGuard<'a, Session>,
+}
+
+impl std::ops::Deref for Writer<'_> {
+    type Target = Session;
+    fn deref(&self) -> &Session {
+        &self.g
+    }
+}
+
+impl std::ops::DerefMut for Writer<'_> {
+    fn deref_mut(&mut self) -> &mut Session {
+        &mut self.g
+    }
+}
+
+/// A concurrent read handle: `Send + Sync + Clone`, no lifetime.
+///
+/// Every method takes `&self`, so one `Reader` shared by N threads -- or N
+/// clones, which cost an `Arc` bump each -- run their queries at the same
+/// time. This is the type the flat 33/32/31 ms scaling curve was about.
+#[derive(Clone)]
+pub struct Reader {
+    inner: Arc<RwLock<Session>>,
+    limits: Limits,
+}
+
+impl Reader {
+    /// Run one read statement.
+    pub fn query(&self, sql: &str) -> Result<ResultSet> {
+        let ctx = self.limits.context();
+        self.with_session(|s| s.read_with(sql, &ctx))
+    }
+
+    /// [`Reader::query`] under a caller-supplied context, for a pool that
+    /// governs a statement rather than a connection.
+    pub fn query_with(&self, sql: &str, ctx: &QueryContext) -> Result<ResultSet> {
+        self.with_session(|s| s.read_with(sql, ctx))
+    }
+
+    /// Stream a `SELECT` to `sink`, one block at a time. See
+    /// [`Session::read_stream`].
+    ///
+    /// The shared lock is held for the whole stream, so the sink is on the
+    /// critical path of every writer: a sink that blocks on a slow socket
+    /// blocks the next `INSERT`. [`Reader::cursor`] is the version that does
+    /// not, at the cost of a thread.
+    pub fn stream(
+        &self,
+        sql: &str,
+        sink: &mut dyn FnMut(StreamItem<'_>) -> Result<()>,
+    ) -> Result<usize> {
+        let ctx = self.limits.context();
+        self.with_session(move |s| s.read_stream(sql, &ctx, sink))
+    }
+
+    /// Per-query memory ceiling for this handle only.
+    pub fn with_memory_limit(mut self, bytes: i64) -> Reader {
+        self.limits.mem = bytes;
+        self
+    }
+
+    /// Per-statement deadline for this handle only.
+    pub fn with_timeout(mut self, d: Duration) -> Reader {
+        self.limits.timeout = Some(d);
+        self
+    }
+
+    /// A private cancel flag for this handle, not shared with the session it
+    /// came from. Without this a pool's `KILL QUERY` would stop every
+    /// connection at once.
+    pub fn with_own_cancel(mut self) -> Reader {
+        self.limits.cancel = Arc::new(AtomicBool::new(false));
+        self
+    }
+
+    /// Set this to stop the queries this handle is running.
+    pub fn cancel_handle(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.limits.cancel)
+    }
+
+    pub fn resume(&self) {
+        self.limits.cancel.store(false, Ordering::Relaxed);
+    }
+
+    /// Run `f` under the shared lock, draining buffered writes first if a
+    /// writer left any.
+    ///
+    /// The flush is the one thing a read cannot do for itself, so it is done
+    /// here -- once, under the writer lock, and only when
+    /// `has_pending_writes` says a scan would otherwise answer short. In the
+    /// steady state (an analytic workload, or an OLTP one between writes) the
+    /// test is a handful of `usize` compares and the query runs entirely
+    /// under the shared lock, which is what lets N of them overlap.
+    ///
+    /// The slow path flushes **and answers** under the exclusive lock rather
+    /// than dropping back to the shared one, and that is not laziness: a
+    /// writer that buffers again in the gap would leave the retry facing the
+    /// same buffered rows, and reporting that as an error would be a spurious
+    /// failure with no action the caller could take. Holding the lock across
+    /// both makes progress unconditional. The price is that the first read
+    /// after a write serializes with the other readers -- one query, and only
+    /// until the delta is empty again.
+    ///
+    /// A table mid-transaction skips straight to `f`, which refuses: flushing
+    /// would push the buffered rows into the writer's private overlay, which
+    /// is a mutation of somebody else's transaction to produce an answer that
+    /// is going to be refused anyway.
+    fn with_session<R>(&self, f: impl FnOnce(&Session) -> Result<R>) -> Result<R> {
+        {
+            let g = self.inner.read().unwrap_or_else(|e| e.into_inner());
+            if !g.catalog.has_pending_writes() || g.catalog.any_in_txn() {
+                return f(&g);
+            }
+        }
+        let mut g = self.inner.write().unwrap_or_else(|e| e.into_inner());
+        g.catalog.flush_all()?;
+        f(&g)
+    }
+
+    /// Read rows incrementally, pulling instead of pushing.
+    ///
+    /// [`Reader::stream`] is the cheaper API and the one to prefer; this is
+    /// the shape a wire protocol's portal needs, where the *client* decides
+    /// when the next batch is wanted. It costs one thread, which holds the
+    /// shared lock until the cursor is drained or dropped -- so a writer on
+    /// this thread waits for it. Dropping the cursor cancels the query and
+    /// releases the lock, and `Drop` joins, so "drop it before you write" is
+    /// the whole rule.
+    ///
+    /// One sharp edge worth stating: a cursor opened while a writer has rows
+    /// buffered takes the *exclusive* lock instead (see
+    /// [`Reader::with_session`]) and holds it, so it blocks other readers too
+    /// until it is drained. Opening cursors on a quiet database, or after a
+    /// `SYSTEM FLUSH`, avoids it entirely.
+    pub fn cursor(&self, sql: &str) -> Result<Cursor> {
+        Cursor::spawn(Arc::clone(&self.inner), self.limits.clone(), sql.to_string())
+    }
+}
+
+/// A pull-based result stream. `Iterator<Item = Result<Block>>`.
+///
+/// One block is in flight at a time: the producer parks on a rendezvous send
+/// until the consumer takes the previous one, so a cursor over a billion rows
+/// holds two blocks, not a billion rows. That backpressure is the point -- an
+/// unbounded channel would move the unbounded buffer rather than remove it.
+pub struct Cursor {
+    rx: std::sync::mpsc::Receiver<Result<Chunk>>,
+    /// Flipped by `Drop`, which is what unblocks a producer parked in `send`
+    /// and stops the query it is running mid-block.
+    cancel: Arc<AtomicBool>,
+    join: Option<std::thread::JoinHandle<()>>,
+    schema: Schema,
+    done: bool,
+}
+
+/// [`StreamItem`] with the head owned, because it crosses a channel.
+enum Chunk {
+    Head(Schema),
+    Rows(Block),
+}
+
+impl Cursor {
+    fn spawn(inner: Arc<RwLock<Session>>, limits: Limits, sql: String) -> Result<Cursor> {
+        // Its own flag, never the session's: dropping one cursor must not
+        // cancel the session's other queries.
+        let limits = Limits { cancel: Arc::new(AtomicBool::new(false)), ..limits };
+        let cancel = Arc::clone(&limits.cancel);
+        // Capacity 1, not 0: `sync_channel(0)` makes every block a full
+        // rendezvous, so the producer and the consumer alternate in lockstep
+        // and neither ever runs ahead. One slot lets the scan decode block
+        // n+1 while the client is still reading block n, which is the whole
+        // of the pipelining a portal wants, and costs one block of memory.
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Result<Chunk>>(1);
+        let reader = Reader { inner, limits };
+        let join = std::thread::Builder::new()
+            .name("granular-cursor".into())
+            .spawn(move || {
+                let ctx = reader.limits.context();
+                let out = reader.with_session(|s| {
+                    s.read_stream(&sql, &ctx, &mut |item| {
+                        let msg = match item {
+                            StreamItem::Head(s) => Chunk::Head(s.clone()),
+                            StreamItem::Rows(b) => Chunk::Rows(b),
+                        };
+                        // A closed receiver is a dropped cursor, which is a
+                        // cancellation and not an error to report to anyone.
+                        tx.send(Ok(msg)).map_err(|_| Error::exec("cursor closed"))
+                    })
+                });
+                if let Err(e) = out {
+                    let _ = tx.send(Err(e));
+                }
+            })
+            .map_err(|e| Error::Io(format!("cannot start a cursor thread: {e}")))?;
+        // Block for the head, so a cursor either fails to start or knows its
+        // shape -- a portal has to answer `Describe` before it fetches, and an
+        // API that made the schema arrive with the first row could not answer
+        // it at all for an empty result.
+        let schema = match rx.recv() {
+            Ok(Ok(Chunk::Head(s))) => s,
+            Ok(Err(e)) => {
+                let _ = join.join();
+                return Err(e);
+            }
+            // Neither can happen -- the producer's first send is the head --
+            // but the alternative to handling them is `unwrap` on a channel.
+            Ok(Ok(Chunk::Rows(_))) | Err(_) => {
+                let _ = join.join();
+                return Err(Error::exec("cursor produced no schema"));
+            }
+        };
+        Ok(Cursor { rx, cancel, join: Some(join), schema, done: false })
+    }
+
+    /// The result's shape. Known before the first row, always.
+    pub fn schema(&self) -> &Schema {
+        &self.schema
+    }
+}
+
+impl Iterator for Cursor {
+    type Item = Result<Block>;
+
+    fn next(&mut self) -> Option<Result<Block>> {
+        if self.done {
+            return None;
+        }
+        match self.rx.recv() {
+            Ok(Ok(Chunk::Rows(b))) => Some(Ok(b)),
+            // The producer reported a failure, or finished and hung up. Either
+            // way this cursor is over: a second `recv` would return the same
+            // disconnect forever, and an error must be reported once.
+            Ok(Err(e)) => {
+                self.done = true;
+                Some(Err(e))
+            }
+            Ok(Ok(Chunk::Head(_))) | Err(_) => {
+                self.done = true;
+                None
+            }
+        }
+    }
+}
+
+impl Drop for Cursor {
+    fn drop(&mut self) {
+        // Order matters: cancel first so a producer *inside* the query stops
+        // at its next block boundary, then drop the receiver so one parked in
+        // `send` wakes with an error. Joining last is what makes the shared
+        // lock provably released when this returns -- otherwise a writer taken
+        // on the next line would race a thread still holding it.
+        self.cancel.store(true, Ordering::Relaxed);
+        let (_, rx) = std::sync::mpsc::sync_channel::<Result<Chunk>>(1);
+        drop(std::mem::replace(&mut self.rx, rx));
+        if let Some(j) = self.join.take() {
+            let _ = j.join();
+        }
+    }
+}
+
 // ------------------------------------------------------- single-writer lock
 
 /// Name of the lock file in the data directory's root.
@@ -1958,11 +2817,49 @@ pub const LOCK_FILE: &str = "LOCK";
 mod flock_sys {
     use std::ffi::c_int;
 
+    pub const LOCK_SH: c_int = 1;
     pub const LOCK_EX: c_int = 2;
     pub const LOCK_NB: c_int = 4;
 
     extern "C" {
         pub fn flock(fd: c_int, op: c_int) -> c_int;
+    }
+}
+
+/// Which claim a session makes on the data directory.
+///
+/// `Shared` is what makes [`Session::open_read_only`] plural: `flock` lets any
+/// number of `LOCK_SH` holders coexist and excludes them all from a `LOCK_EX`
+/// holder, which is precisely the single-writer / many-reader rule this phase
+/// is about -- enforced by the kernel, across processes, for free.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LockMode {
+    Shared,
+    Exclusive,
+}
+
+impl LockMode {
+    #[cfg(unix)]
+    fn op(self) -> std::ffi::c_int {
+        match self {
+            LockMode::Shared => flock_sys::LOCK_SH,
+            LockMode::Exclusive => flock_sys::LOCK_EX,
+        }
+    }
+
+    fn why(self) -> &'static str {
+        match self {
+            LockMode::Shared => {
+                "another granular process has it open for writing. A read-only session \
+                 shares the directory with other readers, but not with a writer"
+            }
+            LockMode::Exclusive => {
+                "Only one process may have a data directory open for writing at a time -- \
+                 concurrent writers allocate colliding part file names and overwrite each \
+                 other's committed data. Close the other process, or point this one at a \
+                 different --data directory"
+            }
+        }
     }
 }
 
@@ -1987,7 +2884,7 @@ mod flock_sys {
 /// Cost is one `open` and one `flock` per `Session::open`, both off any hot
 /// path.
 #[cfg(unix)]
-fn lock_data_dir(root: &Path) -> Result<Option<File>> {
+fn lock_data_dir(root: &Path, mode: LockMode) -> Result<Option<File>> {
     use std::io::{Read, Seek, SeekFrom, Write};
     use std::os::unix::io::AsRawFd;
 
@@ -2006,7 +2903,7 @@ fn lock_data_dir(root: &Path) -> Result<Option<File>> {
     // SAFETY: `f` owns a valid open descriptor for the whole call, and `flock`
     // only inspects the descriptor -- it neither retains it nor touches user
     // memory.
-    let rc = unsafe { flock_sys::flock(f.as_raw_fd(), flock_sys::LOCK_EX | flock_sys::LOCK_NB) };
+    let rc = unsafe { flock_sys::flock(f.as_raw_fd(), mode.op() | flock_sys::LOCK_NB) };
     if rc != 0 {
         // EWOULDBLOCK is the expected case (someone holds it); anything else
         // (EOPNOTSUPP on an exotic filesystem, EBADF) is reported the same
@@ -2021,13 +2918,18 @@ fn lock_data_dir(root: &Path) -> Result<Option<File>> {
             format!(" (pid {holder})")
         };
         return Err(Error::storage(format!(
-            "data directory `{}` is already open by another granular process{who}: {os}. \
-             Only one process may have a data directory open at a time -- concurrent \
-             writers allocate colliding part file names and overwrite each other's \
-             committed data. Close the other process, or point this one at a different \
-             --data directory.",
-            root.display()
+            "data directory `{}` is already open by another granular process{who}: {os}. {}.",
+            root.display(),
+            mode.why()
         )));
+    }
+
+    // A shared holder must not stamp its pid over the file: several of them
+    // hold the lock at once, so the last writer would win a race nobody
+    // arbitrates, and the pid is only there to name the *exclusive* holder in
+    // the message above.
+    if mode == LockMode::Shared {
+        return Ok(Some(f));
     }
 
     // Only now, holding the lock, is it ours to write to.
@@ -2055,7 +2957,7 @@ fn lock_data_dir(root: &Path) -> Result<Option<File>> {
 /// is a real limitation, not an oversight: see the unix arm for what the lock
 /// prevents.
 #[cfg(not(unix))]
-fn lock_data_dir(_root: &Path) -> Result<Option<File>> {
+fn lock_data_dir(_root: &Path, _mode: LockMode) -> Result<Option<File>> {
     Ok(None)
 }
 
@@ -2217,6 +3119,140 @@ fn txn_stmt(span: &[crate::sql::lexer::Spanned]) -> Option<TxnStmt> {
     }
 }
 
+/// What *holding* `b` costs this process, in bytes.
+///
+/// Deliberately not [`Block::bytes`], on two counts. It walks every string in
+/// the block to add its body's length: 1332 ns per 8192-row string block
+/// against 3 ns here (measured, best of 7 over 25 blocks of a 200k-row
+/// result), which is per-row work on a path that must not have any. And it
+/// charges that body once *per row*, while a scan's strings are `Arc<str>`
+/// clones of the part dictionary's -- one body, N pointers -- so it reported
+/// 7 MiB for a result whose real cost was 4.
+///
+/// The pointer is what the result owns, so the pointer is what it is charged.
+/// A string column *computed* by an expression does own its bodies and is
+/// undercharged by their length; the ceiling this defends is 8 GiB and the
+/// thing it is defending against is a result of unbounded *blocks*, which
+/// 24 bytes per row per column bounds exactly.
+fn retained_bytes(b: &Block) -> usize {
+    b.columns
+        .iter()
+        .map(|c| {
+            let per = match &c.data {
+                crate::types::ColumnData::Str(_) => std::mem::size_of::<std::sync::Arc<str>>(),
+                _ => 8,
+            };
+            c.data.len() * per + c.nulls.as_ref().map_or(0, |n| n.bytes())
+        })
+        .sum()
+}
+
+// ------------------------------------------------ is there anything to fold?
+//
+// The mirror of `Session::rewrite_*`, over a borrowed AST and answering one
+// bit instead of rewriting. It exists so the common statement -- no subquery
+// anywhere in it -- plans without cloning itself first.
+//
+// **Every one of these is conservative in the same direction**: an arm this
+// code has not been taught about answers `true`, which costs a clone and takes
+// the path that was there before. So a variant added to the AST cannot make a
+// subquery go unfolded; the worst it can do is lose an optimization. That is
+// the only reading under which a second traversal is safe to keep beside the
+// first, and it is why the catch-alls are wildcards rather than exhaustive
+// matches the compiler would force somebody to extend.
+
+fn has_subquery(q: &crate::sql::ast::Query) -> bool {
+    q.with.iter().any(|c| has_subquery(&c.query))
+        || set_has_subquery(&q.body)
+        || q.order_by.iter().any(|o| expr_has_subquery(&o.expr))
+        || q.limit.iter().chain(q.offset.iter()).any(expr_has_subquery)
+        || q.limit_by.as_ref().is_some_and(|(n, keys)| {
+            expr_has_subquery(n) || keys.iter().any(expr_has_subquery)
+        })
+}
+
+fn set_has_subquery(s: &crate::sql::ast::SetExpr) -> bool {
+    use crate::sql::ast::{SelectItem, SetExpr};
+    match s {
+        SetExpr::Select(sel) => {
+            sel.projection.iter().any(|i| match i {
+                SelectItem::Expr { expr, .. } => expr_has_subquery(expr),
+                _ => false,
+            }) || sel.from.as_ref().is_some_and(tableref_has_subquery)
+                || sel
+                    .prewhere
+                    .iter()
+                    .chain(sel.selection.iter())
+                    .chain(sel.having.iter())
+                    .any(expr_has_subquery)
+                || sel.group_by.iter().any(expr_has_subquery)
+        }
+        SetExpr::Query(q) => has_subquery(q),
+        SetExpr::SetOperation { left, right, .. } => {
+            set_has_subquery(left) || set_has_subquery(right)
+        }
+        SetExpr::Values(rows) => rows.iter().flatten().any(expr_has_subquery),
+    }
+}
+
+fn tableref_has_subquery(t: &crate::sql::ast::TableRef) -> bool {
+    use crate::sql::ast::{JoinConstraint, TableRef};
+    match t {
+        TableRef::Table { .. } => false,
+        // A derived table is bound, not folded -- but one nested *inside* it
+        // is folded, so the walk goes through.
+        TableRef::Subquery { query, .. } => has_subquery(query),
+        TableRef::Join { left, right, constraint, .. } => {
+            tableref_has_subquery(left)
+                || tableref_has_subquery(right)
+                || matches!(constraint, JoinConstraint::On(e) if expr_has_subquery(e))
+        }
+    }
+}
+
+fn expr_has_subquery(e: &crate::sql::ast::Expr) -> bool {
+    use crate::sql::ast::Expr;
+    match e {
+        Expr::Subquery(_) | Expr::InSubquery { .. } | Expr::Exists { .. } => true,
+        Expr::Literal(_) | Expr::Column(_) | Expr::Wildcard => false,
+        Expr::UnaryOp { expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::IsNull { expr, .. }
+        | Expr::Interval { value: expr, .. } => expr_has_subquery(expr),
+        Expr::BinaryOp { left, right, .. } => {
+            expr_has_subquery(left) || expr_has_subquery(right)
+        }
+        Expr::Function { args, params, .. } => {
+            args.iter().chain(params.iter()).any(expr_has_subquery)
+        }
+        Expr::Window { args, params, spec, .. } => {
+            args.iter().chain(params.iter()).any(expr_has_subquery)
+                || spec.partition_by.iter().any(expr_has_subquery)
+                || spec.order_by.iter().any(|o| expr_has_subquery(&o.expr))
+        }
+        Expr::Case { operand, when_then, else_result } => {
+            operand.iter().any(|o| expr_has_subquery(o))
+                || when_then
+                    .iter()
+                    .any(|(w, t)| expr_has_subquery(w) || expr_has_subquery(t))
+                || else_result.iter().any(|x| expr_has_subquery(x))
+        }
+        Expr::InList { expr, list, .. } => {
+            expr_has_subquery(expr) || list.iter().any(expr_has_subquery)
+        }
+        Expr::Between { expr, low, high, .. } => {
+            expr_has_subquery(expr) || expr_has_subquery(low) || expr_has_subquery(high)
+        }
+        Expr::Like { expr, pattern, .. } => {
+            expr_has_subquery(expr) || expr_has_subquery(pattern)
+        }
+        Expr::Tuple(items) => items.iter().any(expr_has_subquery),
+        // See the note above: unknown means "assume yes".
+        #[allow(unreachable_patterns)]
+        _ => true,
+    }
+}
+
 /// Statements that change the catalog's shape rather than a table's contents.
 fn is_ddl(s: &Statement) -> bool {
     matches!(
@@ -2229,6 +3265,87 @@ fn is_ddl(s: &Statement) -> bool {
             | Statement::AlterDropColumn { .. }
             | Statement::Truncate { .. }
     )
+}
+
+/// Statements a `&self` session may run: they read the catalog and the parts,
+/// and touch nothing else.
+///
+/// `EXPLAIN` is in, including `EXPLAIN ANALYZE`, because the statement it
+/// wraps is only ever *planned* here -- and ANALYZE runs it exactly as a
+/// `SELECT` runs, through the same builder. `EXPLAIN` over a mutation binds
+/// the plan that would find the rows and stops there. `USE` is out: it moves
+/// the session's current database, which is state, however small.
+///
+/// The one that has to stay out and looks like it belongs: `SYSTEM FLUSH`. It
+/// is spelled like a read and it drains every write buffer.
+fn is_read(s: &Statement) -> bool {
+    matches!(
+        s,
+        Statement::Query(_)
+            | Statement::ShowDatabases
+            | Statement::ShowTables { .. }
+            | Statement::ShowCreateTable(_)
+            | Statement::Describe(_)
+            | Statement::Explain { .. }
+    )
+}
+
+/// Read statements that touch a table's *rows* rather than only its metadata.
+///
+/// `EXPLAIN` is in even where it does not execute: `PIPELINE` reads granule
+/// counts off the pinned snapshot to decide the exchange width, so a plan
+/// rendered over an unflushed delta would describe a fleet the real query
+/// would not get.
+fn reads_rows(s: &Statement) -> bool {
+    matches!(s, Statement::Query(_) | Statement::Explain { .. })
+}
+
+/// The statement's name, for an error that has to say what it refused.
+///
+/// A `&'static str` rather than `format!("{stmt:?}")`: the refusal messages
+/// are the only caller, and dumping an entire AST into one is how a rejected
+/// `INSERT ... SELECT` produces a megabyte of error text.
+fn stmt_kind(s: &Statement) -> &'static str {
+    match s {
+        Statement::Query(_) => "SELECT",
+        Statement::Insert(_) => "INSERT",
+        Statement::CreateTable(_) => "CREATE TABLE",
+        Statement::CreateDatabase { .. } => "CREATE DATABASE",
+        Statement::DropTable { .. } => "DROP TABLE",
+        Statement::DropDatabase { .. } => "DROP DATABASE",
+        Statement::Use(_) => "USE",
+        Statement::Optimize { .. } => "OPTIMIZE",
+        Statement::Truncate { .. } => "TRUNCATE",
+        Statement::SystemFlush(_) => "SYSTEM FLUSH",
+        Statement::AlterDelete { .. } => "ALTER TABLE ... DELETE",
+        Statement::AlterUpdate { .. } => "ALTER TABLE ... UPDATE",
+        Statement::AlterAddColumn { .. } => "ALTER TABLE ... ADD COLUMN",
+        Statement::AlterDropColumn { .. } => "ALTER TABLE ... DROP COLUMN",
+        Statement::ShowDatabases => "SHOW DATABASES",
+        Statement::ShowTables { .. } => "SHOW TABLES",
+        Statement::ShowCreateTable(_) => "SHOW CREATE TABLE",
+        Statement::Describe(_) => "DESCRIBE",
+        Statement::Explain { .. } => "EXPLAIN",
+    }
+}
+
+/// What a `&self` read says when a table still holds buffered rows.
+///
+/// It is an error and not a shrug because the alternative is the defect this
+/// engine keeps finding: an answer that is short by however many rows happened
+/// to be in the delta, returned as if it were complete.
+const PENDING_WRITES: &str =
+    "this session has buffered writes that a scan cannot see, and a read-only path \
+     cannot flush them. Run the query through `&mut Session`, or use a `Reader` from \
+     `Db`, which takes the writer lock for one flush and retries";
+
+#[cold]
+fn read_only_err(what: &str) -> Error {
+    Error::unsupported(format!(
+        "{what} is not allowed on a read-only session: it was opened with \
+         `open_read_only`, which takes a shared directory lock that several \
+         processes hold at once precisely because none of them writes"
+    ))
 }
 
 
@@ -2333,6 +3450,52 @@ mod tests {
     use crate::persist::testkit::Scratch;
 
     const DDL: &str = "CREATE TABLE t (id UInt64, v Int64) ENGINE = MergeTree ORDER BY id";
+
+    /// The safety property of planning without cloning: a false *negative*
+    /// from `has_subquery` leaves an `Expr::Subquery` in the tree for the
+    /// binder to trip over, so every position the rewriter folds in has to be
+    /// a position this detector looks in.
+    ///
+    /// One entry per arm of `Session::rewrite_*`. A false positive costs a
+    /// clone and is not a bug, which is why the negatives below are only
+    /// spot-checks -- they exist to prove the detector is not `|| true`.
+    #[test]
+    fn every_position_the_folder_rewrites_is_a_position_the_detector_looks_in() {
+        let with = [
+            "SELECT (SELECT max(id) FROM t) FROM t",
+            "SELECT * FROM t WHERE id IN (SELECT id FROM t)",
+            "SELECT * FROM t WHERE EXISTS (SELECT 1 FROM t)",
+            "SELECT * FROM t PREWHERE id > (SELECT min(id) FROM t)",
+            "SELECT id, count() FROM t GROUP BY id HAVING count() > (SELECT 1)",
+            "SELECT * FROM t GROUP BY id + (SELECT 0)",
+            "WITH c AS (SELECT (SELECT 1) AS x FROM t) SELECT * FROM c",
+            "SELECT * FROM (SELECT id FROM t WHERE id IN (SELECT id FROM t)) s",
+            "SELECT * FROM t a JOIN t b ON a.id = b.id + (SELECT 0)",
+            "SELECT * FROM t ORDER BY id + (SELECT 0)",
+            "SELECT * FROM t LIMIT (SELECT 1)",
+            "SELECT * FROM t WHERE CASE WHEN id > (SELECT 0) THEN 1 ELSE 0 END = 1",
+            "SELECT abs(id - (SELECT 0)) FROM t",
+            "SELECT sum(v) OVER (PARTITION BY id + (SELECT 0)) FROM t",
+            "SELECT * FROM t WHERE id BETWEEN (SELECT 0) AND 9",
+            "SELECT * FROM t WHERE id IN (1, (SELECT 2))",
+            "SELECT id FROM t UNION ALL SELECT (SELECT 1) FROM t",
+        ];
+        for sql in with {
+            let stmts = parse(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+            let Statement::Query(q) = &stmts[0] else { panic!("{sql}: not a query") };
+            assert!(has_subquery(q), "missed the subquery in `{sql}`");
+        }
+        for sql in [
+            "SELECT id, v FROM t WHERE id = 1",
+            "SELECT id, sum(v) FROM t GROUP BY id ORDER BY id LIMIT 10",
+            "SELECT id FROM t UNION ALL SELECT id FROM t",
+            "SELECT * FROM t a JOIN t b ON a.id = b.id",
+        ] {
+            let stmts = parse(sql).unwrap();
+            let Statement::Query(q) = &stmts[0] else { panic!("{sql}: not a query") };
+            assert!(!has_subquery(q), "`{sql}` has no subquery to fold");
+        }
+    }
 
     /// Two sessions over one directory used to both report success and then
     /// overwrite each other's parts. The second must now fail loudly.

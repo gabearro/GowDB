@@ -244,8 +244,39 @@ impl Catalog {
             .flat_map(|(_, d)| d.tables.iter_mut())
     }
 
-    /// Flush every table's write buffer. Called before a scan-based query and
-    /// before persisting.
+    pub fn all_tables(&self) -> impl Iterator<Item = (&String, &Table)> {
+        self.databases.iter().flat_map(|(_, d)| d.tables.iter())
+    }
+
+    /// Does any table hold rows a scan would not see?
+    ///
+    /// The gate on the `&self` read path in [`crate::Session::read`]: scans
+    /// read parts, so a table with a non-empty delta has to be flushed before
+    /// one can answer, and flushing needs `&mut`. Answering that question is
+    /// one `usize` compare per table -- cheaper than the `flush_all` it
+    /// replaces even when it says yes, because `flush_all`'s cost was never
+    /// the work, it was the exclusive borrow of every *other* table.
+    ///
+    /// Deliberately not cached in a flag: a `Table` can be mutated through
+    /// `catalog.table_mut()` by anyone holding `&mut Catalog`, and a stale
+    /// "clean" flag is a silently wrong answer. Asking the tables is exact.
+    pub fn has_pending_writes(&self) -> bool {
+        self.all_tables().any(|(_, t)| t.has_pending_writes())
+    }
+
+    /// Is a table mid-transaction, i.e. carrying a private overlay that
+    /// [`Table::snapshot`] would hand to a reader as if it were committed?
+    ///
+    /// [`Table::snapshot`]: crate::storage::Table::snapshot
+    pub fn any_in_txn(&self) -> bool {
+        self.all_tables().any(|(_, t)| t.in_txn())
+    }
+
+    /// Flush every table's write buffer. Called before persisting, and by the
+    /// `&mut self` write path before a statement that has to see its own
+    /// buffered rows through a scan.
+    ///
+    /// No longer on the read path: see [`Catalog::has_pending_writes`].
     pub fn flush_all(&mut self) -> Result<()> {
         for (_, d) in self.databases.iter_mut() {
             for (_, t) in d.tables.iter_mut() {

@@ -6,7 +6,7 @@
 //! was a 1:1 structural mapping from [`LogicalPlan`] to operators, with no
 //! place to put a decision even if one had been obvious.
 //!
-//! Two decisions live here today.
+//! Three decisions live here today.
 //!
 //! ## 1. Index selection
 //!
@@ -49,6 +49,60 @@
 //! [`PhysicalPlan::Sort`] and shows up in `EXPLAIN` as `TopK` rather than
 //! `Sort`.
 //!
+//! ## 3. Parallelism
+//!
+//! How many workers a query gets is the third decision, and it used to be
+//! taken *inside* `exchange::try_build` at operator-construction time. That
+//! made it invisible: `EXPLAIN PIPELINE` for a 400k-row `GROUP BY` was
+//! byte-identical to the serial plan, so neither a user nor a benchmark could
+//! tell whether a query had gone parallel, and a regression that silently
+//! turned the exchange off would not have shown up anywhere. It is now
+//! [`PhysicalPlan::Exchange`], produced here by calling the pure
+//! [`exchange::degree`], and `exchange::build` obeys the node rather than
+//! re-deciding. The width is in the plan text, which is the whole point.
+//!
+//! The node is emitted only where the builder can honour it. `Window` and the
+//! branches of a `UNION` are built by the *serial* builder --
+//! `union::build_union` re-lowers each branch through `operators::build`, and
+//! `exchange::build` hands `Window` straight to `build_physical` -- so an
+//! `Exchange` under either would be a plan node that prints and never runs,
+//! which is the exact defect this change exists to remove. `lower` therefore
+//! carries a "the builder above me can honour this" flag; see [`lower_at`].
+//!
+//! Moving the decision must not move any query, and it does not: the same
+//! shapes go parallel at the same width, because [`exchange::shard_stats`] runs
+//! the same checks against the same snapshot that `try_build` used to. Both
+//! variants were built into **one** binary behind a temporary switch and
+//! interleaved in a single loop with the sides alternating which ran first,
+//! best-of-31 and paired-median per side, 2M rows, 14 cores:
+//!
+//! ```text
+//!                         legacy    node   best  median
+//!   count                  3.22    3.28   0.98x  1.00x
+//!   sum                    3.98    4.07   0.98x  0.98x
+//!   sum + filter           7.45    7.49   0.99x  1.03x
+//!   group by country      17.18   16.65   1.03x  1.05x
+//!   uniq (HLL)             7.85    7.17   1.09x  1.04x
+//!   top-k by sort         10.05   10.49   0.96x  1.00x
+//!   full sort             54.44   56.42   0.96x  0.98x
+//!   group by high-card   353.7   366.6   0.96x  1.00x
+//!   point lookup           0.009   0.009  1.00x  1.00x
+//!   small count            0.035   0.036  0.97x  1.00x
+//!   small group by         0.134   0.133  1.00x  1.00x
+//!   small top-k            0.121   0.122  0.99x  1.00x
+//! ```
+//!
+//! The last four are the ones that carry information. Everything above them
+//! disagrees between the two statistics -- `count` best-of says 0.98x and the
+//! paired median says 1.00x, `uniq` says 1.09x and 1.04x -- which is what noise
+//! looks like on a machine that swings 30%. The bottom four are queries whose
+//! whole cost *is* planning, so a snapshot added per plan node would show up
+//! there and nowhere else, and they are 1.00x to three digits. That is the
+//! measurement that matters: `lower` takes one extra `RwLock::read` + `Arc`
+//! clone (~40 ns) per blocking node, against a 35 us query, and the builder
+//! now does strictly *less* work than it did -- `try_build` used to re-run the
+//! shape match at every one of the plan's nodes, including the leaves.
+//!
 //! ## What this is deliberately *not*
 //!
 //! Not a cost model. There are no statistics beyond "how many live rows does
@@ -73,6 +127,7 @@ use crate::common::{lane_to_f64, lane_to_i64, Error, Result};
 use crate::sql::ast::{BinaryOp, JoinOp};
 use crate::types::{DataType, PhysicalType, Schema, Value};
 
+use crate::exec::exchange;
 use crate::exec::operators::window::WindowNode;
 
 use super::logical::{BoundAgg, BoundExpr, LogicalPlan, ScanNode, SortKey};
@@ -210,24 +265,44 @@ pub enum PhysicalPlan<'a> {
     Empty {
         schema: &'a Schema,
     },
+    /// `workers` copies of `input`, each over a disjoint contiguous slice of
+    /// the one scan underneath it, with their partials merged in worker order.
+    ///
+    /// `workers` is always >= 2: [`exchange::degree`] answers 1 for "stay
+    /// serial", and a one-wide fleet is a serial plan with a rendezvous bolted
+    /// on. Emitting the node at all is therefore the statement that the query
+    /// *will* run parallel, which is what makes `EXPLAIN PIPELINE` worth
+    /// reading.
+    Exchange {
+        input: Box<PhysicalPlan<'a>>,
+        workers: usize,
+    },
 }
 
 /// Lower a logical plan, choosing an access path for every scan.
 pub fn lower<'a>(plan: &'a LogicalPlan, catalog: &Catalog) -> Result<PhysicalPlan<'a>> {
-    lower_at(plan, catalog, 0)
+    lower_at(plan, catalog, 0, true)
 }
 
+/// `par`: may a parallel node be emitted here?
+///
+/// False under a `Window` and inside a `UNION` branch, because both are built
+/// by the serial builder and an `Exchange` there would print without running.
+/// It is a parameter rather than a post-pass because lowering is bottom-up: by
+/// the time the `Window` node exists its child has already been wrapped, and
+/// unwrapping it again would need a by-value rewrite of every variant.
 fn lower_at<'a>(
     plan: &'a LogicalPlan,
     catalog: &Catalog,
     depth: usize,
+    par: bool,
 ) -> Result<PhysicalPlan<'a>> {
     if depth > MAX_PLAN_DEPTH {
         return Err(too_deep());
     }
     let d = depth + 1;
     let down = |p: &'a LogicalPlan| -> Result<Box<PhysicalPlan<'a>>> {
-        Ok(Box::new(lower_at(p, catalog, d)?))
+        Ok(Box::new(lower_at(p, catalog, d, par)?))
     };
     Ok(match plan {
         LogicalPlan::Scan(s) => match index_path(s, catalog) {
@@ -240,17 +315,21 @@ fn lower_at<'a>(
         LogicalPlan::Project { input, exprs, schema } => {
             PhysicalPlan::Project { input: down(input)?, exprs, schema }
         }
-        LogicalPlan::Aggregate { input, group, aggs, schema } => {
-            PhysicalPlan::Aggregate { input: down(input)?, group, aggs, schema }
-        }
+        LogicalPlan::Aggregate { input, group, aggs, schema } => fan_out(
+            PhysicalPlan::Aggregate { input: down(input)?, group, aggs, schema },
+            catalog,
+            par,
+        ),
         LogicalPlan::Window { input, node } => {
-            PhysicalPlan::Window { input: down(input)?, node }
+            PhysicalPlan::Window { input: Box::new(lower_at(input, catalog, d, false)?), node }
         }
-        LogicalPlan::Sort { input, keys } => {
-            PhysicalPlan::Sort { input: down(input)?, keys, fetch: None }
-        }
+        LogicalPlan::Sort { input, keys } => fan_out(
+            PhysicalPlan::Sort { input: down(input)?, keys, fetch: None },
+            catalog,
+            par,
+        ),
         LogicalPlan::Limit { input, limit, offset } => {
-            let mut inner = lower_at(input, catalog, d)?;
+            let mut inner = lower_at(input, catalog, d, par)?;
             if let Some(l) = limit {
                 fuse_top_k(&mut inner, l.saturating_add(*offset));
             }
@@ -271,7 +350,7 @@ fn lower_at<'a>(
         LogicalPlan::Union { inputs, all, schema } => PhysicalPlan::Union {
             branches: inputs
                 .iter()
-                .map(|p| lower_at(p, catalog, d))
+                .map(|p| lower_at(p, catalog, d, false))
                 .collect::<Result<_>>()?,
             logical: inputs,
             all: *all,
@@ -315,7 +394,16 @@ fn fuse_top_k(plan: &mut PhysicalPlan<'_>, k: usize) {
         {
             *fetch = Some(k);
         }
-        PhysicalPlan::Project { input, .. } => fuse_top_k(input, k),
+        // `Exchange` is transparent for the same reason `Project` is: it emits
+        // exactly the rows the sort under it produced. Missing this arm would
+        // silently un-fuse every top-K big enough to go parallel -- which is
+        // every top-K worth fusing -- because `fan_out` wraps the sort before
+        // the limit above it is lowered. Top-K is the shape the exchange wins
+        // on outright (5.5x, see the exchange's own table); a full sort under
+        // the same limit is 1.1x.
+        PhysicalPlan::Project { input, .. } | PhysicalPlan::Exchange { input, .. } => {
+            fuse_top_k(input, k)
+        }
         _ => {}
     }
 }
@@ -470,6 +558,37 @@ fn exact_lane(v: &Value, ty: &DataType) -> Option<u64> {
     (back == *v).then_some(lane)
 }
 
+// -------------------------------------------------------- 3. parallelism
+//
+// The two halves of the decision live on opposite sides of the layer on
+// purpose. *Can this shape be sharded at all* is a property of the operator
+// that would run it, so `exchange::shard_stats` answers it and returns the
+// table statistics as its evidence. *How wide should it be* is a cost
+// question, so `degree` is called from here -- the one place a real cost model
+// would eventually replace it, and the only place that can put the answer in
+// the plan text.
+
+/// Wrap a blocking node in an [`Exchange`](PhysicalPlan::Exchange), or leave it
+/// alone.
+///
+/// Not fallible: an unresolvable table, an out-of-range projection and a shape
+/// no worker can replicate are all "stay serial", and the serial builder is
+/// what owns the error message for the first two. Reporting them twice, in two
+/// wordings, is how a planner grows a second source of truth.
+fn fan_out<'a>(plan: PhysicalPlan<'a>, catalog: &Catalog, par: bool) -> PhysicalPlan<'a> {
+    if !par {
+        return plan;
+    }
+    let Some((rows, granules)) = exchange::shard_stats(&plan, catalog) else { return plan };
+    match exchange::degree(rows, granules) {
+        // 1 is `degree`'s refusal, and every caller has always treated it as
+        // one. Emitting `Exchange { workers: 1 }` would put a rendezvous and N
+        // pipeline builds in front of a query that measured *slower* with them.
+        0 | 1 => plan,
+        workers => PhysicalPlan::Exchange { input: Box::new(plan), workers },
+    }
+}
+
 // ------------------------------------------------------------------ EXPLAIN
 
 impl PhysicalPlan<'_> {
@@ -481,6 +600,7 @@ impl PhysicalPlan<'_> {
             | PhysicalPlan::Sort { input, .. }
             | PhysicalPlan::Limit { input, .. }
             | PhysicalPlan::LimitBy { input, .. }
+            | PhysicalPlan::Exchange { input, .. }
             | PhysicalPlan::Distinct { input } => input.schema(),
             PhysicalPlan::Window { node, .. } => &node.schema,
             PhysicalPlan::Project { schema, .. }
@@ -505,6 +625,7 @@ impl PhysicalPlan<'_> {
             | PhysicalPlan::Limit { input, .. }
             | PhysicalPlan::LimitBy { input, .. }
             | PhysicalPlan::Window { input, .. }
+            | PhysicalPlan::Exchange { input, .. }
             | PhysicalPlan::Distinct { input } => vec![input],
             PhysicalPlan::Join { left, right, .. } => vec![left, right],
             PhysicalPlan::Union { branches, .. } => branches.iter().collect(),
@@ -514,9 +635,13 @@ impl PhysicalPlan<'_> {
     /// The access path and its parameters, one line, no children.
     ///
     /// `EXPLAIN` is the only way anyone outside this file can tell whether the
-    /// index fired, so the label states the decision and the numbers behind it
-    /// rather than merely naming the operator.
-    fn label(&self) -> String {
+    /// index fired or the exchange did, so the label states the decision and
+    /// the numbers behind it rather than merely naming the operator.
+    ///
+    /// `pub(crate)` for `exchange::explain_analyze`, which prints these same
+    /// lines with measurements appended. One renderer, so the annotated tree
+    /// and the plain one can never disagree about what the plan says.
+    pub(crate) fn label(&self) -> String {
         match self {
             PhysicalPlan::Scan(s) => {
                 let mut out = format!("Scan {} [{}]", s.table, col_names(&s.schema));
@@ -599,6 +724,9 @@ impl PhysicalPlan<'_> {
             }
             PhysicalPlan::Values { rows, .. } => format!("Values {} rows", rows.len()),
             PhysicalPlan::Empty { .. } => "Empty".into(),
+            // The degree is the number a benchmark and a bug report both need,
+            // so it is in the line rather than implied by the node's presence.
+            PhysicalPlan::Exchange { workers, .. } => format!("Exchange {workers} workers"),
         }
     }
 
@@ -871,6 +999,48 @@ mod tests {
         for want in ["Limit 5", "Aggregate", "Scan default.t"] {
             assert!(e.contains(want), "missing {want} in:\n{e}");
         }
+    }
+
+    #[test]
+    fn the_exchange_is_a_plan_node_with_its_width_on_it() {
+        // Was invisible: `EXPLAIN PIPELINE` for a query that fanned out to 14
+        // workers was byte-identical to one that stayed serial.
+        let mut s = session("UInt64", 100_000);
+        let e = phys(&mut s, "SELECT id, count(*) FROM t GROUP BY id");
+        let line = e.lines().find(|l| l.contains("Exchange")).unwrap_or_else(|| panic!("{e}"));
+        let n: usize = line.split_whitespace().nth(1).unwrap().parse().unwrap();
+        assert!(n >= 2, "{line}");
+        assert!(line.contains("workers"), "{line}");
+        // ... and it wraps the blocking node rather than replacing it.
+        assert!(e.contains("Aggregate"), "{e}");
+    }
+
+    #[test]
+    fn a_node_the_serial_builder_owns_never_gets_an_exchange() {
+        // `union::build_union` re-lowers each branch through `operators::build`
+        // and `exchange::build` hands `Window` to `build_physical`, so neither
+        // can honour a fleet. Printing one there would be the same lie in the
+        // other direction: a plan that promises parallelism and runs serially.
+        let mut s = session("UInt64", 100_000);
+        let u = phys(&mut s, "SELECT count(*) FROM t UNION ALL SELECT count(*) FROM t");
+        assert!(!u.contains("Exchange"), "a UNION branch is built serially:\n{u}");
+        let w = phys(&mut s, "SELECT id, row_number() OVER (ORDER BY v) FROM t");
+        assert!(!w.contains("Exchange"), "a window's sort is built serially:\n{w}");
+        // The same aggregate outside a UNION still fans out, so the flag is
+        // doing the narrow thing and not simply switching parallelism off.
+        assert!(phys(&mut s, "SELECT count(*) FROM t").contains("Exchange"));
+    }
+
+    #[test]
+    fn top_k_still_fuses_through_the_exchange() {
+        // `fan_out` wraps the sort before the `Limit` above it is lowered, so
+        // `fuse_top_k` has to see through the new node. Missing that arm turns
+        // every parallel top-K into a full parallel sort -- right answer,
+        // several times slower, and invisible without this assertion.
+        let mut s = session("UInt64", 100_000);
+        let e = phys(&mut s, "SELECT v FROM t ORDER BY id DESC LIMIT 10");
+        assert!(e.contains("Exchange"), "{e}");
+        assert!(e.contains("TopK 10"), "the limit must reach the sort under the exchange:\n{e}");
     }
 
     #[test]

@@ -64,11 +64,24 @@
 //!
 //! One [`QueryContext`] serves every worker, which is what makes the budget a
 //! *query* budget: the [`MemTracker`](operators::MemTracker) is one atomic, so N
-//! hash tables charge one ceiling. The corollary is that an N-way `GROUP BY`
+//! hash tables charge one ceiling. It arrives as a *parameter* -- this module
+//! used to keep a `OnceLock<QueryContext>`, i.e. one budget, one deadline and
+//! one cancel flag for the whole process, which is why none of the three was
+//! reachable from `Session` and why a leaked reservation was permanent. The corollary is that an N-way `GROUP BY`
 //! genuinely holds N partial tables at once and can be refused where the
 //! serial plan fit -- that is the accounting being right, not a regression, and
 //! it is why [`degree`] leaves small queries alone. Cancellation and the
 //! deadline reach every worker through the same context, once per block.
+//!
+//! ## Measuring it
+//!
+//! [`explain_analyze`] lives here rather than in the planner because [`build`]
+//! does: it is the same builder with a [`Probe`] wrapped around every operator
+//! it constructs, so the tree `EXPLAIN ANALYZE` prints and the pipeline it
+//! times are one object. The exchange is measured as a *single* node -- the
+//! subtree below it is rebuilt once per worker inside [`Shape::pipeline`] and
+//! does not exist as a pipeline on this thread -- so the nodes underneath
+//! report nothing rather than a fourteenth of something.
 //!
 //! ## Nesting
 //!
@@ -185,11 +198,13 @@ const MIN_GRANULES_PER_WORKER: usize = 4;
 
 /// How many workers this table's live row count justifies.
 ///
-/// Pure: plan shape and table statistics in, a width out. It is a *planner*
-/// decision that happens to be called from the builder -- when
-/// [`PhysicalPlan`] grows an `Exchange` node this is the function that
-/// belongs behind it, unchanged. 1 means "stay serial", and every caller
-/// treats that as a refusal rather than a one-wide fleet.
+/// Pure: table statistics in, a width out. It is a *planner* decision, and it
+/// is now called from the planner: [`physical::lower`] wraps the node in
+/// `PhysicalPlan::Exchange { workers }` with whatever this answers, and the
+/// builder below obeys rather than re-deciding. 1 means "stay serial", and
+/// every caller treats that as a refusal rather than a one-wide fleet.
+///
+/// [`physical::lower`]: crate::planner::physical::lower
 pub fn degree(rows: usize, granules: usize) -> usize {
     if rows < MIN_PARALLEL_ROWS {
         return 1;
@@ -198,6 +213,40 @@ pub fn degree(rows: usize, granules: usize) -> usize {
         .threads()
         .min(granules / MIN_GRANULES_PER_WORKER)
         .max(1)
+}
+
+/// The statistics [`degree`] needs for this node, or `None` if no fleet could
+/// run it whatever the table looks like.
+///
+/// The planner's half of the decision needs an answer to "is this shape
+/// shardable at all", and that question belongs to the operator that would do
+/// the sharding -- so it is answered here, and the *width* is chosen by the
+/// caller. Every `None` is a fall-through to the serial plan, never an error:
+/// a table this cannot resolve and a projection it cannot validate are both
+/// mistakes the serial builder already owns the message for.
+///
+/// Ordered cheapest-first. `analyze` is a pattern match over the plan and
+/// costs nothing; the snapshot is one uncontended `RwLock::read` plus an `Arc`
+/// clone (~40 ns), and it is only reached once the shape has already matched,
+/// so the point-lookup path -- `Project` over `IndexLookup`, no blocking node
+/// at all -- never gets here.
+pub fn shard_stats(plan: &PhysicalPlan<'_>, catalog: &Catalog) -> Option<(usize, usize)> {
+    let shape = analyze(plan)?;
+    let table = catalog.table_by_path(&shape.node.table).ok()?;
+    // `Scan::new` owns the message for an out-of-range projection, and a
+    // parallel path that produced a different one would be a second source of
+    // truth for the same mistake.
+    let ncols = table.schema().len();
+    if shape.node.projection.iter().any(|&c| c >= ncols) {
+        return None;
+    }
+    let snap = table.snapshot();
+    // `AUTO_COMPACT_PARTS` caps this at 16 iterations, and it is the same walk
+    // the builder makes a moment later under the same `&Catalog` borrow, which
+    // excludes every mutation -- so the width the plan prints is the width the
+    // fleet is built with.
+    let granules = (0..snap.len()).map(|i| snap.part(i).granule_count()).sum();
+    Some((snap.live_rows(), granules))
 }
 
 // --------------------------------------------------------------- plan shape
@@ -592,39 +641,30 @@ impl Operator for Exchange<'_> {
 
 // ---------------------------------------------------------------- the entry
 
-/// Replace `plan` with a parallel pipeline, or `None` to build it serially.
+/// Build the fleet the planner asked for, or `None` if the shape it matched
+/// against no longer matches.
 ///
-/// Every refusal here is a fall-through, never an error: a shape this cannot
-/// run, a table it cannot resolve and a projection it cannot validate all
-/// return `None` so the serial builder produces the same answer -- or the same
-/// error message -- it always did.
-pub fn try_build<'a>(
+/// The `None` arm is unreachable in practice -- [`shard_stats`] made exactly
+/// these checks under the same `&Catalog` borrow, which excludes every
+/// mutation -- and it is a fall-through rather than an assertion because
+/// "serial" is always a correct answer and a panic never is.
+fn fleet<'a>(
     plan: &PhysicalPlan<'a>,
     catalog: &'a Catalog,
     ctx: &'a QueryContext,
-) -> Result<Option<Box<dyn Operator + 'a>>> {
-    let Some(shape) = analyze(plan) else { return Ok(None) };
-    let Ok(table) = catalog.table_by_path(&shape.node.table) else { return Ok(None) };
-    // `Scan::new` owns the message for an out-of-range projection, and a
-    // parallel path that produced a different one would be a second source of
-    // truth for the same mistake.
-    let ncols = table.schema().len();
-    if shape.node.projection.iter().any(|&c| c >= ncols) {
-        return Ok(None);
+    workers: usize,
+) -> Option<Box<dyn Operator + 'a>> {
+    let shape = analyze(plan)?;
+    let table = catalog.table_by_path(&shape.node.table).ok()?;
+    if shape.node.projection.iter().any(|&c| c >= table.schema().len()) {
+        return None;
     }
-
     let snap = table.snapshot();
-    let granules: usize = (0..snap.len()).map(|i| snap.part(i).granule_count()).sum();
-    let workers = degree(snap.live_rows(), granules);
-    if workers <= 1 {
-        return Ok(None);
-    }
-
     let work: Vec<(u32, u32)> = (0..snap.len())
         .flat_map(|pi| (0..snap.part(pi).granule_count()).map(move |g| (pi as u32, g as u32)))
         .collect();
     let schema = shape.schema();
-    Ok(Some(Box::new(Exchange {
+    Some(Box::new(Exchange {
         shape,
         ctx,
         schema,
@@ -634,57 +674,94 @@ pub fn try_build<'a>(
         out: Vec::new(),
         ready: false,
         stats: ScanStats::default(),
-    })))
+    }))
 }
 
-/// [`operators::build_physical`], with the exchange consulted at every node.
+/// [`operators::build_physical`], honouring the planner's `Exchange` nodes.
 ///
 /// Only the operators that can legitimately sit *above* a parallel subtree are
 /// recursed through here; everything else is handed to the serial builder
 /// whole, which is what stops this from being a second copy of `build_physical`
 /// that goes stale. A plan node added elsewhere keeps working and simply stays
-/// serial.
-///
-/// `Sort` is in the list because `SELECT k, count(*) ... GROUP BY k ORDER BY k`
-/// wants the *aggregate* parallelized with the sort serial above it, and the
-/// per-node decision is what gets that right without a special case.
+/// serial -- and `lower` knows not to put an `Exchange` under one, so the plan
+/// text never promises a fleet this function would drop on the floor.
 pub fn build<'a>(
     plan: PhysicalPlan<'a>,
     catalog: &'a Catalog,
     ctx: &'a QueryContext,
 ) -> Result<Box<dyn Operator + 'a>> {
-    if let Some(op) = try_build(&plan, catalog, ctx)? {
-        return Ok(op);
-    }
+    build_traced(plan, catalog, ctx, None)
+}
+
+/// [`build`], optionally wrapping every node it constructs in a [`Probe`].
+///
+/// One builder, not two: an `EXPLAIN ANALYZE` that measured a differently
+/// built pipeline would be measuring something the user never runs, which is
+/// the same class of lie as a plan that does not mention the exchange.
+fn build_traced<'a>(
+    plan: PhysicalPlan<'a>,
+    catalog: &'a Catalog,
+    ctx: &'a QueryContext,
+    trace: Option<&Trace<'a>>,
+) -> Result<Box<dyn Operator + 'a>> {
+    // Claimed before the children's, so the cells are in the same pre-order
+    // `PhysicalPlan::explain` walks and the renderer needs no second walk.
+    let cell = trace.map(|t| t.claim());
+    let inner = build_node(plan, catalog, ctx, trace)?;
+    Ok(match cell {
+        Some(c) => Box::new(Probe { inner, cell: c }),
+        None => inner,
+    })
+}
+
+fn build_node<'a>(
+    plan: PhysicalPlan<'a>,
+    catalog: &'a Catalog,
+    ctx: &'a QueryContext,
+    trace: Option<&Trace<'a>>,
+) -> Result<Box<dyn Operator + 'a>> {
+    let down = |p: Box<PhysicalPlan<'a>>| build_traced(*p, catalog, ctx, trace);
     Ok(match plan {
+        PhysicalPlan::Exchange { input, workers } => {
+            // The subtree below is not a pipeline in this process -- it is
+            // rebuilt once per worker inside `Shape::pipeline` -- so there is
+            // nothing here to probe and the cells for it stay untouched. The
+            // renderer reads that as "measured by the exchange above", which
+            // is exactly what happened.
+            if let Some(t) = trace {
+                t.skip(node_count(&input));
+            }
+            match fleet(&input, catalog, ctx, workers) {
+                Some(op) => op,
+                None => build_traced(*input, catalog, ctx, None)?,
+            }
+        }
         PhysicalPlan::Filter { input, predicate } => {
-            Box::new(filter::Filter::new(build(*input, catalog, ctx)?, predicate))
+            Box::new(filter::Filter::new(down(input)?, predicate))
         }
         PhysicalPlan::Project { input, exprs, schema } => {
-            Box::new(project::Project::new(build(*input, catalog, ctx)?, exprs, schema))
+            Box::new(project::Project::new(down(input)?, exprs, schema))
         }
-        PhysicalPlan::Aggregate { input, group, aggs, schema } => Box::new(
-            aggregate::Aggregate::new(build(*input, catalog, ctx)?, group, aggs, schema, ctx)?,
-        ),
+        PhysicalPlan::Aggregate { input, group, aggs, schema } => {
+            Box::new(aggregate::Aggregate::new(down(input)?, group, aggs, schema, ctx)?)
+        }
         PhysicalPlan::Sort { input, keys, fetch } => {
-            let inner = build(*input, catalog, ctx)?;
+            let inner = down(input)?;
             Box::new(match fetch {
                 Some(k) => sort::Sort::top_k(inner, keys, k, ctx),
                 None => sort::Sort::new(inner, keys, ctx),
             })
         }
         PhysicalPlan::Limit { input, limit, offset } => {
-            Box::new(limit::Limit::new(build(*input, catalog, ctx)?, limit, offset, ctx))
+            Box::new(limit::Limit::new(down(input)?, limit, offset, ctx))
         }
         PhysicalPlan::LimitBy { input, limit, keys } => {
-            Box::new(limit::LimitBy::new(build(*input, catalog, ctx)?, limit, keys, ctx))
+            Box::new(limit::LimitBy::new(down(input)?, limit, keys, ctx))
         }
-        PhysicalPlan::Distinct { input } => {
-            Box::new(distinct::Distinct::new(build(*input, catalog, ctx)?))
-        }
+        PhysicalPlan::Distinct { input } => Box::new(distinct::Distinct::new(down(input)?)),
         PhysicalPlan::Join { left, right, op, on, residual, schema } => Box::new(join::Join::new(
-            build(*left, catalog, ctx)?,
-            build(*right, catalog, ctx)?,
+            down(left)?,
+            down(right)?,
             op,
             on,
             residual,
@@ -692,8 +769,15 @@ pub fn build<'a>(
             ctx,
         )),
         // Leaves and the shapes with private constructors: nothing above them
-        // to parallelize, so the serial builder is the whole answer.
-        other => operators::build_physical(other, catalog, ctx)?,
+        // to parallelize, so the serial builder is the whole answer. It builds
+        // the subtree in one call, so one probe covers all of it and the rest
+        // of the subtree's cells are skipped.
+        other => {
+            if let Some(t) = trace {
+                t.skip(node_count(&other) - 1);
+            }
+            operators::build_physical(other, catalog, ctx)?
+        }
     })
 }
 
@@ -722,19 +806,224 @@ pub fn execute_ctx<'a>(
     Ok((out, stats))
 }
 
-/// [`operators::execute_with_stats`] with the exchange in the plan.
+/// [`execute_ctx`] for a caller that has no context of its own yet.
 ///
-/// Exists so the one call site that matters -- `Session::run_query`, which
-/// today calls `operators::execute_with_stats(&plan, &self.catalog)` -- can
-/// switch by changing the path and nothing else. `operators::ambient_context`
-/// is private to that module, so this keeps its own; both are a
-/// default-budget, no-deadline context and a query cannot tell them apart.
+/// This used to hold `static C: OnceLock<QueryContext>` -- one context for the
+/// whole *process*. Three things were wrong with that, and only the first is
+/// obvious:
+///
+///   * a per-query memory limit, deadline or cancel flag was unreachable from
+///     `Session` by construction, because there was no per-query object to put
+///     one on;
+///   * the [`MemTracker`](operators::MemTracker) is a single atomic, so every
+///     session in the process shared one 8 GiB ceiling and two concurrent
+///     `GROUP BY`s could refuse each other;
+///   * a reservation leaked by a query that failed between `grow_to` and the
+///     guard's drop stayed charged against every later query, forever.
+///
+/// A fresh context is two `Arc` allocations against a query that has already
+/// bound, optimized and lowered a plan -- unmeasurable, and it is per *query*,
+/// which is the unit the budget is supposed to describe. Callers that do have
+/// a context (a session with settings) should call [`execute_ctx`] and pass it.
 pub fn execute_with_stats<'a>(
     plan: &'a crate::planner::logical::LogicalPlan,
     catalog: &'a Catalog,
 ) -> Result<(Vec<Block>, ScanStats)> {
-    static C: std::sync::OnceLock<QueryContext> = std::sync::OnceLock::new();
-    execute_ctx(plan, catalog, C.get_or_init(QueryContext::new))
+    execute_ctx(plan, catalog, &QueryContext::new())
+}
+
+// ------------------------------------------------------------ EXPLAIN ANALYZE
+
+/// What one plan node actually did. Filled in by [`Probe`] as the query runs.
+///
+/// 56 bytes, one per plan node, allocated once per `EXPLAIN ANALYZE` and never
+/// in the query path -- `Cell` rather than an atomic because the probes are all
+/// on the coordinating thread; the parallel region is behind a single
+/// `Exchange` node and is measured as one.
+#[derive(Default, Clone, Copy)]
+struct NodeStats {
+    /// Rows this operator handed upward.
+    rows: u64,
+    /// `next()` calls that returned a block.
+    blocks: u64,
+    /// Wall time inside `next()`, *inclusive* of the children below it -- the
+    /// same convention Postgres's `actual time` uses. Self time is the
+    /// subtraction, and printing both doubles the width of every line for a
+    /// number the reader can do in their head.
+    nanos: u64,
+    /// The access-path counters as of this node. Only printed at the bottom of
+    /// the probed tree, because `Operator::stats` forwards from the input and
+    /// every node above a scan would otherwise repeat the same three numbers.
+    scan: ScanStats,
+    /// Set when the node got a probe at all, which is a *structural* fact
+    /// decided at build time -- not "did it record anything". An operator a
+    /// `LIMIT 0` tore down before its first `next()` is probed and reports
+    /// zeroes, and that is a different statement from a node the exchange
+    /// swallowed, which reports nothing.
+    probed: bool,
+}
+
+/// Pre-order cursor over the cells, handed to [`build_traced`].
+struct Trace<'a> {
+    cells: &'a [std::cell::Cell<NodeStats>],
+    at: std::cell::Cell<usize>,
+}
+
+impl<'a> Trace<'a> {
+    fn claim(&self) -> &'a std::cell::Cell<NodeStats> {
+        let i = self.at.get();
+        self.at.set(i + 1);
+        let c = &self.cells[i];
+        c.set(NodeStats { probed: true, ..c.get() });
+        c
+    }
+
+    fn skip(&self, n: usize) {
+        self.at.set(self.at.get() + n);
+    }
+}
+
+/// A pass-through that times and counts what flows through it.
+///
+/// One `Instant::now` pair and one 56-byte copy per *block*, never per row, and
+/// only on the `EXPLAIN ANALYZE` path -- an ordinary query builds no probes at
+/// all, so the cost to the engine proper is one `Option` check per node at
+/// build time.
+struct Probe<'a> {
+    inner: Box<dyn Operator + 'a>,
+    cell: &'a std::cell::Cell<NodeStats>,
+}
+
+impl Operator for Probe<'_> {
+    fn schema(&self) -> &Schema {
+        self.inner.schema()
+    }
+
+    fn stats(&self) -> ScanStats {
+        self.inner.stats()
+    }
+
+    fn next(&mut self) -> Result<Option<Block>> {
+        let t0 = std::time::Instant::now();
+        let r = self.inner.next();
+        let dt = t0.elapsed();
+        let mut s = self.cell.get();
+        s.nanos += dt.as_nanos() as u64;
+        if let Ok(Some(b)) = &r {
+            s.rows += b.rows() as u64;
+            s.blocks += 1;
+        }
+        // Refreshed every call rather than at end of stream: a `LIMIT` tears
+        // the pipeline down without ever seeing `None`, and a scan that read
+        // 40 granules must not report 0 because the query stopped early.
+        s.scan = self.inner.stats();
+        self.cell.set(s);
+        r
+    }
+}
+
+/// Nodes in a subtree, counted the way [`PhysicalPlan::explain`] walks it.
+fn node_count(p: &PhysicalPlan<'_>) -> usize {
+    1 + p.children().iter().map(|c| node_count(c)).sum::<usize>()
+}
+
+/// Run `plan` and render its physical tree annotated with what each operator
+/// actually did.
+///
+/// The point of the exercise is that this is the *same* plan, built by the
+/// *same* builder and run by the *same* loop as `Session::query` -- so the
+/// exchange it shows is the exchange that ran, and the rows on each line are
+/// rows that existed. `EXPLAIN PIPELINE` says what will happen; this says what
+/// did.
+pub fn explain_analyze(
+    plan: &crate::planner::logical::LogicalPlan,
+    catalog: &Catalog,
+    ctx: &QueryContext,
+) -> Result<String> {
+    let shown = crate::planner::physical::lower(plan, catalog)?;
+    let cells = vec![std::cell::Cell::new(NodeStats::default()); node_count(&shown)];
+    let trace = Trace { cells: &cells, at: std::cell::Cell::new(0) };
+
+    let wall = std::time::Instant::now();
+    {
+        // A second lowering, because the builder consumes the plan and the
+        // renderer still needs one. `lower` is a pure function of the logical
+        // plan and the catalog, and the `&Catalog` borrow held across both
+        // calls excludes every mutation -- so `shown` is the tree that ran, not
+        // a tree like it. It costs one `Box` per plan node and nothing per row.
+        let mut op = build_traced(
+            crate::planner::physical::lower(plan, catalog)?,
+            catalog,
+            ctx,
+            Some(&trace),
+        )?;
+        while let Some(b) = {
+            ctx.check()?;
+            op.next()?
+        } {
+            // Dropped, not collected: `EXPLAIN ANALYZE` was asked for the
+            // measurement, not the rows, and holding a 10M-row result only to
+            // throw it away would give the diagnostic a worse peak RSS than
+            // the query it diagnoses.
+            std::hint::black_box(b.rows());
+        }
+    }
+    let wall = wall.elapsed();
+    // The builder claims cells in the pre-order `annotate` prints in, and the
+    // two agree only because `build_node`'s recursion set matches
+    // `PhysicalPlan::children`. Drift there does not crash -- it silently moves
+    // every measurement one line, which is a diagnostic that lies. Cheap
+    // enough to check on every debug run of every test that touches ANALYZE.
+    debug_assert_eq!(
+        trace.at.get(),
+        cells.len(),
+        "the trace walk and `PhysicalPlan::children` disagree about this plan"
+    );
+
+    let mut out = String::with_capacity(96 * cells.len() + 32);
+    annotate(&shown, &cells, &mut 0, 0, &mut out);
+    out.push_str(&format!("Total {:.3} ms", wall.as_nanos() as f64 / 1e6));
+    Ok(out)
+}
+
+fn annotate(
+    p: &PhysicalPlan<'_>,
+    cells: &[std::cell::Cell<NodeStats>],
+    at: &mut usize,
+    depth: usize,
+    out: &mut String,
+) {
+    let i = *at;
+    *at += 1;
+    for _ in 0..depth {
+        out.push_str("  ");
+    }
+    out.push_str(&p.label());
+    let s = cells[i].get();
+    if s.probed {
+        out.push_str(&format!(
+            "  rows={} blocks={} time={:.3}ms",
+            s.rows,
+            s.blocks,
+            s.nanos as f64 / 1e6
+        ));
+        // Printed at the bottom of the *probed* tree only. `Operator::stats`
+        // forwards from the input, so every node above a scan holds the same
+        // three numbers and repeating them per level says nothing. `i + 1` is
+        // the first child in pre-order; an unprobed one means the subtree below
+        // was built in one piece (a leaf, a `Window`, a `UNION`) or run inside
+        // the workers (an `Exchange`), and either way this line owns it.
+        if !cells.get(i + 1).map(|c| c.get().probed).unwrap_or(false) {
+            out.push_str(&format!(
+                " granules={}r/{}p decoded={}",
+                s.scan.granules_read, s.scan.granules_pruned, s.scan.rows_read
+            ));
+        }
+    }
+    out.push('\n');
+    for c in p.children() {
+        annotate(c, cells, at, depth + 1, out);
+    }
 }
 
 #[cfg(test)]
@@ -813,18 +1102,17 @@ mod tests {
 
     /// Did the exchange actually fire for this query? A test that only checks
     /// agreement passes trivially when the parallel path silently declined.
+    ///
+    /// Asks the *plan*, which is now where the decision is recorded -- so this
+    /// is the same question `EXPLAIN PIPELINE` answers, not a second opinion
+    /// that could drift from it.
     fn goes_parallel(s: &mut Session, sql: &str) -> bool {
         let plan = plan_of(s, sql);
-        let lowered = physical::lower(&plan, &s.catalog).unwrap();
-        fired(&lowered, &s.catalog)
+        fired(&physical::lower(&plan, &s.catalog).unwrap())
     }
 
-    fn fired(p: &PhysicalPlan<'_>, cat: &Catalog) -> bool {
-        let ctx = QueryContext::new();
-        if try_build(p, cat, &ctx).unwrap().is_some() {
-            return true;
-        }
-        p.children().iter().any(|c| fired(c, cat))
+    fn fired(p: &PhysicalPlan<'_>) -> bool {
+        matches!(p, PhysicalPlan::Exchange { .. }) || p.children().iter().any(|c| fired(c))
     }
 
     // ------------------------------------------------- parallel == serial
@@ -1128,6 +1416,179 @@ mod tests {
             let (serial, parallel) = both(&mut s, q);
             assert_eq!(parallel, serial, "{q}");
         }
+    }
+
+    // ------------------------------------------------- the plan node and ANALYZE
+
+    #[test]
+    fn the_builder_obeys_the_planner_rather_than_re_deciding() {
+        // The whole point of moving the decision: strip the node and the query
+        // runs serially, because nothing downstream second-guesses the plan.
+        // (Before, `build` re-derived parallelism at every node and the plan
+        // had no say at all.)
+        let mut s = session();
+        let plan = plan_of(&mut s, "SELECT k, count(*) FROM t GROUP BY k");
+        let lowered = physical::lower(&plan, &s.catalog).unwrap();
+        assert!(fired(&lowered), "the planner should have fanned this out");
+
+        let ctx = QueryContext::new();
+        let stripped = match lowered {
+            PhysicalPlan::Project { input, exprs, schema } => match *input {
+                PhysicalPlan::Exchange { input, .. } => {
+                    PhysicalPlan::Project { input, exprs, schema }
+                }
+                other => PhysicalPlan::Project { input: Box::new(other), exprs, schema },
+            },
+            other => other,
+        };
+        assert!(!fired(&stripped));
+        let mut op = build(stripped, &s.catalog, &ctx).unwrap();
+        let mut rows = 0;
+        while let Some(b) = op.next().unwrap() {
+            rows += b.rows();
+        }
+        assert_eq!(rows, 8, "the serial build must still answer");
+    }
+
+    #[test]
+    fn each_query_gets_its_own_context() {
+        // `execute_with_stats` used to hold a `OnceLock<QueryContext>`: one
+        // memory tracker, one cancel flag and one deadline for the whole
+        // *process*. A query that failed under a tight budget could leave its
+        // reservation charged against every later query, forever.
+        let mut s = session();
+        let plan = plan_of(&mut s, "SELECT big, count(*) FROM t GROUP BY big");
+        for _ in 0..3 {
+            let (blocks, _) = execute_with_stats(&plan, &s.catalog).unwrap();
+            assert!(!blocks.is_empty());
+        }
+        // Cancelling one context must not reach the next query, which is only
+        // true because there is a new one each time.
+        let ctx = QueryContext::new();
+        ctx.stop();
+        assert!(execute_ctx(&plan, &s.catalog, &ctx).is_err());
+        assert!(!execute_with_stats(&plan, &s.catalog).unwrap().0.is_empty());
+    }
+
+    #[test]
+    fn explain_analyze_measures_the_pipeline_it_prints() {
+        let mut s = session();
+        let ctx = QueryContext::new();
+        let plan = plan_of(&mut s, "SELECT k, count(*) FROM t GROUP BY k");
+        let text = explain_analyze(&plan, &s.catalog, &ctx).unwrap();
+
+        // The exchange owns the measurement for everything inside it; the
+        // nodes it swallowed report nothing rather than inventing a figure.
+        let x = text.lines().find(|l| l.contains("Exchange")).unwrap_or_else(|| panic!("{text}"));
+        assert!(x.contains("rows=8"), "{x}");
+        assert!(x.contains(&format!("decoded={ROWS}")), "{x}");
+        for l in text.lines().filter(|l| l.trim_start().starts_with("Aggregate")) {
+            assert!(!l.contains("rows="), "a node inside the fleet claimed a measurement: {l}");
+        }
+        assert!(text.contains("Total "), "{text}");
+
+        // A serial plan gets a line per operator, scan included.
+        let plan = plan_of(&mut s, "SELECT k FROM t WHERE id = 5");
+        let text = explain_analyze(&plan, &s.catalog, &ctx).unwrap();
+        assert!(text.contains("IndexLookup"), "{text}");
+        assert_eq!(
+            text.lines().filter(|l| l.contains("rows=")).count(),
+            2,
+            "Project and IndexLookup, both measured:\n{text}"
+        );
+        // The index skipped the granules a scan would have walked, and that is
+        // now visible from outside for the first time.
+        assert!(text.contains("granules=1r/"), "{text}");
+    }
+
+    #[test]
+    fn analyze_does_not_change_the_answer_it_measures() {
+        // The probes are pass-throughs; a probe that swallowed or duplicated a
+        // block would be a diagnostic that lies about the query it ran.
+        let mut s = session();
+        let ctx = QueryContext::new();
+        for q in [
+            "SELECT count(*) FROM t",
+            "SELECT k, count(*) FROM t GROUP BY k",
+            "SELECT id FROM t ORDER BY id DESC LIMIT 7",
+            "SELECT DISTINCT k FROM t",
+            "SELECT id FROM t WHERE k = 3 LIMIT 4",
+        ] {
+            let plan = plan_of(&mut s, q);
+            let want: usize =
+                execute_ctx(&plan, &s.catalog, &ctx).unwrap().0.iter().map(|b| b.rows()).sum();
+            let text = explain_analyze(&plan, &s.catalog, &ctx).unwrap();
+            let top = text.lines().find(|l| l.contains("rows=")).unwrap();
+            let got: usize = top[top.find("rows=").unwrap() + 5..]
+                .split_whitespace()
+                .next()
+                .unwrap()
+                .parse()
+                .unwrap();
+            assert_eq!(got, want, "`{q}`:\n{text}");
+        }
+    }
+
+    #[test]
+    fn analyze_annotates_the_same_tree_explain_prints() {
+        // The measurements are attached by *position* in a pre-order walk, so
+        // a plan shape whose `children()` and whose build recursion disagree
+        // would move every number one line down and never say so. Shapes with
+        // two children, with private constructors and with subtrees the serial
+        // builder swallows whole -- exactly where the two walks could part.
+        let mut s = session();
+        s.execute("CREATE TABLE d (cid UInt64, name String) ENGINE = MergeTree ORDER BY cid")
+            .unwrap();
+        s.execute("INSERT INTO d VALUES (0,'zero'),(1,'one'),(2,'two')").unwrap();
+        let ctx = QueryContext::new();
+        for q in [
+            "SELECT count(*) FROM t JOIN d ON t.k = d.cid",
+            "SELECT k FROM t UNION ALL SELECT cid FROM d",
+            "SELECT DISTINCT k FROM t UNION SELECT cid FROM d",
+            "SELECT k, count(*) FROM t GROUP BY k ORDER BY k DESC LIMIT 3",
+            "SELECT id FROM t WHERE id IN (1, 2, 3)",
+            "SELECT 1",
+        ] {
+            let plan = plan_of(&mut s, q);
+            let tree = physical::lower(&plan, &s.catalog).unwrap().explain();
+            let a = explain_analyze(&plan, &s.catalog, &ctx).unwrap();
+            // Same tree, one extra line for the wall-clock total: the labels
+            // have to line up character for character up to the annotation.
+            // (`explain_analyze` also `debug_assert`s that the build walk
+            // consumed exactly one cell per node, which is the other half.)
+            let plain: Vec<&str> = tree.lines().collect();
+            let noted: Vec<&str> = a.lines().collect();
+            assert_eq!(noted.len(), plain.len() + 1, "`{q}`:\n{tree}\n--\n{a}");
+            for (p, n) in plain.iter().zip(&noted) {
+                assert!(n.starts_with(p), "`{q}`: `{n}` is not `{p}` annotated");
+            }
+            assert!(noted[0].contains("rows="), "the root is always measured: {}", noted[0]);
+        }
+
+        // `Window` belongs in the list above and cannot be run from here yet:
+        // every window query underflows in `window::Window::emit`
+        // (`self.part_start -= cut`) in a debug build, which is another change
+        // in flight and not this one's to patch. The half that this change can
+        // still break is checked without executing anything -- the renderer
+        // walks `children()`, so a `Window` whose node count and whose printed
+        // line count disagree would silently shift every measurement. Put the
+        // query back in the loop when the underflow is fixed.
+        let plan = plan_of(&mut s, "SELECT cid, row_number() OVER (ORDER BY name) FROM d");
+        let lowered = physical::lower(&plan, &s.catalog).unwrap();
+        assert!(lowered.explain().contains("Window") || lowered.explain().contains("OVER"));
+        assert_eq!(node_count(&lowered), lowered.explain().lines().count());
+    }
+
+    #[test]
+    fn analyze_honours_the_context_it_is_given() {
+        // Same governance as the query itself: a diagnostic that ignored the
+        // cancel flag would be the one statement a user could not stop.
+        let mut s = session();
+        let plan = plan_of(&mut s, "SELECT big, count(*) FROM t GROUP BY big");
+        let ctx = QueryContext::new();
+        ctx.stop();
+        let e = explain_analyze(&plan, &s.catalog, &ctx).unwrap_err();
+        assert!(e.to_string().contains("cancelled"), "{e}");
     }
 
     #[test]

@@ -43,6 +43,39 @@
 //! split between memory and disk, so nothing is merged back and no accumulator
 //! ever has to be serialized.
 //!
+//! **In parallel too.** The exchange's workers each build one of these tables,
+//! and until recently none of them could spill: a `GROUP BY` that a serial plan
+//! answered under a tight budget was an error as soon as it went wide, and the
+//! only thing bounding fourteen partial tables was the whole query failing. A
+//! worker now freezes and spills exactly as the serial operator does. What it
+//! cannot do is fold what it spilled -- its partitions' keys are disjoint from
+//! its *own* resident groups but not from the other workers' -- so the
+//! partitions ride along on the table it hands back and [`emit_spilled`] folds
+//! them against the merged result. Three things follow, and all three are
+//! measured where they are decided: the partition mask has to be the same for
+//! every worker ([`Partitions::arm`]), a worker has to stop short of the whole
+//! budget so the merge above it can happen at all ([`worker_ceiling`]), and the
+//! fold has to treat the merged table as read-only ([`emit_spilled`]).
+//!
+//! What it costs, 2M rows and 1.1M groups on 14 threads, budget swept downwards,
+//! best-of-3 per budget, two runs:
+//!
+//! ```text
+//!   budget      8G    4G     2G     1G   512M   256M   128M    96M    64M
+//!   GROUP BY   451   448   1055   1094   1047   1023   1037   1017   fails  ms
+//!                       ^ last budget that holds the partials
+//! ```
+//!
+//! **A 2.3x cliff**, flat below it, and the same shape the serial spill has --
+//! what is paid is one write and one read of the rows that missed a frozen
+//! table. Two boundaries are worth knowing. The cliff arrives at an *eighth* of
+//! the budget rather than at the budget, because the partials, the merged table
+//! and one folded bucket are resident together (see [`worker_ceiling`]). And
+//! below ~96 MiB the query fails however hard it spills: fourteen workers each
+//! admit one more block of groups before the per-block check fires, so the
+//! fleet's floor is 14 x 8192 groups whatever the budget says. Both of those
+//! are the exchange's accounting, not this file's.
+//!
 //! ## Three separable steps
 //!
 //! [`accumulate`] folds an input into a [`Groups`], [`Groups::absorb`] combines
@@ -56,7 +89,7 @@
 
 use std::mem::size_of;
 
-use crate::common::{FastSet, Result, BLOCK_SIZE};
+use crate::common::{BitSet, FastSet, Result, BLOCK_SIZE};
 use crate::exec::expr;
 use crate::exec::functions::Accumulator;
 use crate::planner::logical::{BoundAgg, BoundExpr};
@@ -107,7 +140,7 @@ impl<'a> Aggregate<'a> {
     fn materialize(&mut self) -> Result<()> {
         self.ready = true;
         let mut guard = MemGuard::new(self.ctx, guard_name(self.group.len()));
-        let mut parts = Partitions::new(0);
+        let mut parts = Partitions::new(0, 0);
         // A bare aggregate is one group that exists before the first row and
         // has no key to partition by, so it is the one shape that still fails
         // rather than spills -- and the one shape that cannot grow by
@@ -155,11 +188,28 @@ pub(crate) fn guard_name(ngroup: usize) -> &'static str {
     }
 }
 
-/// Fold every row `input` produces into a group table.
+/// Fold every row `input` produces into a group table, spilling if it must.
 ///
 /// Split out of the operator so a parallel exchange can call it once per
 /// worker; `guard` is the caller's because the budget has to be charged
 /// against the whole query, not per worker.
+///
+/// A worker spills exactly as the serial operator does -- before this it could
+/// not, so a `GROUP BY` that was answerable serially under a tight budget was
+/// an error in parallel, and the fourteen partial tables were bounded only by
+/// the whole query failing. What a worker cannot do is *fold* what it spilled:
+/// its partitions' keys are disjoint from its own resident groups but not from
+/// the other workers', so folding them here would emit a group twice. They ride
+/// along on the table instead and [`emit`] folds them once the partials have
+/// been merged; see [`emit_spilled`].
+///
+/// A worker that fits pays nothing for any of it: the freeze is the `grow_to`
+/// this loop already made, the ceiling is one relaxed load per block, and
+/// `Partitions` allocates nothing until it is armed. Measured interleaved
+/// against `accumulate_into(.., None)` -- the shape a worker had before this --
+/// alternating sides in one loop, best-of-7 over 2M rows, three runs:
+/// 8 groups 1.011x / 0.955x / 1.024x, 1k groups 0.967x / 0.930x / 0.995x, 100k
+/// groups 0.983x / 0.982x / 1.052x. Null, with no consistent sign.
 pub(crate) fn accumulate(
     input: &mut Box<dyn Operator + '_>,
     group: &[BoundExpr],
@@ -168,7 +218,54 @@ pub(crate) fn accumulate(
     ctx: &QueryContext,
     guard: &mut MemGuard,
 ) -> Result<Groups> {
-    accumulate_into(input, group, aggs, protos, ctx, guard, None)
+    let mut parts = Partitions::new(0, worker_ceiling(ctx));
+    // Same exception the serial path makes: a bare aggregate's one group exists
+    // before the first row and has no key to partition by.
+    let spill = (!group.is_empty()).then_some(&mut parts);
+    let mut groups = accumulate_into(input, group, aggs, protos, ctx, guard, spill)?;
+    let pending = parts.finish()?;
+    if !pending.is_empty() {
+        groups.over = Some(Box::new(Overflow { ctx: own_ctx(ctx), pending }));
+    }
+    Ok(groups)
+}
+
+/// The size one parallel worker's table stops at, so that the merge above it
+/// has somewhere to happen.
+///
+/// A worker that grows until the shared budget refuses leaves nothing for what
+/// comes next, and what comes next needs two more tables' worth: the exchange
+/// folds the partials with [`Groups::absorb`] while still holding them (its own
+/// accounting is conservative by one partial, so its peak is `partials +
+/// merged`), and then [`emit_spilled`] rebuilds one spilled bucket at a time
+/// against the merged table. So the fleet has to stop at an **eighth** of the
+/// budget: a half would leave the merge exactly nothing, and the check is made
+/// once per block, so by the time it fires every worker has taken one more
+/// block -- and a block that doubles a `Vec`'s capacity doubles the table.
+/// Measured on 14 threads over 1.1M groups, the fleet overshoots by ~2.4x, and
+/// an eighth is where the query stops failing: same table, budget swept
+/// downward, a third answered only from 384 MiB, an eighth from 96 MiB.
+///
+/// The share is per *worker* and derived from the pool's width rather than
+/// from the shared `used` counter, and that is the whole point: a ceiling read
+/// off `used` fires at a moment that depends on how the fourteen threads
+/// happened to interleave, so which keys a worker still had resident -- and
+/// therefore what `any(x)` and `groupArray(x)` answered -- changed from run to
+/// run. This fires at a fixed table size on a fixed slice of the input, so a
+/// spilled parallel `GROUP BY` answers the same thing every time. It is also
+/// cheaper: the comparison is against `groups.bytes()`, which the `grow_to` on
+/// the same line already computed, so the block loop gains no load at all.
+///
+/// `threads` and not the exchange's actual degree, because a worker is not told
+/// how many others there are. Over-dividing is the safe direction -- a narrower
+/// fleet spills a little earlier than it had to.
+///
+/// None of this makes the parallel aggregate stricter than it was: above a half
+/// the merge already failed, so the change is that the query spills at three
+/// eighths instead of failing at a half.
+fn worker_ceiling(ctx: &QueryContext) -> usize {
+    let share = (ctx.mem.limit().max(0) as usize) / 8;
+    (share / crate::common::pool::global().threads().max(1)).max(1)
 }
 
 /// [`accumulate`], optionally allowed to spill.
@@ -259,6 +356,9 @@ pub(crate) fn accumulate_into(
     let mut mpart: Vec<u32> = Vec::new();
     let mut frozen = false;
     let forced = if spill.is_some() { super::sort::forced_spill_rows() } else { 0 };
+    // Hoisted out of the block loop: `0` for every serial aggregate and for
+    // every worker whose budget is unbounded.
+    let soft = spill.as_deref().map_or(0, |p| p.soft);
 
     loop {
         // Once per block. The group table is the thing that grows without
@@ -455,12 +555,13 @@ pub(crate) fn accumulate_into(
         // The freeze, and the only line the in-memory path did not already
         // run: a `grow_to` that succeeds costs exactly what it did before,
         // plus one compare against a knob that is zero outside the tests.
-        let over = guard.grow_to(groups.bytes());
-        if over.is_err() || (forced != 0 && groups.len >= forced) {
+        let bytes = groups.bytes();
+        let over = guard.grow_to(bytes);
+        if over.is_err() || (forced != 0 && groups.len >= forced) || (soft != 0 && bytes > soft) {
             match spill.as_deref_mut() {
                 None => over?,
                 Some(p) => {
-                    p.arm(ctx, &b);
+                    p.arm(ctx, super::sort::share_of(guard));
                     frozen = true;
                 }
             }
@@ -493,6 +594,11 @@ pub(crate) fn emit(
     aggs: &[BoundAgg],
     schema: &Schema,
 ) -> Result<Vec<Block>> {
+    // One predictable branch on a null pointer, once per query, for every
+    // aggregate that fit in memory.
+    if groups.over.is_some() {
+        return emit_spilled(groups, group, aggs, schema);
+    }
     let (nagg, ngroup) = (aggs.len(), group.len());
     let width = ngroup + nagg;
     if width == 0 {
@@ -502,23 +608,16 @@ pub(crate) fn emit(
             vec![Block::rows_only(groups.len)]
         });
     }
-    let ty_at = |i: usize| -> DataType {
-        if i < schema.len() {
-            schema.ty(i).clone()
-        } else if i < ngroup {
-            group[i].ty()
-        } else {
-            aggs[i - ngroup].ty.clone()
-        }
-    };
+    let tys = out_types(group, aggs, schema);
 
     let total = groups.len;
     let mut out = Vec::with_capacity(total.div_ceil(BLOCK_SIZE));
     let mut start = 0;
     while start < total {
         let end = (start + BLOCK_SIZE).min(total);
-        let mut builders: Vec<ColumnBuilder> = (0..width)
-            .map(|i| ColumnBuilder::with_capacity(ty_at(i), end - start))
+        let mut builders: Vec<ColumnBuilder> = tys
+            .iter()
+            .map(|t| ColumnBuilder::with_capacity(t.clone(), end - start))
             .collect();
         // Split once per block rather than adding `ngroup + ai` per cell, and
         // zip over slices rather than index them: both arenas are proved in
@@ -532,11 +631,39 @@ pub(crate) fn emit(
                 b.push_value(&a.finish()?)?;
             }
         }
-        // An aggregate over an empty group finishes as NULL (`min` of
-        // nothing), so a column can acquire a mask even where the plan's
-        // schema said otherwise. A live mask must never sit on a
-        // non-Nullable type, so widen when it happens.
-        let cols: Vec<Column> = builders
+        out.push(finish_block(builders)?);
+        start = end;
+    }
+    Ok(out)
+}
+
+/// The output column types, in `[group..., aggs...]` order.
+///
+/// The plan's schema wins where it has an opinion; the expressions' own types
+/// are the fallback for a caller that built a narrower schema.
+fn out_types(group: &[BoundExpr], aggs: &[BoundAgg], schema: &Schema) -> Vec<DataType> {
+    let ngroup = group.len();
+    (0..ngroup + aggs.len())
+        .map(|i| {
+            if i < schema.len() {
+                schema.ty(i).clone()
+            } else if i < ngroup {
+                group[i].ty()
+            } else {
+                aggs[i - ngroup].ty.clone()
+            }
+        })
+        .collect()
+}
+
+/// Close one output block.
+///
+/// An aggregate over an empty group finishes as NULL (`min` of nothing), so a
+/// column can acquire a mask even where the plan's schema said otherwise. A
+/// live mask must never sit on a non-Nullable type, so widen when it happens.
+fn finish_block(builders: Vec<ColumnBuilder>) -> Result<Block> {
+    Block::new(
+        builders
             .into_iter()
             .map(|b| {
                 let mut c = b.finish();
@@ -545,11 +672,236 @@ pub(crate) fn emit(
                 }
                 c
             })
-            .collect();
-        out.push(Block::new(cols)?);
-        start = end;
+            .collect(),
+    )
+}
+
+// ---------------------------------------------------- folding a parallel spill
+
+/// [`emit`] for a merged table that still owes the rows its workers spilled.
+///
+/// The serial spill can *append* its partitions to the answer, because a key it
+/// spilled is by construction a key its one table had never seen. A parallel
+/// spill cannot: the tables were frozen per worker, so a key worker 0 spilled
+/// may be a key worker 1 held resident, and appending would emit that group
+/// twice with each half of its rows.
+///
+/// So the merged table is the authority and the partitions are folded *against*
+/// it. Each bucket -- all workers' files for it at once, in worker order -- is
+/// aggregated on its own by the same [`accumulate_into`], spilling again if it
+/// still does not fit, and the resulting groups are split in two: one the
+/// merged table has never seen is emitted as it stands, one it already holds is
+/// emitted as the two combined, and the base group is struck off the tail.
+///
+/// The merged table is only ever **read**. That is what keeps this inside
+/// `emit`'s `&Groups` -- widening it would ripple into the exchange -- and,
+/// more to the point, what bounds the fold: the table never grows, so the
+/// resident set is the table plus one bucket at a time rather than the table
+/// plus every group that ever spilled. The combining is done in a scratch
+/// accumulator cloned from the *prototype* and merged with both sides, rather
+/// than by cloning the base's, because `Accumulator::boxed_clone` promises a
+/// fresh accumulator of the same kind and not a copy of its state.
+///
+/// Cost: one hash probe per spilled group, and for a group the two sides share,
+/// two `merge` calls on top. Order: the folded buckets first, then the merged
+/// table's remaining groups -- a spilled `GROUP BY` has never promised
+/// first-seen order (the serial one emits its partitions after its table for
+/// the same reason), and what it does promise, determinism, holds because the
+/// exchange's split is static.
+///
+/// One order caveat that the serial spill does not have: for a group split
+/// between a resident table and another worker's spill file, the resident rows
+/// are folded first whichever worker they came from. `any(x)` over such a group
+/// can therefore answer with a later row than a serial scan would. It is
+/// deterministic, and it only arises once a query has spilled.
+fn emit_spilled(
+    base: &Groups,
+    group: &[BoundExpr],
+    aggs: &[BoundAgg],
+    schema: &Schema,
+) -> Result<Vec<Block>> {
+    let ov = base.over.as_ref().expect("checked by the caller");
+    let ctx = &ov.ctx;
+    let protos = protos(aggs)?;
+    let (nagg, nkeys) = (aggs.len(), base.nkeys);
+    let mut sink = Rows::new(out_types(group, aggs, schema));
+    // Base groups a bucket has already emitted, merged with its own rows. One
+    // bit per group of a table that has just proved it is as large as the
+    // budget allows, so a bitset and not a `Vec<bool>`.
+    let mut done = BitSet::with_capacity_bits(base.len);
+    let mut vals: Vec<Value> = Vec::with_capacity(nagg);
+    let mut more: Vec<Partition> = Vec::new();
+
+    for bucket in buckets(&ov.pending) {
+        fold_bucket(&bucket, base, group, aggs, &protos, ctx, &mut sink, &mut done, &mut more)?;
     }
-    Ok(out)
+    // A bucket that still did not fit re-partitioned on fresh hash bits, and
+    // each level removes at least the groups that did fit, so this terminates.
+    // Depth-first (`pop`), so peak disk tracks what is still owed.
+    while let Some(p) = more.pop() {
+        fold_bucket(&[p], base, group, aggs, &protos, ctx, &mut sink, &mut done, &mut more)?;
+    }
+
+    for g in 0..base.len {
+        if done.get(g) {
+            continue;
+        }
+        vals.clear();
+        for a in &base.accs[g * nagg..][..nagg] {
+            vals.push(a.finish()?);
+        }
+        sink.push(&base.keys[g * nkeys..][..nkeys], &vals)?;
+    }
+    sink.finish()
+}
+
+/// Group the workers' partition files by bucket, keeping worker order inside
+/// each and bucket order between them.
+///
+/// A `Vec<Vec<_>>` indexed by bucket would be tidier and is not worth it: the
+/// buckets are at most 64 and the files at most 64 per bucket, so this is a
+/// short stable partition of a list that is already nearly sorted.
+fn buckets(pending: &[Partition]) -> Vec<Vec<Partition>> {
+    let mut out: Vec<Vec<Partition>> = Vec::new();
+    for p in pending {
+        match out.iter_mut().find(|b| b[0].idx == p.idx && b[0].level == p.level) {
+            Some(b) => b.push(p.clone()),
+            None => out.push(vec![p.clone()]),
+        }
+    }
+    out
+}
+
+/// Fold one bucket's files into `sink`, against the read-only `base`.
+#[allow(clippy::too_many_arguments)]
+fn fold_bucket(
+    bucket: &[Partition],
+    base: &Groups,
+    group: &[BoundExpr],
+    aggs: &[BoundAgg],
+    protos: &[Box<dyn Accumulator>],
+    ctx: &QueryContext,
+    sink: &mut Rows,
+    done: &mut BitSet,
+    more: &mut Vec<Partition>,
+) -> Result<()> {
+    ctx.check()?;
+    let (nagg, nkeys) = (aggs.len(), base.nkeys);
+    let paths: Vec<std::path::PathBuf> = bucket.iter().map(|p| p.path.clone()).collect();
+    let mut guard = MemGuard::new(ctx, guard_name(group.len()));
+    let mut input: Box<dyn Operator> =
+        Box::new(SpillScan::open(bucket[0].schema.clone(), &paths));
+    let mut parts = Partitions::new(bucket[0].level, 0);
+    let mut t =
+        accumulate_into(&mut input, group, aggs, protos, ctx, &mut guard, Some(&mut parts))?;
+    // Unlinked as soon as it has been folded rather than with the whole
+    // directory, so peak disk tracks what is still owed and not what the query
+    // has ever spilled.
+    drop(input);
+    for p in &paths {
+        let _ = std::fs::remove_file(p);
+    }
+    more.extend(parts.finish()?);
+
+    let mut vals: Vec<Value> = Vec::with_capacity(nagg);
+    let mut fresh: Vec<GroupKey> = Vec::new();
+    for g in 0..t.len {
+        let key = &t.keys[g * nkeys..][..nkeys];
+        vals.clear();
+        match base.find(key, t.hashes[g]) {
+            // Nobody's resident table held this key, so `t` is the whole group.
+            None => {
+                for a in &t.accs[g * nagg..][..nagg] {
+                    vals.push(a.finish()?);
+                }
+            }
+            Some(b) => {
+                done.set(b);
+                for ai in 0..nagg {
+                    let mut acc = protos[ai].boxed_clone();
+                    acc.merge(&*base.accs[b * nagg + ai])?;
+                    // DISTINCT is the one shape that cannot go through `merge`
+                    // twice: both sides deduplicated within themselves, so the
+                    // overlap would be counted once each. Replay only the
+                    // tuples the base has not already seen -- the same argument
+                    // `absorb` makes, read-only on the base's side of it.
+                    match (
+                        base.seen.get(b * nagg + ai).and_then(|s| s.as_ref()),
+                        t.seen.get_mut(g * nagg + ai).and_then(|s| s.as_mut()),
+                    ) {
+                        (Some(mine), Some(theirs)) => {
+                            fresh.clear();
+                            fresh.extend(theirs.drain().filter(|x| !mine.contains(x)));
+                            if !fresh.is_empty() {
+                                replay(&mut *acc, &aggs[ai], &fresh)?;
+                            }
+                        }
+                        _ => acc.merge(&*t.accs[g * nagg + ai])?,
+                    }
+                    vals.push(acc.finish()?);
+                }
+            }
+        }
+        sink.push(key, &vals)?;
+    }
+    Ok(())
+}
+
+/// Row-at-a-time output for the spilled path.
+///
+/// [`emit`]'s own loop walks one table's arenas and is worth its
+/// `split_at_mut`; this one takes rows from three places -- a bucket's own
+/// groups, the groups it shares with the merged table, and the merged table's
+/// tail -- so it takes them one at a time. Same block cutting and the same
+/// nullable widening; the builders are rebuilt per block and nothing else
+/// allocates.
+struct Rows {
+    tys: Vec<DataType>,
+    b: Vec<ColumnBuilder>,
+    n: usize,
+    out: Vec<Block>,
+}
+
+impl Rows {
+    fn new(tys: Vec<DataType>) -> Rows {
+        let b = tys
+            .iter()
+            .map(|t| ColumnBuilder::with_capacity(t.clone(), BLOCK_SIZE))
+            .collect();
+        Rows { tys, b, n: 0, out: Vec::new() }
+    }
+
+    fn push(&mut self, keys: &[Value], vals: &[Value]) -> Result<()> {
+        for (b, v) in self.b.iter_mut().zip(keys.iter().chain(vals)) {
+            b.push_value(v)?;
+        }
+        self.n += 1;
+        if self.n == BLOCK_SIZE {
+            self.cut()?;
+        }
+        Ok(())
+    }
+
+    fn cut(&mut self) -> Result<()> {
+        if self.n == 0 {
+            return Ok(());
+        }
+        let next: Vec<ColumnBuilder> = self
+            .tys
+            .iter()
+            .map(|t| ColumnBuilder::with_capacity(t.clone(), BLOCK_SIZE))
+            .collect();
+        let b = std::mem::replace(&mut self.b, next);
+        self.out.push(finish_block(b)?);
+        self.n = 0;
+        Ok(())
+    }
+
+    fn finish(mut self) -> Result<Vec<Block>> {
+        self.cut()?;
+        // Handed out back to front by every caller of `emit`; see `next`.
+        Ok(self.out)
+    }
 }
 
 /// The group table: keys in first-seen order, their accumulators, and the
@@ -595,6 +947,30 @@ pub(crate) struct Groups {
     /// `None`.
     seen: Vec<Option<FastSet<GroupKey>>>,
     has_distinct: bool,
+    /// Rows this table refused after it filled the budget, hash-partitioned and
+    /// waiting to be folded. `None` -- one null pointer per *table*, i.e. once
+    /// per worker -- for every aggregate that fit, and for the serial operator,
+    /// which folds its own partitions as it streams them. See [`Overflow`].
+    over: Option<Box<Overflow>>,
+}
+
+/// A parallel worker's spilled rows, and enough of the query context to fold
+/// them later.
+///
+/// The context is owned rather than borrowed because a `Groups` crosses out of
+/// `pool::map` on its own and is folded much later by [`emit`], which has no
+/// `&QueryContext` -- and widening `emit`'s signature would ripple into the
+/// exchange. All three fields are an `Arc` or a `Copy`, so this is three words
+/// per worker, paid only by a query that actually spilled.
+struct Overflow {
+    ctx: QueryContext,
+    pending: Vec<Partition>,
+}
+
+/// An owned copy of a query's stop conditions: same cancel flag, same deadline,
+/// same meter, no borrow.
+fn own_ctx(ctx: &QueryContext) -> QueryContext {
+    QueryContext { cancel: ctx.cancel.clone(), deadline: ctx.deadline, mem: ctx.mem.clone() }
 }
 
 /// Feed argument tuples straight into an accumulator, bypassing a block.
@@ -696,9 +1072,21 @@ impl Groups {
     /// adopted ones are handed the next `gid`s in the order pass one saw them.
     pub(crate) fn absorb(&mut self, other: Groups, aggs: &[BoundAgg]) -> Result<()> {
         let nagg = aggs.len();
-        let Groups { nkeys, keys, hashes, len, accs, mut seen, has_distinct, .. } = other;
+        let Groups { nkeys, keys, hashes, len, accs, mut seen, has_distinct, over, .. } = other;
         debug_assert_eq!(nkeys, self.nkeys);
         debug_assert_eq!(has_distinct, self.has_distinct);
+        // Concatenation, not a merge: every worker cut on the same mask at the
+        // same level (see `Partitions::arm`), so partition `p` of one worker
+        // and partition `p` of another describe the same key range and no other
+        // partition holds a key either of them holds. Worker order is
+        // preserved, which is what keeps `any`/`groupArray` reading the earlier
+        // slice first when a partition is folded.
+        if let Some(o) = over {
+            match &mut self.over {
+                Some(mine) => mine.pending.extend(o.pending),
+                None => self.over = Some(o),
+            }
+        }
         // Reused across every group: the argument tuples new to this side.
         let mut fresh: Vec<GroupKey> = Vec::new();
         // Groups of `other` this side has never seen, ascending.
@@ -964,20 +1352,35 @@ pub(crate) struct Partitions {
     counts: Vec<u32>,
     cursor: Vec<u32>,
     sel: Vec<u32>,
+    /// Table size past which this table freezes even though its own `grow_to`
+    /// still succeeds; `0` disables it. Only a parallel worker sets it -- see
+    /// [`worker_ceiling`].
+    soft: usize,
 }
 
 /// One spilled partition, and its share of the directory's lifetime.
+///
+/// `Clone` is a path, a schema and two refcount bumps, and it exists so
+/// [`buckets`] can regroup a borrowed `pending` list without taking the table
+/// apart -- [`emit`] only ever has `&Groups`.
+#[derive(Clone)]
 pub(crate) struct Partition {
     path: std::path::PathBuf,
     schema: Schema,
     level: u32,
+    /// Which bucket of the level's hash split this is. Carried because a
+    /// parallel aggregate produces one file per (worker, bucket) and the files
+    /// of one bucket have to be folded *together*: two workers can both have
+    /// spilled the same key, and folding their files separately would create
+    /// the group twice and emit it twice.
+    idx: u32,
     /// Shared, because a directory holds every partition cut at one level and
     /// must outlive the last of them -- however early the query stops reading.
     _dir: std::sync::Arc<spill::SpillDir>,
 }
 
 impl Partitions {
-    pub(crate) fn new(level: u32) -> Partitions {
+    pub(crate) fn new(level: u32, soft: usize) -> Partitions {
         Partitions {
             dir: None,
             writers: Vec::new(),
@@ -988,23 +1391,38 @@ impl Partitions {
             counts: Vec::new(),
             cursor: Vec::new(),
             sel: Vec::new(),
+            soft,
         }
     }
 
     /// Fix the partition count and buffer size. Called once, at the freeze.
-    fn arm(&mut self, ctx: &QueryContext, b: &Block) {
+    ///
+    /// The two numbers come from different places on purpose. The partition
+    /// **count** is a function of the query's whole budget and of nothing else,
+    /// because every worker of a parallel aggregate has to cut on the same
+    /// mask: if worker A's bucket 3 and worker B's bucket 3 described different
+    /// key ranges, a key could land in two folds and be emitted twice. The
+    /// per-partition write **buffer** comes from this operator's own share of
+    /// that budget, which legitimately differs per worker and is only a sizing
+    /// question -- sixty-four 64 KiB buffers is 4 MiB of write-behind, free
+    /// against 8 GiB and absurd against 256 KiB, and fourteen workers each
+    /// claiming the query's whole quarter is how a bounded query becomes a 3.5x
+    /// overshoot.
+    ///
+    /// The count used to be clamped by the rows of the block that triggered the
+    /// freeze, which made it depend on *where in its input* a worker happened
+    /// to run out. It bought nothing even serially: a writer is created on
+    /// first use, so a partition that never sees a row never opens a file.
+    fn arm(&mut self, ctx: &QueryContext, share: usize) {
         if self.mask != 0 {
             return;
         }
         // A quarter of the budget for write-behind; the group table -- which
         // has just proved it wants everything -- keeps the rest.
         let cap = ((ctx.mem.limit().max(0) as usize) / 4).max(8 << 10);
-        let want = (cap / (32 << 10)).clamp(2, 64).next_power_of_two().min(64);
-        // Never more partitions than the block that triggered the freeze has
-        // rows: a hundred one-row files cost more in syscalls than they save.
-        let n = want.min(b.rows().max(2).next_power_of_two());
+        let n = (cap / (32 << 10)).clamp(2, 64).next_power_of_two().min(64);
         self.mask = n as u64 - 1;
-        self.flush_at = (cap / n).clamp(4 << 10, 64 << 10);
+        self.flush_at = ((share / 4).max(8 << 10) / n).clamp(4 << 10, 64 << 10);
         self.writers = (0..n).map(|_| None).collect();
     }
 
@@ -1076,16 +1494,19 @@ impl Partitions {
         let Partitions { dir, writers, level, schema, .. } = self;
         let (Some(dir), Some(schema)) = (dir, schema) else { return Ok(Vec::new()) };
         let mut paths = Vec::new();
-        for w in writers.into_iter().flatten() {
-            paths.push(w.finish()?);
+        for (i, w) in writers.into_iter().enumerate() {
+            if let Some(w) = w {
+                paths.push((i as u32, w.finish()?));
+            }
         }
         let dir = std::sync::Arc::new(dir);
         Ok(paths
             .into_iter()
-            .map(|path| Partition {
+            .map(|(idx, path)| Partition {
                 path,
                 schema: schema.clone(),
                 level: level + 1,
+                idx,
                 _dir: dir.clone(),
             })
             .collect())
@@ -1094,17 +1515,23 @@ impl Partitions {
 
 /// Reads one spilled partition back as an operator, so the recursive pass is
 /// the *same* `accumulate_into` and not a second implementation of it.
+///
+/// A partition can be several files -- one per worker of a parallel aggregate
+/// -- and they are read back **in worker order**, one at a time. In order,
+/// because `any`, `anyLast`, `argMin`'s tie-break and `groupArray`'s element
+/// order are all defined against feed order; one at a time, because a partition
+/// of a fourteen-way `GROUP BY` would otherwise hold fourteen read buffers open
+/// for a single sequential pass.
 struct SpillScan {
-    src: spill::RunReader,
     schema: Schema,
+    /// Reversed, so `next` pops.
+    rest: Vec<std::path::PathBuf>,
+    cur: Option<spill::RunReader>,
 }
 
 impl SpillScan {
-    fn open(p: &Partition) -> Result<SpillScan> {
-        Ok(SpillScan {
-            src: spill::RunReader::open(&p.path, p.schema.clone())?,
-            schema: p.schema.clone(),
-        })
+    fn open(schema: Schema, paths: &[std::path::PathBuf]) -> SpillScan {
+        SpillScan { schema, rest: paths.iter().rev().cloned().collect(), cur: None }
     }
 }
 
@@ -1113,7 +1540,19 @@ impl Operator for SpillScan {
         &self.schema
     }
     fn next(&mut self) -> Result<Option<Block>> {
-        self.src.next()
+        loop {
+            let r = match &mut self.cur {
+                Some(r) => r,
+                None => {
+                    let Some(p) = self.rest.pop() else { return Ok(None) };
+                    self.cur.insert(spill::RunReader::open(&p, self.schema.clone())?)
+                }
+            };
+            match r.next()? {
+                Some(b) => return Ok(Some(b)),
+                None => self.cur = None,
+            }
+        }
     }
 }
 
@@ -1128,8 +1567,9 @@ impl Aggregate<'_> {
         let Some(p) = self.pending.pop() else { return Ok(false) };
         self.ctx.check()?;
         let mut guard = MemGuard::new(self.ctx, guard_name(self.group.len()));
-        let mut input: Box<dyn Operator> = Box::new(SpillScan::open(&p)?);
-        let mut parts = Partitions::new(p.level);
+        let mut input: Box<dyn Operator> =
+            Box::new(SpillScan::open(p.schema.clone(), std::slice::from_ref(&p.path)));
+        let mut parts = Partitions::new(p.level, 0);
         let groups = accumulate_into(
             &mut input,
             self.group,

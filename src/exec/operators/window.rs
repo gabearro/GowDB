@@ -102,6 +102,107 @@
 //! look -- which is the second reason the sort is a plan node here rather than
 //! something this operator does privately.
 //!
+//! ## The unit is the partition, not the relation
+//!
+//! This operator used to drain its whole input into one block before it could
+//! answer anything, so a window over a relation larger than the budget was
+//! refused -- not slow, refused. That was the wrong unit. Rows arrive sorted by
+//! `(partition keys, ORDER BY keys)`, so **partitions arrive contiguous and in
+//! full**, and a partition that has ended can be computed and handed out while
+//! the next one is still being read.
+//!
+//! So the operator buffers, and when the budget objects it computes every
+//! *complete* partition in the buffer, emits them, and keeps only the trailing
+//! partial one. Its bound is `max(largest partition, budget)` rather than the
+//! relation, and a `PARTITION BY` over a hundred keys is a hundredth of the
+//! footprint it used to be.
+//!
+//! Nothing is written to disk, and that is the point rather than an omission:
+//! the natural spill unit is the partition, and once the operator works a
+//! partition at a time there is nothing left to write. Rows that have been
+//! computed leave immediately, and rows that have not been read yet are still
+//! in the operator below.
+//!
+//! **A single partition larger than the budget** -- `sum(x) OVER ()` over a
+//! huge table, or one key holding most of the rows -- has no smaller unit, and
+//! it is refused with the message naming the window buffer. Spilling it would
+//! not help: every sweep here needs random access to the partition's rows
+//! (`lag` reaches backwards, `last_value` forwards, `Refold` re-reads an
+//! arbitrary range), so a disk-resident partition needs a second, external
+//! implementation of every window function rather than a buffer swap. What is
+//! fixed is the case that was actually common -- a large *relation* of ordinary
+//! partitions -- and what is left refused is the case that is genuinely hard.
+//!
+//! The boundary pass moved with it: [`mark_changes`] now runs per input block
+//! instead of once over the concatenation, with the seam between two blocks
+//! compared through the previous block's last key values. Same total work, and
+//! it is what lets the operator know where the last partition starts without
+//! having ever held the whole relation.
+//!
+//! Cutting costs nothing measurable. 1M rows, `sum(v) OVER (PARTITION BY g
+//! ORDER BY id)` end to end, best-of-6, cut forced with `GRANULAR_SPILL_ROWS`:
+//! one chunk 581.5 ms, six chunks 576.3 ms, twenty-one chunks 527.0 ms. The
+//! last one is not a typo and not a claim -- it is inside the noise -- but it
+//! does say that the two `Block::slice` copies a cut pays are nothing against
+//! the work, and that smaller working sets are not obviously worse.
+//!
+//! ## Partitions are independent, so the fan-out is free
+//!
+//! One `PARTITION BY` key means one self-contained problem, and a chunk holding
+//! many of them is embarrassingly parallel: worker `k` takes a contiguous,
+//! partition-aligned range of rows and computes *every* window function over
+//! it, and the columns are concatenated in range order. There is no merge, no
+//! partial state and nothing recomputed, so the result is **bit-identical** to
+//! the serial one -- including a float `sum`, because each partition is still
+//! folded by exactly one accumulator in exactly one order. That is a stronger
+//! guarantee than the exchange can make about a parallel aggregate, and it is
+//! purely a property of the split being by partition.
+//!
+//! The split is balanced by *rows* rather than by partitions ([`split_partitions`]),
+//! because partition sizes are the one thing a `PARTITION BY` says nothing
+//! about. The argument columns are evaluated once for the whole chunk, outside
+//! the fan-out, since an accumulator is fed absolute row ids and needs no slice
+//! of its own.
+//!
+//! Measured on 14 cores, 1M rows in 40 integer partitions, `GRANULAR_THREADS`
+//! stepped through the pool sizes, best-of-6. This is the **window step
+//! alone**, timed inside [`compute`] by a temporary `eprintln` since removed,
+//! because the query around it is dominated by something else -- see below.
+//!
+//! ```text
+//!   threads                              1      2      4      8     14
+//!   sum(v) OVER (PARTITION BY g       17.7   11.1    7.6    5.6    7.5  ms
+//!                ORDER BY id)         1.0x   1.6x   2.3x   3.2x   2.4x
+//!   ... ROWS BETWEEN 100 PRECEDING   325.9  232.1  157.8  111.2   71.2  ms
+//!                AND CURRENT ROW      1.0x   1.4x   2.1x   2.9x   4.6x
+//! ```
+//!
+//! 56 M rows/s serial and 179 M rows/s at eight threads for the running total;
+//! 3.1 M rows/s serial and 14 M rows/s at fourteen for the sliding frame. The
+//! cheap window stops scaling at eight because a 17 ms step cannot amortize
+//! fourteen rendezvous; the expensive one scales to the end of the machine,
+//! which is the shape that needed the threads.
+//!
+//! **The query around it does not move**, and that is worth stating rather
+//! than hiding: `exchange::build` has no arm for `PhysicalPlan::Window`, so the
+//! `Sort` the binder puts *underneath* every window is built by the serial
+//! builder. On the 1M-row query above that sort is ~470 ms against a 17 ms
+//! window step -- 96% of the query, single-threaded, for the want of one match
+//! arm. Parallelizing this operator was still the right half to do (it is the
+//! half that scales with the frame), but until that arm exists a user will not
+//! see it.
+//!
+//! **A window with no `PARTITION BY` is one partition**, [`split_partitions`]
+//! returns one range, and the step stays serial. That is the honest answer, not
+//! a missing case: `sum(v) OVER (ORDER BY id)` is a running total, and a
+//! prefix scan can only be split by folding each chunk twice -- once to get its
+//! partial, once again seeded with the partials before it. `Accumulator` has
+//! `merge`, so it could be built; it doubles the work to divide it by the
+//! thread count, which is a win only above four or so threads and only for the
+//! two linear sweeps (`Whole` and `Forward`). It is a separate task with its
+//! own measurement, and pretending otherwise by splitting a single partition
+//! would silently break `rank` at the seams.
+//!
 //! ## What is refused rather than approximated
 //!
 //! `RANGE` with a numeric offset (`RANGE BETWEEN 3 PRECEDING ...`) and `GROUPS`
@@ -119,14 +220,14 @@
 use std::borrow::Cow;
 use std::sync::Arc;
 
-use crate::common::{Error, Result};
+use crate::common::{pool, Error, Result};
 use crate::exec::expr;
 use crate::exec::functions::{aggregate, AggFn};
 use crate::planner::logical::BoundExpr;
 use crate::sql::ast::{FrameBound, FrameUnits, WindowFrame};
 use crate::types::{Block, Column, ColumnBuilder, ColumnData, DataType, Field, Schema, Value};
 
-use super::{chunk, drain, MemGuard, Operator, QueryContext, ScanStats};
+use super::{chunk, MemGuard, Operator, QueryContext, ScanStats};
 
 // ================================================================= registry
 
@@ -421,14 +522,62 @@ const NEW_PART: u8 = 1;
 /// `flags` bit: this row begins a new peer group. Implied by [`NEW_PART`].
 const NEW_PEER: u8 = 2;
 
+/// Rows below which a window step stays single-threaded.
+///
+/// Assembling the fleet costs a rendezvous with parked workers plus one
+/// `ColumnBuilder` per function per worker, and below some size the step is
+/// over before that has happened. Measured with the window step timed on its
+/// own, 14 cores, a 100-wide sliding frame (the shape with enough work per row
+/// to be worth splitting at all), 40 partitions:
+///
+/// ```text
+///   rows     workers   step
+///    2 000      1      0.39 ms
+///    4 000      1      1.02 ms
+///    4 096      2      1.35 ms
+///    8 000      3      1.04 ms
+///  100 000     14      6.45 ms
+/// ```
+///
+/// 4096 rows is where the fan-out starts and 8000 is where it has already paid
+/// for itself. Being wrong toward "stay serial" costs a fraction of a query
+/// that was already under a millisecond; being wrong toward "go parallel" taxes
+/// every small window in an HTAP workload. The floor is a quarter of the
+/// exchange's 16 384 because a window row costs several times what a scanned
+/// row does -- there is more work per row to amortize the same fixed cost
+/// against.
+const MIN_PARALLEL_ROWS: usize = 4 << 10;
+
+/// Rows one worker should get before another is woken.
+const MIN_ROWS_PER_WORKER: usize = 2 << 10;
+
 pub struct Window<'a> {
     input: Box<dyn Operator + 'a>,
     node: &'a WindowNode,
     ctx: &'a QueryContext,
-    /// Reversed once materialization finishes, so `next` is a `pop`.
+    /// Rows read but not yet computed. `None` until the first block arrives,
+    /// so the first `extend` is a move rather than `Block::extend`'s clone.
+    buf: Option<Block>,
+    /// One byte per buffered row; see the module docs. Extended block by
+    /// block, which is why the seam below exists.
+    flags: Vec<u8>,
+    /// The partition keys then the ORDER BY keys of the buffer's last row.
+    /// Comparing the next block's first row against these is what lets the
+    /// boundary pass run per input block instead of over the concatenation.
+    seam: Vec<Value>,
+    /// First row of the trailing, possibly incomplete partition -- the only
+    /// place the buffer may be cut. Maintained as blocks arrive rather than
+    /// found by scanning back, which on a single-partition window would be a
+    /// backwards walk of the whole buffer per block.
+    part_start: usize,
+    /// Reversed, so `next` is a `pop`.
     out: Vec<Block>,
-    ready: bool,
+    /// `0..rows`, grown once and shared by every function *and* every worker:
+    /// a frame fold is `update(args, &ids[s..e])` with no allocation.
+    ids: Vec<u32>,
+    eof: bool,
     guard: MemGuard,
+    forced: usize,
 }
 
 impl<'a> Window<'a> {
@@ -441,58 +590,158 @@ impl<'a> Window<'a> {
             input,
             node,
             ctx,
+            buf: None,
+            flags: Vec::new(),
+            seam: Vec::new(),
+            part_start: 0,
             out: Vec::new(),
-            ready: false,
+            ids: Vec::new(),
+            eof: false,
             guard: MemGuard::new(ctx, "a window function's row buffer"),
+            forced: super::sort::forced_spill_rows(),
         }
     }
 
-    fn materialize(&mut self) -> Result<()> {
-        self.ready = true;
-        let mut block = drain(&mut self.input, self.ctx, &mut self.guard)?;
-        let n = block.rows();
-        if n == 0 {
-            return Ok(());
-        }
-
-        // One pass per key column, dispatched on physical type outside the row
-        // loop. Partition keys set both bits at once: a new partition is
-        // necessarily a new peer group, and folding that in here saves a
-        // second sweep over `flags`.
-        let mut flags = vec![0u8; n];
-        flags[0] = NEW_PART | NEW_PEER;
-        for c in expr::eval_all_cow(&self.node.partition, &block)? {
-            mark_changes(&c, NEW_PART | NEW_PEER, &mut flags);
-        }
-        for c in expr::eval_all_cow(&self.node.order, &block)? {
-            mark_changes(&c, NEW_PEER, &mut flags);
-        }
-
-        // Row ids, built once and shared by every function: an accumulator is
-        // fed a *slice* of this, so a frame fold allocates nothing at all.
-        let ids: Vec<u32> = (0..n as u32).collect();
-
-        let pass = Pass {
-            block: &block,
-            flags: &flags,
-            ids: &ids,
-            ordered: !self.node.order.is_empty(),
-            ctx: self.ctx,
-        };
-        let mut scratch: Vec<Value> = Vec::new();
-        let mut cols = Vec::with_capacity(self.node.funcs.len());
-        for f in &self.node.funcs {
+    /// Read input until there is something to hand out.
+    fn pump(&mut self) -> Result<()> {
+        loop {
             self.ctx.check()?;
-            cols.push(eval_window(f, &pass, &mut scratch)?);
+            let Some(b) = self.input.next()? else {
+                self.eof = true;
+                let n = self.flags.len();
+                if n > 0 {
+                    self.emit(n)?;
+                }
+                return Ok(());
+            };
+            if b.rows() == 0 {
+                continue;
+            }
+            self.absorb(b)?;
+            // One `grow_to` per block, exactly as the old `drain` made, and one
+            // `usize` compare for the test knob. The `Err` is a signal rather
+            // than an error: a relation that does not fit is a query that
+            // emits earlier, not one that is refused.
+            let n = self.flags.len();
+            let over = (self.forced != 0 && n >= self.forced)
+                || self.guard.grow_to(self.footprint()).is_err();
+            if over {
+                if self.part_start == 0 {
+                    // The buffer is one partition and there is no smaller unit
+                    // to emit -- see the module docs. Charge it for real so the
+                    // refusal names the window buffer rather than happening
+                    // later somewhere else.
+                    self.guard.grow_to(self.footprint())?;
+                } else {
+                    self.emit(self.part_start)?;
+                    return Ok(());
+                }
+            }
         }
-        block.append_columns(cols)?;
-        // Charged once, at the peak: the input rows, the appended columns, and
-        // the 5 bytes/row of flags and row ids. `drain` already charged the
-        // input, so this only ever grows the reservation.
-        self.guard.grow_to(block.bytes() + n * 5)?;
+    }
 
-        self.out = chunk(block);
+    /// Append one input block and extend the partition/peer bits over it.
+    fn absorb(&mut self, b: Block) -> Result<()> {
+        let base = self.flags.len();
+        let n = b.rows();
+        self.flags.resize(base + n, 0);
+        if self.ids.len() < base + n {
+            let from = self.ids.len() as u32;
+            self.ids.extend(from..(base + n) as u32);
+        }
+
+        // One pass per key column over *this block*, dispatched on physical
+        // type outside the row loop. Partition keys set both bits at once: a
+        // new partition is necessarily a new peer group, and folding that in
+        // here saves a second sweep over `flags`.
+        let pk = expr::eval_all_cow(&self.node.partition, &b)?;
+        let ok = expr::eval_all_cow(&self.node.order, &b)?;
+        if base == 0 {
+            self.flags[0] = NEW_PART | NEW_PEER;
+        } else {
+            // The seam `mark_changes` cannot see, because it compares adjacent
+            // rows of one column and the two rows are in different blocks.
+            let np = pk.len();
+            let mut bits = 0u8;
+            for (i, c) in pk.iter().enumerate() {
+                if c.as_ref().value(0) != self.seam[i] {
+                    bits |= NEW_PART | NEW_PEER;
+                }
+            }
+            for (i, c) in ok.iter().enumerate() {
+                if c.as_ref().value(0) != self.seam[np + i] {
+                    bits |= NEW_PEER;
+                }
+            }
+            self.flags[base] |= bits;
+        }
+        for c in &pk {
+            mark_changes(c.as_ref(), NEW_PART | NEW_PEER, &mut self.flags[base..]);
+        }
+        for c in &ok {
+            mark_changes(c.as_ref(), NEW_PEER, &mut self.flags[base..]);
+        }
+        // Walked backwards and stopped at the first hit: a block that opens no
+        // partition costs a full backwards scan of *itself*, never of the
+        // buffer, so maintaining this is linear in the input either way.
+        for i in (base..base + n).rev() {
+            if self.flags[i] & NEW_PART != 0 {
+                self.part_start = i;
+                break;
+            }
+        }
+        self.seam.clear();
+        for c in pk.iter().chain(&ok) {
+            self.seam.push(c.as_ref().value(n - 1));
+        }
+        drop((pk, ok));
+
+        match &mut self.buf {
+            None => self.buf = Some(b),
+            Some(a) => a.extend(&b)?,
+        }
+        Ok(())
+    }
+
+    /// What the operator is holding: the buffered rows, the byte of flags and
+    /// four of row id each, and any computed output not yet collected.
+    fn footprint(&self) -> usize {
+        self.buf.as_ref().map_or(0, |b| b.bytes())
+            + self.flags.len() * 5
+            + self.out.iter().map(|b| b.bytes()).sum::<usize>()
+    }
+
+    /// Compute the first `cut` rows -- always a whole number of partitions --
+    /// and keep the rest.
+    fn emit(&mut self, cut: usize) -> Result<()> {
+        let buf = self.buf.take().expect("emit with an empty buffer");
+        let n = buf.rows();
+        debug_assert!(cut <= n && cut > 0);
+        // The whole buffer is the overwhelmingly common case (every window
+        // that fits takes it), and it must not copy: the two slices below are
+        // a full copy of the rows and only a spilling window should pay them.
+        let (head, tail) = if cut == n {
+            (buf, None)
+        } else {
+            (buf.slice(0, cut), Some(buf.slice(cut, n)))
+        };
+        self.out = compute(self.node, self.ctx, head, &self.flags[..cut], &self.ids)?;
+        // Handed out back to front; see the `out` field.
         self.out.reverse();
+
+        self.flags.drain(..cut);
+        // Saturating because the end-of-stream call cuts *past* the trailing
+        // partition's start -- there is no trailing partition left to point at.
+        self.part_start = self.part_start.saturating_sub(cut);
+        self.buf = tail;
+        if self.buf.is_some() {
+            // `MemGuard` only ever grows, so a streaming operator that reused
+            // one would hold its high-water mark for ever and never feel
+            // pressure again -- it would silently buffer the whole relation
+            // after the first cut. Replacing it is the release.
+            self.guard = MemGuard::new(self.ctx, "a window function's row buffer");
+            self.guard.grow_to(self.footprint())?;
+        }
         Ok(())
     }
 }
@@ -507,11 +756,126 @@ impl Operator for Window<'_> {
     }
 
     fn next(&mut self) -> Result<Option<Block>> {
-        if !self.ready {
-            self.materialize()?;
+        loop {
+            if let Some(b) = self.out.pop() {
+                return Ok(Some(b));
+            }
+            if self.eof {
+                return Ok(None);
+            }
+            self.pump()?;
         }
-        Ok(self.out.pop())
     }
+}
+
+// --------------------------------------------------------------- fan-out
+
+/// Compute every window function over one partition-aligned block of rows.
+fn compute(
+    node: &WindowNode,
+    ctx: &QueryContext,
+    mut block: Block,
+    flags: &[u8],
+    ids: &[u32],
+) -> Result<Vec<Block>> {
+    let n = block.rows();
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+    let cols = {
+        // Evaluated once for the whole block, *outside* the fan-out: an
+        // argument column is indexed by absolute row id, so a worker needs no
+        // slice of its own and evaluating per worker would repeat the whole
+        // expression k times over the whole block.
+        let ordered = !node.order.is_empty();
+        let prep: Vec<Prepared> = node
+            .funcs
+            .iter()
+            .map(|f| Prepared::of(f, &block, ordered))
+            .collect::<Result<_>>()?;
+        let pass = Pass { flags, ids, ctx };
+
+        let w = degree(n);
+        let ranges = if w > 1 { split_partitions(flags, n, w) } else { Vec::new() };
+        if ranges.len() < 2 {
+            // Serial: one range, and no `pool` round trip at all.
+            let mut scratch: Vec<Value> = Vec::new();
+            let mut cols = Vec::with_capacity(node.funcs.len());
+            for (f, p) in node.funcs.iter().zip(&prep) {
+                ctx.check()?;
+                cols.push(eval_window(f, p, &pass, 0, n, &mut scratch)?);
+            }
+            cols
+        } else {
+            // Partitions are independent, so this is a pure fan-out with no
+            // merge: worker `k` computes every function over its own
+            // contiguous, partition-aligned row range, and the answers are
+            // concatenated in range order. Nothing is recomputed and no value
+            // depends on the split, so the result is bit-identical to the
+            // serial one -- including a float `sum`, because each partition is
+            // still folded by exactly one accumulator in one order.
+            let parts: Vec<Result<Vec<Column>>> = pool::global().map(ranges.len(), |k| {
+                let (lo, hi) = ranges[k];
+                let mut scratch: Vec<Value> = Vec::new();
+                let mut cols = Vec::with_capacity(node.funcs.len());
+                for (f, p) in node.funcs.iter().zip(&prep) {
+                    ctx.check()?;
+                    cols.push(eval_window(f, p, &pass, lo, hi, &mut scratch)?);
+                }
+                Ok(cols)
+            });
+            let mut it = parts.into_iter();
+            let mut cols = it.next().expect("at least two ranges")?;
+            for other in it {
+                for (a, b) in cols.iter_mut().zip(other?) {
+                    a.extend(&b)?;
+                }
+            }
+            cols
+        }
+    };
+    block.append_columns(cols)?;
+    Ok(chunk(block))
+}
+
+/// How many workers this many rows justifies. 1 means "stay serial", and the
+/// caller treats it as a refusal rather than a one-wide fleet.
+fn degree(rows: usize) -> usize {
+    if rows < MIN_PARALLEL_ROWS {
+        return 1;
+    }
+    pool::global().threads().min(rows / MIN_ROWS_PER_WORKER).max(1)
+}
+
+/// Cut `[0, n)` into at most `w` contiguous ranges that start on a partition
+/// boundary and hold roughly equal numbers of *rows*.
+///
+/// Rows and not partitions, because partition sizes are the one thing a
+/// `PARTITION BY` says nothing about: a key with 90% of the rows would give one
+/// worker 90% of the work under an equal-partition split, and the whole step
+/// would run at serial speed with extra threads watching.
+///
+/// A window with no `PARTITION BY` is one partition and comes back as a single
+/// range, i.e. serial -- see the module docs for why that is the honest answer
+/// rather than a missing case.
+fn split_partitions(flags: &[u8], n: usize, w: usize) -> Vec<(usize, usize)> {
+    let mut out = Vec::with_capacity(w);
+    let mut s = 0usize;
+    for k in 1..w {
+        // Walk forward from the ideal cut to the next partition start. Each
+        // walk covers disjoint rows, so the whole split is one pass.
+        let mut e = (n * k / w).max(s + 1);
+        while e < n && flags[e] & NEW_PART == 0 {
+            e += 1;
+        }
+        if e >= n {
+            break;
+        }
+        out.push((s, e));
+        s = e;
+    }
+    out.push((s, n));
+    out
 }
 
 // ------------------------------------------------------------- boundaries
@@ -676,56 +1040,104 @@ impl Sweep {
 
 // -------------------------------------------------------------- evaluation
 
-/// Everything computed once for the whole materialized block and then read by
-/// every function: the rows, the partition/peer bits, the shared row-id vector
-/// and the query's stop conditions.
+/// Everything computed once for one processed chunk and then read by every
+/// function *and* every worker: the partition/peer bits, the shared row-id
+/// vector and the query's stop conditions.
 ///
-/// One struct rather than six parameters because it is genuinely one thing --
-/// the state of a single materialization pass -- and because k window functions
-/// share exactly this and nothing else.
+/// One struct rather than three parameters because it is genuinely one thing --
+/// the state of a single pass -- and because k window functions across w
+/// workers share exactly this and nothing else.
 struct Pass<'p> {
-    block: &'p Block,
     flags: &'p [u8],
     /// `0..rows`, so a frame fold is `update(args, &ids[s..e])` with no
     /// allocation and no index materialization.
     ids: &'p [u32],
-    /// False when the window has no ORDER BY; see [`Sweep::of`].
-    ordered: bool,
     ctx: &'p QueryContext,
 }
 
 impl Pass<'_> {
-    /// End (exclusive) of the partition starting at `ps`.
+    /// End (exclusive) of the partition starting at `ps`, bounded by the
+    /// worker's own range. Ranges are partition-aligned so the bound never
+    /// actually bites; it is there so that a range is a self-contained unit and
+    /// no worker can read past its own rows.
     #[inline]
-    fn part_end(&self, ps: usize) -> usize {
-        let n = self.flags.len();
+    fn part_end(&self, ps: usize, hi: usize) -> usize {
         let mut pe = ps + 1;
-        while pe < n && self.flags[pe] & NEW_PART == 0 {
+        while pe < hi && self.flags[pe] & NEW_PART == 0 {
             pe += 1;
         }
         pe
     }
 }
 
-/// Compute one window function's output column over the whole materialized
-/// block.
-fn eval_window(f: &BoundWindow, p: &Pass<'_>, scratch: &mut Vec<Value>) -> Result<Column> {
-    match f.kind {
-        WindowKind::Agg(af) => eval_agg(f, af, p, scratch),
-        WindowKind::Lag | WindowKind::Lead => eval_shift(f, p),
-        WindowKind::FirstValue | WindowKind::LastValue | WindowKind::NthValue => eval_pick(f, p),
-        _ => Ok(eval_rank(f, p)),
+/// One window call's row-independent inputs, evaluated once for the whole
+/// chunk and shared by every worker.
+///
+/// The split exists for the fan-out: an argument column is indexed by absolute
+/// row id, so a worker that evaluated `f.args` itself would repeat the whole
+/// expression over the whole block once per thread and then use a slice of it.
+enum Prepared<'b> {
+    Rank,
+    Shift { val: Cow<'b, Column>, dflt: Option<Cow<'b, Column>> },
+    Pick { val: Cow<'b, Column> },
+    Agg { args: Vec<Column>, tys: Vec<DataType>, sweep: Sweep },
+}
+
+impl<'b> Prepared<'b> {
+    fn of(f: &BoundWindow, block: &'b Block, ordered: bool) -> Result<Prepared<'b>> {
+        Ok(match f.kind {
+            WindowKind::Agg(_) => Prepared::Agg {
+                // Owned, because `Accumulator::update` wants a contiguous
+                // `&[Column]` and there is no borrowed spelling of that. One
+                // clone of the argument columns per query, not per row.
+                args: expr::eval_all(&f.args, block)?,
+                tys: f.args.iter().map(|a| a.ty()).collect(),
+                sweep: Sweep::of(&f.frame, ordered),
+            },
+            WindowKind::Lag | WindowKind::Lead => Prepared::Shift {
+                val: one_col(&f.args[0], block)?,
+                dflt: match f.args.get(2) {
+                    Some(e) => Some(one_col(e, block)?),
+                    None => None,
+                },
+            },
+            WindowKind::FirstValue | WindowKind::LastValue | WindowKind::NthValue => {
+                Prepared::Pick { val: one_col(&f.args[0], block)? }
+            }
+            _ => Prepared::Rank,
+        })
+    }
+}
+
+/// Compute one window function's output column over the rows `[lo, hi)`, which
+/// must start and end on a partition boundary.
+fn eval_window(
+    f: &BoundWindow,
+    prep: &Prepared<'_>,
+    p: &Pass<'_>,
+    lo: usize,
+    hi: usize,
+    scratch: &mut Vec<Value>,
+) -> Result<Column> {
+    match (f.kind, prep) {
+        (WindowKind::Agg(af), Prepared::Agg { args, tys, sweep }) => {
+            eval_agg(f, af, args, tys, *sweep, p, lo, hi, scratch)
+        }
+        (_, Prepared::Shift { val, dflt }) => eval_shift(f, val, dflt.as_deref(), p, lo, hi),
+        (_, Prepared::Pick { val }) => eval_pick(f, val, p, lo, hi),
+        (_, Prepared::Rank) => Ok(eval_rank(f, p, lo, hi)),
+        _ => unreachable!("Prepared::of and eval_window disagree about a window kind"),
     }
 }
 
 /// `row_number`, `rank`, `dense_rank`, `percent_rank`, `cume_dist`, `ntile` --
 /// everything that reads only the ordering.
-fn eval_rank(f: &BoundWindow, p: &Pass<'_>) -> Column {
-    let (n, flags) = (p.block.rows(), p.flags);
-    let mut b = ColumnBuilder::with_capacity(f.ty.clone(), n);
-    let mut ps = 0usize;
-    while ps < n {
-        let pe = p.part_end(ps);
+fn eval_rank(f: &BoundWindow, p: &Pass<'_>, lo: usize, hi: usize) -> Column {
+    let flags = p.flags;
+    let mut b = ColumnBuilder::with_capacity(f.ty.clone(), hi - lo);
+    let mut ps = lo;
+    while ps < hi {
+        let pe = p.part_end(ps, hi);
         let size = pe - ps;
         let mut gs = ps;
         let mut ge = peer_end(flags, ps, pe);
@@ -777,20 +1189,21 @@ fn ntile(j: usize, size: usize, buckets: u64) -> u64 {
 
 /// `lag` / `lead`: a positional gather inside the partition, with a default for
 /// the rows that fall off the end. The frame is ignored, per SQL.
-fn eval_shift(f: &BoundWindow, p: &Pass<'_>) -> Result<Column> {
-    let n = p.block.rows();
-    let val = one_col(&f.args[0], p.block)?;
-    let dflt = match f.args.get(2) {
-        Some(e) => Some(one_col(e, p.block)?),
-        None => None,
-    };
+fn eval_shift(
+    f: &BoundWindow,
+    val: &Column,
+    dflt: Option<&Column>,
+    p: &Pass<'_>,
+    lo: usize,
+    hi: usize,
+) -> Result<Column> {
     let back = matches!(f.kind, WindowKind::Lag);
     let off = f.offset as usize;
 
-    let mut b = ColumnBuilder::with_capacity(f.ty.clone(), n);
-    let mut ps = 0usize;
-    while ps < n {
-        let pe = p.part_end(ps);
+    let mut b = ColumnBuilder::with_capacity(f.ty.clone(), hi - lo);
+    let mut ps = lo;
+    while ps < hi {
+        let pe = p.part_end(ps, hi);
         for i in ps..pe {
             let src = if back {
                 i.checked_sub(off).filter(|t| *t >= ps)
@@ -799,7 +1212,7 @@ fn eval_shift(f: &BoundWindow, p: &Pass<'_>) -> Result<Column> {
             };
             match src {
                 Some(t) => b.push_value(&val.value(t))?,
-                None => match &dflt {
+                None => match dflt {
                     Some(d) => b.push_value(&d.value(i))?,
                     None => b.push_null(),
                 },
@@ -814,13 +1227,18 @@ fn eval_shift(f: &BoundWindow, p: &Pass<'_>) -> Result<Column> {
 /// **frame**, which is what makes `last_value(x) OVER (ORDER BY k)` return the
 /// current row rather than the partition's last -- the single most reported
 /// surprise in every engine that has these.
-fn eval_pick(f: &BoundWindow, p: &Pass<'_>) -> Result<Column> {
-    let (n, flags) = (p.block.rows(), p.flags);
-    let val = one_col(&f.args[0], p.block)?;
-    let mut b = ColumnBuilder::with_capacity(f.ty.clone(), n);
-    let mut ps = 0usize;
-    while ps < n {
-        let pe = p.part_end(ps);
+fn eval_pick(
+    f: &BoundWindow,
+    val: &Column,
+    p: &Pass<'_>,
+    lo: usize,
+    hi: usize,
+) -> Result<Column> {
+    let flags = p.flags;
+    let mut b = ColumnBuilder::with_capacity(f.ty.clone(), hi - lo);
+    let mut ps = lo;
+    while ps < hi {
+        let pe = p.part_end(ps, hi);
         let mut gs = ps;
         let mut ge = peer_end(flags, ps, pe);
         for i in ps..pe {
@@ -846,33 +1264,32 @@ fn eval_pick(f: &BoundWindow, p: &Pass<'_>) -> Result<Column> {
 }
 
 /// An aggregate over the frame, folded by whichever sweep the frame allows.
+#[allow(clippy::too_many_arguments)]
 fn eval_agg(
     f: &BoundWindow,
     af: &'static AggFn,
+    args: &[Column],
+    tys: &[DataType],
+    sweep: Sweep,
     p: &Pass<'_>,
+    lo: usize,
+    hi: usize,
     scratch: &mut Vec<Value>,
 ) -> Result<Column> {
-    let (n, flags, ids, block) = (p.block.rows(), p.flags, p.ids, p.block);
-    // Owned, because `Accumulator::update` wants a contiguous `&[Column]` and
-    // there is no borrowed spelling of that. One clone of the argument columns
-    // per query, not per row.
-    let args = expr::eval_all(&f.args, block)?;
-    let tys: Vec<DataType> = f.args.iter().map(|a| a.ty()).collect();
-    let sweep = Sweep::of(&f.frame, p.ordered);
-
-    let mut b = ColumnBuilder::with_capacity(f.ty.clone(), n);
-    let mut ps = 0usize;
-    while ps < n {
+    let (flags, ids) = (p.flags, p.ids);
+    let mut b = ColumnBuilder::with_capacity(f.ty.clone(), hi - lo);
+    let mut ps = lo;
+    while ps < hi {
         // Once per *partition*, not once per row: the three linear sweeps are
         // fast enough that a per-row check would be the dominant cost, but a
         // `Refold` over a single wide partition is the one thing in this
         // operator that can run long enough for a user to want it stopped.
         p.ctx.check()?;
-        let pe = p.part_end(ps);
+        let pe = p.part_end(ps, hi);
         match sweep {
             Sweep::Whole => {
-                let mut acc = (af.new)(&tys, &f.params)?;
-                acc.update(&args, &ids[ps..pe])?;
+                let mut acc = (af.new)(tys, &f.params)?;
+                acc.update(args, &ids[ps..pe])?;
                 let v = acc.finish()?;
                 for _ in ps..pe {
                     b.push_value(&v)?;
@@ -883,7 +1300,7 @@ fn eval_agg(
                 // frame is exactly `[ps, e)` -- so `finish()` is the answer
                 // with no bookkeeping, including for an empty frame, where a
                 // fresh accumulator already reports the empty-input value.
-                let mut acc = (af.new)(&tys, &f.params)?;
+                let mut acc = (af.new)(tys, &f.params)?;
                 let mut fed = ps;
                 let mut gs = ps;
                 let mut ge = peer_end(flags, ps, pe);
@@ -894,14 +1311,14 @@ fn eval_agg(
                     }
                     let (_, e) = frame_of(&f.frame, i, ps, pe, gs, ge);
                     if e > fed {
-                        acc.update(&args, &ids[fed..e])?;
+                        acc.update(args, &ids[fed..e])?;
                         fed = e;
                     }
                     b.push_value(&acc.finish()?)?;
                 }
             }
             Sweep::Backward => {
-                let mut acc = (af.new)(&tys, &f.params)?;
+                let mut acc = (af.new)(tys, &f.params)?;
                 let mut fed = pe;
                 let mut ge = pe;
                 let mut gs = peer_start(flags, pe, ps);
@@ -917,7 +1334,7 @@ fn eval_agg(
                     }
                     let (s, _) = frame_of(&f.frame, i, ps, pe, gs, ge);
                     if s < fed {
-                        acc.update(&args, &ids[s..fed])?;
+                        acc.update(args, &ids[s..fed])?;
                         fed = s;
                     }
                     scratch.push(acc.finish()?);
@@ -935,9 +1352,9 @@ fn eval_agg(
                         ge = peer_end(flags, gs, pe);
                     }
                     let (s, e) = frame_of(&f.frame, i, ps, pe, gs, ge);
-                    let mut acc = (af.new)(&tys, &f.params)?;
+                    let mut acc = (af.new)(tys, &f.params)?;
                     if s < e {
-                        acc.update(&args, &ids[s..e])?;
+                        acc.update(args, &ids[s..e])?;
                     }
                     b.push_value(&acc.finish()?)?;
                 }
@@ -1062,6 +1479,117 @@ mod tests {
         ctx.cancel.store(true, Ordering::Relaxed);
         let e = super::super::execute_ctx(&plan, cat, &ctx).unwrap_err().to_string();
         assert!(e.contains("cancelled"), "{e}");
+    }
+
+    // ------------------------------------------- streaming and the fan-out
+
+    /// Run one query under a budget, straight through the engine, and return
+    /// its rows. Bound by hand because the budget is a property of the context
+    /// and `Session::query` owns its own.
+    fn under(s: &mut crate::Session, sql: &str, budget: i64) -> Result<Vec<Vec<Value>>> {
+        use crate::planner::{binder::Binder, optimizer};
+        s.execute("SYSTEM FLUSH").unwrap();
+        let stmt = crate::sql::parse(sql).unwrap();
+        let q = match &stmt[0] {
+            crate::sql::ast::Statement::Query(q) => q.clone(),
+            other => panic!("{other:?}"),
+        };
+        let cat = &s.catalog;
+        let plan = optimizer::optimize(Binder::new(cat).bind_query(&q).unwrap()).unwrap();
+        let ctx = QueryContext::with_budget(budget);
+        let (blocks, _) = super::super::execute_ctx(&plan, cat, &ctx)?;
+        let out = blocks
+            .iter()
+            .flat_map(|b| {
+                (0..b.rows()).map(move |r| {
+                    (0..b.width()).map(|c| b.column(c).value(r)).collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        drop(plan);
+        assert_eq!(ctx.mem.used(), 0, "the query kept its reservation");
+        Ok(out)
+    }
+
+    #[test]
+    fn a_window_cut_partition_by_partition_answers_like_a_buffered_one() {
+        // The claim: the relation no longer has to fit, only a partition. The
+        // budget here is far below the 20 000 rows and comfortably above one
+        // 7000-row partition, so the operator has to cut several times -- and
+        // the answer has to be identical *including order*, because a window's
+        // output order is its input order however the operator chops it up.
+        let mut s = session(20_000);
+        for q in [
+            "SELECT row_number() OVER (PARTITION BY g ORDER BY id) FROM t",
+            "SELECT sum(v) OVER (PARTITION BY g ORDER BY id) FROM t",
+            "SELECT lag(v, 3, -1) OVER (PARTITION BY g ORDER BY id) FROM t",
+            "SELECT last_value(v) OVER (PARTITION BY g ORDER BY id \
+             ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING) FROM t",
+            "SELECT count(*) OVER (PARTITION BY g) FROM t",
+            "SELECT sum(v) OVER (PARTITION BY g ORDER BY id ROWS BETWEEN 5 PRECEDING \
+             AND 2 FOLLOWING) FROM t",
+        ] {
+            let want = under(&mut s, q, 512 << 20).unwrap();
+            let got = under(&mut s, q, 4 << 20).unwrap();
+            assert_eq!(got.len(), 20_000, "{q}: rows went missing");
+            assert_eq!(got, want, "{q}: a cut window answered differently");
+        }
+    }
+
+    #[test]
+    fn one_partition_wider_than_the_budget_is_refused_and_says_so() {
+        // The shape with no smaller unit. It has to be an error the caller can
+        // read rather than a swap storm, and the error has to name the window
+        // buffer -- otherwise it looks like the sort underneath ran out.
+        let mut s = session(20_000);
+        let e = under(&mut s, "SELECT sum(v) OVER (ORDER BY id) FROM t", 192 << 10).unwrap_err();
+        let msg = e.to_string();
+        assert!(msg.contains("memory budget"), "{msg}");
+
+        // ... and the negative: the same query with room answers, so the
+        // refusal is about the budget and not about the shape being broken.
+        let got = under(&mut s, "SELECT sum(v) OVER (ORDER BY id) FROM t", 512 << 20).unwrap();
+        assert_eq!(got.len(), 20_000);
+    }
+
+    #[test]
+    fn the_split_lands_on_partition_starts_and_balances_rows_not_partitions() {
+        // 100 rows: one partition of 70 and three of 10. An equal-partitions
+        // split would give one worker 70% of the work.
+        let mut flags = vec![0u8; 100];
+        for i in [0usize, 70, 80, 90] {
+            flags[i] = NEW_PART | NEW_PEER;
+        }
+        let r = split_partitions(&flags, 100, 4);
+        assert!(r.iter().all(|&(s, _)| flags[s] & NEW_PART != 0), "a range cut a partition");
+        assert_eq!(r.first().unwrap().0, 0);
+        assert_eq!(r.last().unwrap().1, 100);
+        for w in r.windows(2) {
+            assert_eq!(w[0].1, w[1].0, "the ranges have to tile [0, n)");
+        }
+        // The first range must swallow the fat partition whole and stop, not
+        // creep past 70 in search of a rounder number.
+        assert_eq!(r[0], (0, 70));
+
+        // A window with no PARTITION BY is one range whatever the width.
+        let mut one = vec![0u8; 100];
+        one[0] = NEW_PART | NEW_PEER;
+        assert_eq!(split_partitions(&one, 100, 8), vec![(0, 100)]);
+
+        // Every row its own partition: the split is even and uses every worker.
+        let all = vec![NEW_PART | NEW_PEER; 100];
+        let r = split_partitions(&all, 100, 4);
+        assert_eq!(r, vec![(0, 25), (25, 50), (50, 75), (75, 100)]);
+    }
+
+    #[test]
+    fn degree_leaves_small_windows_alone() {
+        assert_eq!(degree(0), 1);
+        assert_eq!(degree(MIN_PARALLEL_ROWS - 1), 1, "below the floor, stay serial");
+        assert!(degree(MIN_PARALLEL_ROWS) >= 1);
+        assert!(degree(1 << 20) <= pool::global().threads());
+        // Enough rows to be worth it, but not enough for every thread.
+        assert_eq!(degree(MIN_PARALLEL_ROWS).min(2), 2.min(pool::global().threads()));
     }
 
     #[test]

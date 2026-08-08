@@ -249,7 +249,11 @@ impl<'a> Sort<'a> {
             let perm = self.order_of(&b)?;
             let set = match &mut runs {
                 Some(s) => s,
-                None => runs.insert(RunSet::new()?),
+                // The share is read here, at the first spill, because that is
+                // the one moment it means anything: `held` is what this sort
+                // got out of the shared budget before it ran out. See
+                // `share_of`.
+                None => runs.insert(RunSet::new(share_of(&guard))?),
             };
             set.push_run(&b, &perm, self.ctx)?;
             drop(b);
@@ -507,29 +511,67 @@ pub(crate) fn forced_spill_rows() -> usize {
 /// This is the top half of a parallel `ORDER BY`: each exchange worker sorts
 /// its own slice of the scan and this folds the results. Runs must arrive in
 /// **input order** -- worker 0's slice first -- because ties break toward the
-/// lower absolute position, which is what makes the merged order identical to
-/// the stable serial sort's rather than merely equivalent to it.
+/// lower run index, and every row of run `i` precedes every row of run `j > i`.
+/// That is what makes the merged order identical to the stable serial sort's
+/// rather than merely equivalent to it.
 ///
 /// The storage layer already has a k-way merge (`Table::merge_parts`), and it
 /// gets to be four lines: its keys are single `u64` lanes, so a
 /// `BinaryHeap<Reverse<(u64, part, row)>>` can own them outright. A sort key
 /// here is a tuple of `Value`s, and an owning heap item would mean one heap
-/// allocation per *output row*. Hence [`kway`] below, which stores positions
-/// and compares through a closure that reads an arena in place -- and hence the
-/// two comparators, mirroring [`permutation`]'s own split: a single
-/// non-nullable non-string key merges on `u64` lanes, everything else on
-/// materialized key tuples.
+/// allocation per *output row*. So this borrows that shape and not its code:
+/// the same sift-down [`RunMerge`] uses, over an array of live runs, with a
+/// comparator that reads the heads in place.
 ///
-/// Worth knowing before reaching for this: a merge costs a heap sift *per
-/// output row*, which is a lot next to a radix sort's four linear passes.
-/// Measured through the exchange on 10M rows and 14 cores, `ORDER BY latency`
-/// (single non-null integer key, so the radix path) is 156 -> 139 ms, 1.1x --
-/// the merge gives back most of what the parallel sort won. `ORDER BY country,
-/// latency`, which sorts by `n log n` `Value` comparisons instead, is 7079 ->
-/// 1685 ms, 4.2x. And `ORDER BY latency DESC LIMIT 5` is 133 -> 24 ms, because
-/// there the runs are five rows long and the merge is free. The shape of the
-/// win is set by how expensive the sort being parallelized was, not by the
-/// merge.
+/// ## Streaming, one output block at a time
+///
+/// The first version concatenated every run into one block, built a key arena
+/// over the whole relation, and gathered the sorted order back out of it --
+/// two full copies of the answer plus an arena of 8 B/row (lane path) or
+/// 24 B/row/key (comparison path), all resident together. A merge consumes each
+/// run *strictly in order*, so within one output block a run contributes
+/// exactly one contiguous range; the block can be assembled from those pieces
+/// alone and the arena shrinks to one head key per live run. Three consequences,
+/// in the order they matter:
+///
+/// * peak memory is the runs plus one block, not the runs plus a concatenation
+///   plus the whole output plus the arena -- and a run's block is freed the
+///   moment it is spent, so the input half drains as the output half fills;
+/// * the final gather reads a block-sized scratch instead of a relation-sized
+///   one, so it stays in L2 rather than missing to DRAM on every row;
+/// * when a single run supplies a whole output block -- the usual case when the
+///   `ORDER BY` agrees with the table's own order, because then the workers'
+///   key ranges are disjoint -- the block *is* that slice, and there is no
+///   gather and no concatenation at all.
+///
+/// Measured end to end through the exchange against the pre-change binary --
+/// two worktrees, the sides alternating which runs first, best-of-5 per side
+/// per round, six rounds, twice over -- 2M rows, six columns, 14 cores:
+///
+/// ```text
+///   ORDER BY id        (runs disjoint)     11.1 ->  4.8 ms  2.32x  2.39x
+///   ORDER BY latency   (1M distinct)       53.6 -> 57.7 ms  0.93x  0.91x
+///   ORDER BY country, latency (compare)   212   -> 217   ms  0.98x  0.99x
+///   ORDER BY latency DESC LIMIT 5           2.6 ->  2.6 ms  1.00x  1.06x
+///   ORDER BY country, big LIMIT 100         8.3 ->  7.4 ms  1.12x  0.97x
+///   GROUP BY country / big / id                            0.99-1.05x
+/// ```
+///
+/// One shape pays: a single-key full merge over a key with no repeats, where
+/// the runs interleave every row. The gather is why -- reading one row out of
+/// one of fourteen blocks is two dependent loads where reading it out of one
+/// concatenated block is one. A bulk-copy probe in place of the gather put the
+/// rest of this function at 1.06x, so the gather *is* the difference; it buys
+/// the halved peak, and it is the same trade the spilled merge already makes.
+/// Three attempts to close it measured null and are recorded where they were
+/// tried, so that nobody spends the afternoon again: a per-run lane arena (see
+/// [`Heads::refresh`]), packing the row id into `src` (see [`gather`]), and
+/// `push` instead of `collect` in [`pick`].
+///
+/// Worth knowing before reaching for this: a merge still costs a heap sift per
+/// output row wherever [`GALLOP_AFTER`] does not fire, which is a lot next to a
+/// radix sort's four linear passes. The shape of the win from parallelizing a
+/// sort is set by how expensive the sort being replaced was, not by this.
 pub(crate) fn merge_runs(
     runs: Vec<Block>,
     keys: &[SortKey],
@@ -552,104 +594,501 @@ pub(crate) fn merge_runs(
         return Ok(chunk(if want < all.rows() { all.slice(0, want) } else { all }));
     }
 
-    // `ends[i]` is where run `i` stops inside the concatenation, so a heap
-    // entry needs only its absolute position and its run.
-    let mut ends: Vec<u32> = Vec::with_capacity(runs.len());
-    let mut heads: Vec<(u32, u32)> = Vec::with_capacity(runs.len());
-    let mut at = 0u32;
-    for (i, r) in runs.iter().enumerate() {
-        heads.push((at, i as u32));
-        at += r.rows() as u32;
-        ends.push(at);
+    let at = key_positions(keys, runs[0].width());
+    let mut rs: Vec<MergeRun> = Vec::with_capacity(runs.len());
+    let mut held = 0usize;
+    for b in runs {
+        // Only an *expression* key is materialized, and only once per run; a
+        // plain `ORDER BY col` reads straight out of the block it is merging.
+        let mut kx = Vec::new();
+        for (k, a) in keys.iter().zip(&at) {
+            if matches!(a, KeyAt::Expr(_)) {
+                kx.push(expr::eval(&k.expr, &b)?);
+            }
+        }
+        held += b.bytes() + kx.iter().map(|c| c.bytes()).sum::<usize>();
+        rs.push(MergeRun { b, kx });
     }
-    let mut all = runs.remove(0);
-    for r in &runs {
-        all.extend(r)?;
+    let n = rs.len();
+    // The cursors live beside the runs rather than in them, so the merge loop
+    // can hold the key columns borrowed out of the blocks (see [`Keyed`]) while
+    // it advances.
+    let mut cur: Vec<Cur> = rs
+        .iter()
+        .map(|r| Cur { pos: 0, start: 0, end: r.b.rows() as u32 })
+        .collect();
+    // Charged once, for the runs the caller handed over plus the one block this
+    // assembles into. Conservative on both counts: the runs are freed as they
+    // are consumed and a `MemGuard` never refunds, and the scratch is charged
+    // at a full block even when `fetch` is smaller.
+    let row_bytes = held / total.max(1);
+    guard.grow_to(held + want.min(BLOCK_SIZE) * (row_bytes + 2 * size_of::<u32>()))?;
+
+    let mut hd = Heads::new(&rs, &at, keys);
+    let mut heap: Vec<(u32, u32)> = Vec::with_capacity(n);
+    let mut out: Vec<Block> = Vec::with_capacity(want.div_ceil(BLOCK_SIZE));
+    // Which run each output row came from. Reused across blocks, so the merge
+    // allocates nothing per output block.
+    let mut src: Vec<u32> = Vec::with_capacity(want.min(BLOCK_SIZE));
+    let mut left = want;
+    let mut first = true;
+    while left > 0 && (first || !heap.is_empty()) {
+        let take = left.min(BLOCK_SIZE);
+        src.clear();
+        // "Did more than one run contribute" costs a compare and an or per row
+        // here; counting per run cost a read-modify-write on an array instead,
+        // and the count itself was only ever used to answer this.
+        let (mut only, mut mixed) = (u32::MAX, false);
+        // Consecutive rows the current root has won. See `GALLOP_AFTER`.
+        let mut wins = 0u32;
+        for c in cur.iter_mut() {
+            c.start = c.pos;
+        }
+        {
+            // The key columns, resolved once per *output block* rather than
+            // once per output row. Reaching a head key through its run is a
+            // four-level chase -- run, block, column, `ColumnData` -- and
+            // paying it per row cost 5.5 ns/row: `ORDER BY id` over 2M rows
+            // measured 17.8 -> 28.8 ms against the concatenating merge with the
+            // chase in the loop, and 17.8 -> 14.9 with it hoisted here. The
+            // borrow is what forces the scope: freeing a spent run below needs
+            // `&mut rs`.
+            let keyed = Keyed::of(&rs, &at, keys, hd.lane);
+            if first {
+                first = false;
+                for i in 0..n {
+                    hd.refresh(i, &keyed, 0);
+                    heap.push((i as u32, 0));
+                }
+                for i in (0..n / 2).rev() {
+                    sift_down(&mut heap, i, &mut |a, b| hd.less(keys, a, b));
+                }
+            }
+            while src.len() < take {
+                let Some(&(top, _)) = heap.first() else { break };
+                let i = top as usize;
+                // How many of this run's rows win before the runner-up does.
+                // A run is sorted, so its lanes are monotone in the sort
+                // direction and this is a galloping search rather than a sift
+                // per row -- see [`GALLOP_AFTER`] for when it is worth asking
+                // and [`Keyed::stretch`] for the search.
+                wins = if top == only { wins + 1 } else { 0 };
+                let run = match (wins >= GALLOP_AFTER && hd.lane)
+                    .then(|| runner_up(&heap, &hd, keys))
+                {
+                    None => 1,
+                    Some(None) => cur[i].end as usize - cur[i].pos as usize,
+                    Some(Some(r2)) => keyed.stretch(
+                        i,
+                        cur[i].pos as usize,
+                        cur[i].end as usize,
+                        hd.lanes[r2 as usize],
+                        hd.asc,
+                        top < r2,
+                    ),
+                }
+                .min(take - src.len())
+                .max(1);
+                src.resize(src.len() + run, top);
+                mixed |= only != top && only != u32::MAX;
+                only = top;
+                cur[i].pos += run as u32;
+                if cur[i].pos >= cur[i].end {
+                    // The run is spent. Standard shrink: the tail takes the
+                    // root. Its block cannot be released yet -- the piece it
+                    // just contributed has not been copied out.
+                    let last = heap.pop().unwrap_or_default();
+                    if !heap.is_empty() {
+                        heap[0] = last;
+                        sift_down(&mut heap, 0, &mut |a, b| hd.less(keys, a, b));
+                    }
+                } else {
+                    hd.refresh(i, &keyed, cur[i].pos as usize);
+                    sift_down(&mut heap, 0, &mut |a, b| hd.less(keys, a, b));
+                }
+            }
+        }
+        left -= src.len();
+        if src.is_empty() {
+            break;
+        }
+
+        out.push(if !mixed {
+            // One run supplied the whole block: its rows are already in output
+            // order, so the slice *is* the block, and a bulk copy beats an
+            // indexed one.
+            let i = only as usize;
+            let lo = cur[i].start as usize;
+            rs[i].b.slice(lo, lo + src.len())
+        } else {
+            gather(&rs, &cur, &src)?
+        });
+        // Hand back what is finished with. Without this the merge holds every
+        // run until the last one drains, i.e. the whole relation *and* the
+        // whole answer at once.
+        for (r, c) in rs.iter_mut().zip(&cur) {
+            if c.pos >= c.end && r.b.rows() > 0 {
+                r.b = r.b.slice(0, 0);
+                r.kx.clear();
+            }
+        }
     }
-    drop(runs);
+    Ok(out)
+}
 
-    let cols = key_columns(keys, &all)?;
-    let refs: Vec<&Column> = cols.iter().map(|c| c.as_ref()).collect();
-    guard.grow_to(all.bytes() + scratch_bytes(all.rows(), keys, &refs))?;
+/// The runs' key columns, typed once so the head refresh is a load.
+///
+/// Built per output block and borrowed from the runs, which is why it is a
+/// scope rather than a field: the merge frees a run's block the moment it is
+/// spent, and that needs the blocks back.
+enum Keyed<'a> {
+    U(Vec<&'a [u64]>),
+    I(Vec<&'a [i64]>),
+    F(Vec<&'a [f64]>),
+    /// The comparison comparator, `nk` columns per run, flat. Materializing
+    /// `Value`s is the cost here and no typing helps with it.
+    Cols(Vec<&'a Column>),
+}
 
-    let perm = if keys.len() == 1 && radix_eligible(refs[0]) {
-        let lanes = lanes_of(refs[0])?;
-        let asc = keys[0].asc;
-        kway(&mut heads, &ends, want, |a, b| {
-            let (x, y) = (lanes[a as usize], lanes[b as usize]);
-            // Ties fall through to the position, which is the stable
+/// Consecutive rows one run must win before the merge starts asking how many
+/// more it would win.
+///
+/// The ask is not free -- a heap peek, a comparison for the runner-up, and a
+/// probe -- and on a key with no repeats it is pure loss, because the answer is
+/// always one. Measured on 2M rows, `ORDER BY` a key with a million distinct
+/// values: asking every row read **0.74x** against the concatenating merge,
+/// asking only after eight wins reads 0.96x, and the shape the ask exists for
+/// -- `ORDER BY` the table's own key, where each run wins its whole block --
+/// goes from 0.90x to **2.3x**. Eight is `TimSort`'s seven rounded to a power
+/// of two, and for the same reason: it is short enough that a clustered merge
+/// pays it once per stretch and long enough that a shuffled one never does.
+const GALLOP_AFTER: u32 = 8;
+
+/// The run whose head the root has to beat: the better of the root's two heap
+/// children, which is where a binary heap keeps its second-smallest. `None`
+/// when the root is the only run left, and then it wins to the end.
+#[inline]
+fn runner_up(heap: &[(u32, u32)], hd: &Heads, keys: &[SortKey]) -> Option<u32> {
+    match (heap.get(1), heap.get(2)) {
+        (None, _) => None,
+        (Some(&(a, _)), None) => Some(a),
+        (Some(&(a, _)), Some(&(b, _))) => Some(if hd.less(keys, a, b) { a } else { b }),
+    }
+}
+
+impl<'a> Keyed<'a> {
+    /// How many of run `i`'s rows from `lo` still beat lane `limit`.
+    ///
+    /// Galloping and not a plain `partition_point` over the rest of the run:
+    /// the answer is usually small (finely interleaved runs answer 1) and a
+    /// binary search over a 143k-row run would then cost seventeen probes to
+    /// say "one". Doubling first makes it `O(log n)` in the *answer*, so the
+    /// common case is two comparisons and the disjoint case is still
+    /// logarithmic.
+    fn stretch(&self, i: usize, lo: usize, hi: usize, limit: u64, asc: bool, eq: bool) -> usize {
+        let better = |l: u64| if l != limit { (l < limit) == asc } else { eq };
+        let len = hi - lo;
+        // Monotone in the sort direction, so `better` holds on a prefix -- which
+        // is what both searches below require.
+        macro_rules! gallop {
+            ($v:expr, $f:expr) => {{
+                let v = &$v[i][lo..hi];
+                let mut hi2 = 1usize;
+                while hi2 < len && better($f(v[hi2])) {
+                    hi2 *= 2;
+                }
+                let lo2 = hi2 / 2;
+                lo2 + v[lo2..hi2.min(len)].partition_point(|&x| better($f(x)))
+            }};
+        }
+        match self {
+            Keyed::U(v) => gallop!(v, |x: u64| x),
+            Keyed::I(v) => gallop!(v, i64_to_lane),
+            Keyed::F(v) => gallop!(v, f64_to_lane),
+            Keyed::Cols(_) => 1,
+        }
+    }
+
+    fn of(rs: &'a [MergeRun], at: &[KeyAt], keys: &[SortKey], lane: bool) -> Keyed<'a> {
+        if !lane {
+            let mut c = Vec::with_capacity(rs.len() * keys.len());
+            for r in rs {
+                c.extend(at.iter().map(|a| key_col(r, a)));
+            }
+            return Keyed::Cols(c);
+        }
+        // `lane` was decided from these same columns, so every run agrees on
+        // the physical kind; the empty fallbacks cannot be reached and must not
+        // be a panic under a merge loop.
+        match &key_col(&rs[0], &at[0]).data {
+            ColumnData::U64(_) => Keyed::U(
+                rs.iter()
+                    .map(|r| match &key_col(r, &at[0]).data {
+                        ColumnData::U64(v) => v.as_slice(),
+                        _ => &[],
+                    })
+                    .collect(),
+            ),
+            ColumnData::I64(_) => Keyed::I(
+                rs.iter()
+                    .map(|r| match &key_col(r, &at[0]).data {
+                        ColumnData::I64(v) => v.as_slice(),
+                        _ => &[],
+                    })
+                    .collect(),
+            ),
+            _ => Keyed::F(
+                rs.iter()
+                    .map(|r| match &key_col(r, &at[0]).data {
+                        ColumnData::F64(v) => v.as_slice(),
+                        _ => &[],
+                    })
+                    .collect(),
+            ),
+        }
+    }
+}
+
+/// Gather one output block straight out of the runs that fed it.
+///
+/// `types` offers `take` (one source, many rows) and `extend` (one source, all
+/// of it), and a k-way merge needs neither: it needs *many sources, one row at
+/// a time*. Composing the two -- slice each run's contribution out, concatenate
+/// them, then permute the concatenation -- moves every row **three** times,
+/// which on a full merge is one extra copy of the whole answer. So this walks
+/// the two levels itself, with the type match hoisted to once per column per
+/// block.
+///
+/// `src[k]` is the run output row `k` came from; the row *inside* that run is
+/// implicit, because a merge consumes each run in order, so run `r`'s rows in
+/// this block are `cur[r].start` onwards. Packing the row in alongside the run
+/// instead measured **null** here (0.62-0.70x both ways, three runs) and cost
+/// four bytes per row on every block, including the ones a single run supplied
+/// and this never saw -- which is where it showed up: `ORDER BY id`, whose runs
+/// are disjoint, read 0.86x with the packed form and 0.93x without.
+fn gather(rs: &[MergeRun], cur: &[Cur], src: &[u32]) -> Result<Block> {
+    let width = rs[0].b.width();
+    let mut columns = Vec::with_capacity(width);
+    // A zero-column block still has rows -- `SELECT count(*)` scans produce
+    // exactly those -- and `Block::new` cannot infer the count from no columns.
+    if width == 0 {
+        return Ok(Block::rows_only(src.len()));
+    }
+    let mut cs: Vec<&Column> = Vec::with_capacity(rs.len());
+    let mut at: Vec<u32> = Vec::with_capacity(rs.len());
+    for c in 0..width {
+        cs.clear();
+        cs.extend(rs.iter().map(|r| r.b.column(c)));
+        let data = match &cs[0].data {
+            ColumnData::U64(_) => ColumnData::U64(pick(
+                &slices(&cs, |d| match d {
+                    ColumnData::U64(v) => Some(v.as_slice()),
+                    _ => None,
+                })?,
+                src,
+                &mut at,
+                cur,
+            )),
+            ColumnData::I64(_) => ColumnData::I64(pick(
+                &slices(&cs, |d| match d {
+                    ColumnData::I64(v) => Some(v.as_slice()),
+                    _ => None,
+                })?,
+                src,
+                &mut at,
+                cur,
+            )),
+            ColumnData::F64(_) => ColumnData::F64(pick(
+                &slices(&cs, |d| match d {
+                    ColumnData::F64(v) => Some(v.as_slice()),
+                    _ => None,
+                })?,
+                src,
+                &mut at,
+                cur,
+            )),
+            ColumnData::Str(_) => ColumnData::Str(pick(
+                &slices(&cs, |d| match d {
+                    ColumnData::Str(v) => Some(v.as_slice()),
+                    _ => None,
+                })?,
+                src,
+                &mut at,
+                cur,
+            )),
+        };
+        // Only the runs that actually carry a mask are consulted, and only
+        // when one of them does: `nulls: None` is the common case and costs
+        // nothing to keep.
+        let nulls = cs.iter().any(|c| c.nulls.is_some()).then(|| {
+            reset(&mut at, cur);
+            let mut out = crate::common::BitSet::new();
+            for (o, &r) in src.iter().enumerate() {
+                let p = &mut at[r as usize];
+                if cs[r as usize].is_null(*p as usize) {
+                    out.set(o);
+                }
+                *p += 1;
+            }
+            out
+        });
+        columns.push(Column {
+            ty: cs[0].ty.clone(),
+            data,
+            nulls: nulls.filter(|n| !n.is_empty()),
+        });
+    }
+    Block::new(columns)
+}
+
+/// The `n` runs' views of one column, as flat slices of the right type.
+fn slices<'a, T>(
+    cs: &[&'a Column],
+    f: impl Fn(&'a ColumnData) -> Option<&'a [T]>,
+) -> Result<Vec<&'a [T]>> {
+    cs.iter()
+        .map(|c| {
+            f(&c.data).ok_or_else(|| {
+                // Every run of a merge came from one operator over one schema,
+                // so this is a bug rather than a user error -- but it is a bug
+                // that must not be a panic under a query.
+                Error::exec("merged runs disagree about a column's physical type")
+            })
+        })
+        .collect()
+}
+
+#[inline]
+fn reset(at: &mut Vec<u32>, cur: &[Cur]) {
+    at.clear();
+    at.extend(cur.iter().map(|c| c.start));
+}
+
+/// The two-level gather itself: flat, one indexed load per output row.
+#[inline]
+fn pick<T: Clone>(vs: &[&[T]], src: &[u32], at: &mut Vec<u32>, cur: &[Cur]) -> Vec<T> {
+    reset(at, cur);
+    // `collect` and not `with_capacity` + `push`: the slice iterator's exact
+    // size hint lets it write without a capacity check per element, which is
+    // the same reason `Column::take` is written this way. Worth 6% of the
+    // merge, measured interleaved.
+    src.iter()
+        .map(|&r| {
+            let p = &mut at[r as usize];
+            let v = vs[r as usize][*p as usize].clone();
+            *p += 1;
+            v
+        })
+        .collect()
+}
+
+/// One run being merged.
+///
+/// Owns its block, rather than borrowing out of a `Vec<Block>` the caller keeps,
+/// precisely so a spent run can be dropped mid-merge.
+struct MergeRun {
+    b: Block,
+    /// Expression sort keys evaluated over `b`, in [`KeyAt::Expr`] order.
+    /// Empty for the usual `ORDER BY col`, which needs no copy at all.
+    kx: Vec<Column>,
+}
+
+/// Where one run has got to. Separate from [`MergeRun`] so the merge can
+/// advance while the key columns are borrowed out of the blocks.
+struct Cur {
+    pos: u32,
+    /// `pos` at the start of the output block being assembled.
+    start: u32,
+    end: u32,
+}
+
+#[inline]
+fn key_col<'r>(r: &'r MergeRun, a: &KeyAt) -> &'r Column {
+    match a {
+        KeyAt::Col(j) => r.b.column(*j),
+        KeyAt::Expr(j) => &r.kx[*j],
+    }
+}
+
+/// The head row's sort key per live run, refreshed once per output row.
+///
+/// Two representations for the two comparators, mirroring [`permutation`]'s own
+/// split: a single non-nullable non-string key is one `u64` lane per run,
+/// everything else is `nk` `Value`s per run. Either way this is O(runs), which
+/// is what replaced the O(rows) arena the concatenating merge had to build --
+/// on a 10M-row single-key sort, 14 words against 80 MB.
+struct Heads {
+    vals: Vec<Value>,
+    lanes: Vec<u64>,
+    nk: usize,
+    /// Lane comparator; `false` selects `vals`. Decided once per merge, so the
+    /// branches below are perfectly predicted for their whole life.
+    lane: bool,
+    asc: bool,
+}
+
+/// One row's sort lane, from a column typed once per output block.
+#[inline]
+fn lane_of(k: &Keyed<'_>, i: usize, pos: usize) -> u64 {
+    match k {
+        Keyed::U(v) => v[i][pos],
+        Keyed::I(v) => i64_to_lane(v[i][pos]),
+        Keyed::F(v) => f64_to_lane(v[i][pos]),
+        // `Heads::new` admits the lane comparator only when every run's key
+        // column is `radix_eligible`, which excludes strings outright.
+        Keyed::Cols(_) => {
+            debug_assert!(false, "the lane comparator was given a string key");
+            0
+        }
+    }
+}
+
+impl Heads {
+    fn new(rs: &[MergeRun], at: &[KeyAt], keys: &[SortKey]) -> Heads {
+        // Every run has to be lane-eligible, not just the first: one worker's
+        // slice can hold a NULL where another's does not, and a NULL's lane is
+        // a stored zero that would sort as a real value.
+        let lane = keys.len() == 1 && rs.iter().all(|r| radix_eligible(key_col(r, &at[0])));
+        Heads {
+            vals: if lane { Vec::new() } else { vec![Value::Null; rs.len() * keys.len()] },
+            lanes: if lane { vec![0; rs.len()] } else { Vec::new() },
+            nk: keys.len(),
+            lane,
+            asc: keys.first().is_none_or(|k| k.asc),
+        }
+    }
+
+    /// Publish run `i`'s head key for the comparator, out of the per-block
+    /// [`Keyed`] rather than out of the run.
+    ///
+    /// Materializing each run's lanes up front instead -- the arena the
+    /// concatenating merge built -- is the other way to keep this cheap and it
+    /// measured **null**: 2M rows in 14 runs, twice, 0.69x/0.67x with the arena
+    /// against 0.65x/0.58x without. It is not worth 8 B/row and should not be
+    /// retried; hoisting the type match is what the cost actually was.
+    #[inline]
+    fn refresh(&mut self, i: usize, k: &Keyed<'_>, pos: usize) {
+        if self.lane {
+            self.lanes[i] = lane_of(k, i, pos);
+            return;
+        }
+        let Keyed::Cols(c) = k else { return };
+        for j in 0..self.nk {
+            self.vals[i * self.nk + j] = c[i * self.nk + j].value(pos);
+        }
+    }
+
+    #[inline]
+    fn less(&self, keys: &[SortKey], a: u32, b: u32) -> bool {
+        if self.lane {
+            let (x, y) = (self.lanes[a as usize], self.lanes[b as usize]);
+            // Ties fall through to the run index, which is the stable
             // tie-break; `asc` never flips it, because "earlier input row
             // first" is not a direction.
-            if x != y {
-                (x < y) == asc
-            } else {
-                a < b
-            }
-        })
-    } else {
-        let k = keys.len();
-        let mut vals: Vec<Value> = Vec::with_capacity(all.rows() * k);
-        for i in 0..all.rows() {
-            for c in &refs[..k] {
-                vals.push(c.value(i));
-            }
+            return if x != y { (x < y) == self.asc } else { a < b };
         }
-        kway(&mut heads, &ends, want, |a, b| {
-            let (x, y) = (a as usize * k, b as usize * k);
-            match compare_keys(&vals[x..x + k], &vals[y..y + k], keys) {
-                Ordering::Less => true,
-                Ordering::Greater => false,
-                Ordering::Equal => a < b,
-            }
-        })
-    };
-    drop(refs);
-    drop(cols);
-    Ok(chunk_take(&all, &perm))
-}
-
-/// The lane vector [`radix_permutation`] would have built, without the sort.
-fn lanes_of(c: &Column) -> Result<Vec<u64>> {
-    Ok(match &c.data {
-        ColumnData::U64(v) => v.clone(),
-        ColumnData::I64(v) => v.iter().map(|&x| i64_to_lane(x)).collect(),
-        ColumnData::F64(v) => v.iter().map(|&x| f64_to_lane(x)).collect(),
-        ColumnData::Str(_) => return Err(Error::exec("string columns have no global sort lane")),
-    })
-}
-
-/// Pop the least head `want` times. `heads` is `(position, run)` per live run.
-///
-/// `less` must be a strict total order -- ties broken by position -- or the
-/// merge stops being a stable sort. Sift-down rather than `BinaryHeap` so the
-/// comparator can close over the key arena; at fourteen runs the whole heap is
-/// two cache lines and the sift is four comparisons.
-fn kway<F>(heads: &mut Vec<(u32, u32)>, ends: &[u32], want: usize, mut less: F) -> Vec<u32>
-where
-    F: FnMut(u32, u32) -> bool,
-{
-    for i in (0..heads.len() / 2).rev() {
-        sift_down(heads, i, &mut less);
+        less(&self.vals, keys, a, b)
     }
-    let mut out = Vec::with_capacity(want);
-    while out.len() < want {
-        let Some(&(pos, run)) = heads.first() else { break };
-        out.push(pos);
-        let next = pos + 1;
-        if next < ends[run as usize] {
-            heads[0] = (next, run);
-            sift_down(heads, 0, &mut less);
-        } else {
-            // The run is spent. Moving the tail into the root is the standard
-            // shrink; when it *is* the root the pop already emptied the heap.
-            let last = heads.pop().unwrap_or_default();
-            if !heads.is_empty() {
-                heads[0] = last;
-                sift_down(heads, 0, &mut less);
-            }
-        }
-    }
-    out
 }
 
 fn sift_down<F>(h: &mut [(u32, u32)], mut i: usize, less: &mut F)
@@ -809,10 +1248,12 @@ pub(crate) struct RunSet {
     block_rows: usize,
     row_bytes: usize,
     rows: usize,
+    /// This operator's share of the query's memory budget; see [`share_of`].
+    budget: usize,
 }
 
 impl RunSet {
-    pub(crate) fn new() -> Result<RunSet> {
+    pub(crate) fn new(budget: usize) -> Result<RunSet> {
         Ok(RunSet {
             dir: spill::SpillDir::new()?,
             runs: Vec::new(),
@@ -820,6 +1261,7 @@ impl RunSet {
             block_rows: BLOCK_SIZE,
             row_bytes: 1,
             rows: 0,
+            budget,
         })
     }
 
@@ -831,7 +1273,7 @@ impl RunSet {
         if self.schema.is_none() {
             self.schema = Some(spill::schema_of(b));
             self.row_bytes = (b.bytes() / b.rows().max(1)).max(1);
-            self.block_rows = spill_block_rows(ctx, self.row_bytes);
+            self.block_rows = spill_block_rows(self.budget, self.row_bytes);
         }
         let mut w = self.dir.create()?;
         let mut s = 0;
@@ -867,9 +1309,42 @@ impl RunSet {
 /// what lets a query with a 200 KiB budget spill *and then merge* instead of
 /// trading one out-of-memory error for another; the cost is smaller output
 /// batches, which the pipeline already tolerates.
-fn spill_block_rows(ctx: &QueryContext, row_bytes: usize) -> usize {
-    let budget = ctx.mem.limit().max(0) as usize;
+fn spill_block_rows(budget: usize, row_bytes: usize) -> usize {
     (budget / (row_bytes * 8)).clamp(64, BLOCK_SIZE)
+}
+
+/// This operator's share of the query's memory budget: what it was holding
+/// when the budget ran out.
+///
+/// The [`MemTracker`](super::MemTracker) is one atomic for the whole query, so
+/// the *reservations* were already query-wide. Every size **derived** from it
+/// was not: `ctx.mem.limit()` is the budget of the query, and a spilling
+/// operator that reads it is claiming the whole thing for itself. Under the
+/// exchange there are fourteen of them at once, so fourteen sorts each sized
+/// their merge fan-in and their spilled blocks as though they owned all of it
+/// -- and the fan-in is the memory the merge is *about to* allocate, so the
+/// arithmetic that was supposed to make a spilled sort fit instead guaranteed
+/// it would not.
+///
+/// The share is taken from the guard rather than from a worker count because
+/// the guard already knows: at the moment of the spill, `held` is what this
+/// operator got out of the shared budget before it ran out. Serial, that is
+/// nearly the whole budget and the sizing is what it always was; fourteen ways,
+/// it is a fourteenth of it; and with a join build side already holding half
+/// the budget it is a fourteenth of what is *left*, which no worker count would
+/// have told us. The floor keeps a starved operator from computing a zero-sized
+/// buffer.
+///
+/// It is a snapshot, and that is its limit: *when* a worker ran out depends on
+/// how the fourteen threads interleaved, so two workers of one query can take
+/// very different shares from it. That is tolerable for the spilled block size,
+/// which only decides how much of a run is resident at a time, and it is not
+/// tolerable for the merge fan-in, which decides how much a worker is about to
+/// allocate -- so [`fanin`] asks the budget what is left instead of asking
+/// this.
+#[inline]
+pub(crate) fn share_of(guard: &MemGuard) -> usize {
+    guard.held().max(8 << 10)
 }
 
 /// Where one sort key's values live inside a spilled block.
@@ -1181,17 +1656,28 @@ fn less(heads: &[Value], keys: &[SortKey], a: u32, b: u32) -> bool {
 
 /// How many runs may be open at once.
 ///
-/// Each open run holds one spilled block, charged at two here so an
-/// expression sort key's evaluated column has somewhere to live. The fan-in is
-/// therefore a memory question and it answers it out of the same budget
-/// everything else here comes from: a tight budget merges two runs at a time
-/// and takes more passes,
-/// a generous one merges 64 and takes a single pass. Capped at 64 because past
-/// that the heap stops fitting in cache and the sift costs more than the extra
-/// pass it saves.
+/// Each open run holds one spilled block, charged at two here so an expression
+/// sort key's evaluated column has somewhere to live. The fan-in is therefore a
+/// memory question: a tight budget merges two runs at a time and takes more
+/// passes, a generous one merges 64 and takes a single pass. Capped at 64
+/// because past that the heap stops fitting in cache and the sift costs more
+/// than the extra pass it saves.
+///
+/// It asks the budget what is **left**, not what this operator's share of it
+/// was. The sort buffer's own reservation is released before the merge opens
+/// (see [`Sort::materialize_all`]), so `limit - used` at this moment is real
+/// headroom, and under the exchange it is the only number that knows the other
+/// thirteen workers exist. Sizing from a share snapshotted at the first spill
+/// instead is what made a 14-way spilling `ORDER BY` fail at 64 MiB under load
+/// and pass without it: every worker chose a fan-in as though it were alone,
+/// and fourteen of those do not fit. This is not a race-free answer -- workers
+/// that open together still see the same headroom -- but it is self-correcting
+/// where the snapshot was self-reinforcing, and the residual is what
+/// `outsideMyFiles` asks the exchange to close by telling operators the degree.
 fn fanin(ctx: &QueryContext, set: &RunSet) -> usize {
     let per_run = 2 * set.block_rows * set.row_bytes;
-    (((ctx.mem.limit().max(0) as usize) / 2) / per_run.max(1)).clamp(2, 64)
+    let free = (ctx.mem.limit().saturating_sub(ctx.mem.used())).max(0) as usize;
+    ((free.min(set.budget) / 2) / per_run.max(1)).clamp(2, 64)
 }
 
 /// Collapse `set` to at most `fanin` runs by merging groups of them.
@@ -1202,7 +1688,7 @@ fn fanin(ctx: &QueryContext, set: &RunSet) -> usize {
 /// it has been consumed so peak disk stays near one copy of the relation
 /// rather than two.
 fn merge_pass(set: RunSet, keys: &[SortKey], ctx: &QueryContext, fanin: usize) -> Result<RunSet> {
-    let mut out = RunSet::new()?;
+    let mut out = RunSet::new(set.budget)?;
     out.rows = set.rows;
     out.schema = set.schema.clone();
     out.block_rows = set.block_rows;
@@ -1215,6 +1701,7 @@ fn merge_pass(set: RunSet, keys: &[SortKey], ctx: &QueryContext, fanin: usize) -
             block_rows: set.block_rows,
             row_bytes: set.row_bytes,
             rows: set.rows,
+            budget: set.budget,
         };
         let mut m = RunMerge::over(part, keys, ctx)?;
         let mut w = out.dir.create()?;

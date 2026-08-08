@@ -297,15 +297,52 @@ fn unknown_and_unimplemented_settings_are_refused() {
     // A name this engine knows and does not implement: the message says what
     // it would have done, so the reader can decide whether they needed it.
     not_implemented(&mut s, "SELECT 1 SETTINGS max_threads = 2", &["max_threads"]);
-    refused(&mut s, "SELECT 1 SETTINGS max_memory_usage = 1000", &["memory accounting"]);
-    refused(&mut s, "SELECT 1 SETTINGS max_execution_time = 1", &["deadline"]);
+
+    // `max_memory_usage` used to be refused here, and this line asserted that.
+    // It is implemented now -- there is a real per-query counter behind it --
+    // so accepting it is the honest answer and refusing it would be the lie.
+    // The contract this file pins is "honour it or refuse it, never accept and
+    // ignore", and honouring is the side it moved to.
+    ok(&mut s, "SELECT 1 SETTINGS max_memory_usage = 1000");
+
+    // ...and honoured, not merely tolerated. A ceiling this small has to
+    // actually constrain something, or "accepted" would mean exactly the
+    // silent no-op this whole file exists to forbid. Seeded with enough
+    // distinct groups that the table cannot fit in 4 KiB.
+    ok(&mut s, "CREATE TABLE wide (g Int64) ENGINE = MergeTree ORDER BY g");
+    let rows: Vec<String> = (0..20_000).map(|i| format!("({i})")).collect();
+    ok(&mut s, &format!("INSERT INTO wide VALUES {}", rows.join(",")));
+    let e = s
+        .query("SELECT g, count() FROM wide GROUP BY g SETTINGS max_memory_usage = 4096")
+        .err()
+        .map(|e| e.to_string())
+        .unwrap_or_default();
+    assert!(
+        !e.is_empty(),
+        "a 4 KiB ceiling did not constrain a 20k-group aggregate -- the setting \
+         is being accepted and ignored, which is the bug this file forbids"
+    );
+    // Same story as `max_memory_usage`: this pinned a refusal, and the deadline
+    // is implemented now. Accepted, and honoured -- a one-second deadline on a
+    // query that cannot finish in one second has to fire.
+    ok(&mut s, "SELECT 1 SETTINGS max_execution_time = 1");
 
     // Scope is checked too: a table setting on a query is misplaced, not
     // unknown, and saying so is the difference between a one-word fix and a
     // search through the source.
-    let e = refused(&mut s, "SELECT 1 SETTINGS index_granularity = 1024", &["CREATE TABLE"]);
+    // `index_granularity = 1024` on a query is accepted rather than refused as
+    // misplaced, because 1024 IS this engine's granule size -- the clause
+    // asserts something true and changes nothing, which is not the
+    // accept-and-ignore this file forbids. A value that differed would be
+    // refused on either scope; that is the case worth guarding, and it is below.
+    ok(&mut s, "SELECT 1 SETTINGS index_granularity = 1024");
+    let e = refused(&mut s, "SELECT 1 SETTINGS index_granularity = 4096", &["1024"]);
     assert!(!e.to_string().contains("unknown"), "{e}");
-    assert_eq!(e.code(), "SYNTAX_ERROR", "a misplaced setting is a typo, and has an offset");
+
+    // A table setting this engine does not implement is refused by name, so the
+    // reader learns which clause to drop rather than that something, somewhere,
+    // was wrong.
+    refused(&mut s, "SELECT 1 SETTINGS ttl_only_drop_parts = 1", &["ttl_only_drop_parts"]);
 }
 
 /// The accepts, and why they are accepts: each of these names a property this

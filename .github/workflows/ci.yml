@@ -1,0 +1,74 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # 04:00 UTC daily, for the soak job below.
+    - cron: '0 4 * * *'
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # The differential harness diffs generated SQL against the sqlite3 CLI.
+      # It skips loudly rather than failing when sqlite3 is absent, so this
+      # step is what makes the oracle actually run in CI.
+      - name: Install sqlite3
+        run: |
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            sudo apt-get update && sudo apt-get install -y sqlite3
+          else
+            command -v sqlite3 || brew install sqlite
+          fi
+
+      - run: cargo build --all-targets
+      - run: cargo test --release
+
+  # Advisory, not gating, and deliberately so. The tree carries 125 clippy
+  # warnings and has never been rustfmt-formatted; turning either into a gate
+  # today would mean a 60k-line reflow in the same commit as the first public
+  # push, which would make the history unreviewable and would reflow comments
+  # this codebase treats as load-bearing (they carry measurements, rejected
+  # alternatives and invariants, not restatements of the code). Tracked as debt
+  # to be paid down deliberately, not laundered through a formatter.
+  lint:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --all-targets
+      - run: cargo fmt --check
+
+  # The randomized suites find things a fixed corpus cannot, but they are too
+  # slow to gate a push on. Nightly, and on demand.
+  soak:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y sqlite3
+      - name: Differential soak against sqlite
+        run: GRANULAR_DIFF_CASES=200000 cargo test --release --test differential
+      - name: Fuzz soak
+        run: GRANULAR_FUZZ_CASES=200000 cargo test --release --test robustness

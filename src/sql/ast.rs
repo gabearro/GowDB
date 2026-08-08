@@ -794,6 +794,9 @@ pub enum ExplainKind {
     Pipeline,
     /// Parsed AST, pre-binding.
     Ast,
+    /// Physical operator tree, **executed**, annotated with the rows and time
+    /// each operator actually cost. The only kind that runs the statement.
+    Analyze,
 }
 
 #[derive(Clone, PartialEq, Debug)]

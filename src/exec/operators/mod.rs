@@ -446,6 +446,13 @@ pub fn build_physical<'a>(
         }
         PhysicalPlan::Values { rows, schema } => Box::new(values::Values::new(rows, schema)),
         PhysicalPlan::Empty { schema } => Box::new(values::Empty::new(schema)),
+        // The serial builder cannot honour a fleet, so it builds the subtree
+        // and drops the request. Only `exchange::build` runs an `Exchange`, and
+        // `physical::lower` only emits one where that builder will see it --
+        // this arm is what the *other* callers (`INSERT ... SELECT`, a `UNION`
+        // branch) fall into, and dropping the node there is why their plans are
+        // lowered with parallelism switched off rather than lied about.
+        PhysicalPlan::Exchange { input, .. } => build_physical(*input, catalog, ctx)?,
     })
 }
 
