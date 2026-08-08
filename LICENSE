@@ -1,0 +1,14 @@
+granular is dual-licensed under either of
+
+  * Apache License, Version 2.0 ....... LICENSE-APACHE  (http://www.apache.org/licenses/LICENSE-2.0)
+  * MIT license ....................... LICENSE-MIT     (http://opensource.org/licenses/MIT)
+
+at your option. This is the convention the Rust ecosystem uses, and it exists
+so you can pick whichever fits your situation: Apache-2.0 carries an explicit
+patent grant, which matters here because the engine implements a good deal of
+encoding and indexing technique of its own; MIT is shorter and has no NOTICE
+obligation. You do not have to tell anyone which you chose.
+
+Unless you explicitly state otherwise, any contribution intentionally submitted
+for inclusion in this work by you, as defined in the Apache-2.0 license, shall
+be dual licensed as above, without any additional terms or conditions.

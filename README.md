@@ -543,3 +543,14 @@ src/
 benches/engine.rs
 tests/
 ```
+
+## License
+
+Dual-licensed under [Apache License 2.0](LICENSE-APACHE) or
+[MIT](LICENSE-MIT), at your option — the Rust ecosystem convention.
+
+Apache-2.0 is there for the explicit patent grant, which is worth more than
+usual for this project: the engine hand-rolls its own frame-of-reference bit
+packing, CHD minimal perfect hashing, split-block bloom filters, learned rank
+indexes and an LZ4 codec. MIT is there because it is shorter and imposes no
+`NOTICE` obligation. Take whichever suits you; you need not say which.
