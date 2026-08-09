@@ -360,7 +360,7 @@ pub fn table_doc(def: &TableDef, parts: &[String], wal_committed: u64) -> Vec<u8
 /// content at all), while the per-table copy keeps a table directory
 /// self-describing, so a single part tree can be recovered even if the root
 /// file is lost.
-pub fn catalog_doc(roster: &[(String, Vec<TableDef>)]) -> Vec<u8> {
+pub fn catalog_doc(roster: &[(String, Vec<TableDef>)], instance: u64) -> Vec<u8> {
     let mut w = Writer::with_capacity(512);
     w.varint(roster.len() as u64);
     for (db, defs) in roster {
@@ -370,6 +370,11 @@ pub fn catalog_doc(roster: &[(String, Vec<TableDef>)]) -> Vec<u8> {
             put_table_def(&mut w, d);
         }
     }
+    // The data directory's identity, and the *last* field on purpose: a
+    // `CATALOG` written before this field existed simply ends here, and its
+    // reader takes the absence as "unstamped" rather than as damage. No
+    // version bump, and no rewrite of anybody's directory.
+    w.u64(instance);
     doc(&w.finish())
 }
 

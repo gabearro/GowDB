@@ -116,7 +116,7 @@ use crate::storage::part::{Deletes, Snapshot};
 use crate::storage::{Part, Stats};
 use crate::types::{Block, Column, ColumnBuilder, Schema, Value};
 
-use super::{Operator, ScanStats};
+use super::{Operator, QueryContext, ScanStats};
 
 pub struct Scan<'a> {
     node: &'a ScanNode,
@@ -129,10 +129,15 @@ pub struct Scan<'a> {
     /// Survivors waiting to reach [`BLOCK_SIZE`].
     acc: Option<Block>,
     stats: ScanStats,
+    ctx: &'a QueryContext,
 }
 
 impl<'a> Scan<'a> {
-    pub fn new(node: &'a ScanNode, catalog: &'a Catalog) -> Result<Scan<'a>> {
+    pub fn new(
+        node: &'a ScanNode,
+        catalog: &'a Catalog,
+        ctx: &'a QueryContext,
+    ) -> Result<Scan<'a>> {
         let table = catalog.table_by_path(&node.table)?;
         let ncols = table.schema().len();
         for &c in &node.projection {
@@ -151,6 +156,7 @@ impl<'a> Scan<'a> {
             sel: Vec::new(),
             acc: None,
             stats: ScanStats::default(),
+            ctx,
         })
     }
 
@@ -215,8 +221,22 @@ impl Operator for Scan<'_> {
             let gi = self.granule;
             self.granule += 1;
 
+            // The cancel/deadline checkpoint, on the `continue` arms ONLY.
+            //
+            // This loop is *not* 1:1 with the blocks it hands upstream: it
+            // prunes granules and coalesces survivors to `BLOCK_SIZE`, so one
+            // `next()` can consume the whole table without ever returning --
+            // which is precisely what `WHERE <matches nothing>` does once the
+            // optimizer has pushed the predicate into PREWHERE, leaving no
+            // `Filter` above to check on its behalf. The arm that fills `acc`
+            // and returns is untouched, so a scan that produces rows executes
+            // no extra instruction and stays covered by the caller's per-block
+            // check. A skipped granule has already paid a zonemap evaluation
+            // or a full decode plus predicates over up to 8192 rows; one
+            // relaxed load against that is not measurable.
             if self.prunes(p, gi) {
                 self.stats.granules_pruned += 1;
+                self.ctx.check()?;
                 continue;
             }
             self.stats.granules_read += 1;
@@ -226,6 +246,7 @@ impl Operator for Scan<'_> {
             let mut blk = p.read_columns(gi, &self.node.projection, live)?;
             self.stats.rows_read += blk.rows() as u64;
             if blk.rows() == 0 {
+                self.ctx.check()?;
                 continue;
             }
 
@@ -240,6 +261,7 @@ impl Operator for Scan<'_> {
                 }
             }
             if blk.rows() == 0 {
+                self.ctx.check()?;
                 continue;
             }
 
@@ -1015,12 +1037,14 @@ mod tests {
             zone_filters: node.zone_filters.clone(),
         }));
         // Build directly so the borrow lives long enough for the assertions.
+        let ctx = QueryContext::new();
         let mut op = Scan::new(
             match &plan {
                 LogicalPlan::Scan(s) => s,
                 _ => unreachable!(),
             },
             cat,
+            &ctx,
         )
         .unwrap();
         let mut out = Vec::new();
@@ -1275,7 +1299,7 @@ mod tests {
             filters: vec![],
             zone_filters: vec![],
         };
-        assert!(Scan::new(&n, &c).is_err());
+        assert!(Scan::new(&n, &c, &QueryContext::new()).is_err());
     }
 
     #[test]
@@ -1283,7 +1307,7 @@ mod tests {
         let c = catalog_with_rows(1);
         let mut n = node(vec![0], &c);
         n.projection = vec![99];
-        assert!(Scan::new(&n, &c).is_err());
+        assert!(Scan::new(&n, &c, &QueryContext::new()).is_err());
     }
 
     #[test]

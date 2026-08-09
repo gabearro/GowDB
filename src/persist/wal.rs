@@ -313,6 +313,38 @@ const HORIZON_FILE: &str = "HORIZON";
 /// do not have when it happens.
 pub const DEFAULT_ARCHIVE_BYTES: u64 = 64 << 20;
 
+/// Default `wal_fold_bytes`: the per-table log size that triggers the only
+/// automatic checkpoint this engine has.
+///
+/// 64 MiB, and the number is an argument rather than a round figure.
+///
+///   * A fold is [`crate::session::Session::fold_to_parts`]: a `flush` of the
+///     buffered delta into a part, a `write_table` rewrite of the table's part
+///     manifest, and a log truncate. So its cost is O(*delta* + *parts*), not
+///     O(*log*) and -- correcting what this comment used to claim -- not
+///     O(*table rows*) either. It is still the wrong shape to pay often: the
+///     manifest rewrite and the fsyncs are per fold, not per byte, so a small
+///     threshold pays a fixed price over and over for a few megabytes of log.
+///     That is the argument for a large number, and why "checkpoint every
+///     commit" is not the answer.
+///   * Measured, and it is not free: 4 x 2M-row `INSERT ... SELECT` in one
+///     process ran **1.069x** slower at this default than at
+///     `wal_fold_bytes = 0` (best-of-5, interleaved, one binary with the
+///     feature toggled). It does not compound -- part count and on-disk size
+///     came out identical either way. Sustained bulk writers who checkpoint on
+///     their own schedule should set 0 and know why.
+///   * It matches [`DEFAULT_ARCHIVE_BYTES`], so one fold publishes roughly one
+///     archive segment's worth and retention keeps a few of them.
+///   * At the ~73 bytes per row a narrow table logs, it caps replay at about
+///     900k rows -- a bounded, sub-second recovery -- while a wide table hits
+///     it sooner, which is the right direction: wide rows are what make replay
+///     slow.
+///
+/// 0 disables it, which is exactly what the engine did before this existed and
+/// is kept reachable for a workload that would rather checkpoint on its own
+/// schedule.
+pub const DEFAULT_FOLD_BYTES: u64 = 64 << 20;
+
 /// The live retention budget. 0 disables archiving entirely.
 ///
 /// Process-global rather than per-session, which is the opposite of how
@@ -769,9 +801,20 @@ impl Wal {
         // writer's, and framing cannot recover from that the way it recovers
         // from a short tail. A *batch* in one call is the same guarantee, one
         // syscall wider.
-        self.file
-            .write_all(bytes)
-            .map_err(|e| store::io_err("append to", &self.path, e))?;
+        if let Err(e) = self.file.write_all(bytes) {
+            // A `write_all` that fails part-way still wrote what it wrote --
+            // ENOSPC on a 12 MiB volume left 53236 bytes behind from a call
+            // that returned `Err`. The file is O_APPEND, so leaving `self.len`
+            // at the pre-write value does not merely mis-report the length: a
+            // later successful append lands at the real end of the file while
+            // the LSN handed back names the torn offset, and `rewind_to` then
+            // sees `lsn >= self.len` and declines to truncate. One `fstat` on
+            // a path that has already failed restores the invariant the rest
+            // of the type is written against, and the original error is what
+            // the caller still gets.
+            self.len = self.file.metadata().map_or(self.len, |m| m.len());
+            return Err(store::io_err("append to", &self.path, e));
+        }
         self.len += bytes.len() as u64;
         self.dirty = true;
         Ok(lsn)
@@ -958,7 +1001,11 @@ impl Wal {
                 Ok(()) | Err(_) => {}
             }
         }
-        match std::fs::hard_link(&self.path, &seg) {
+        // A copy where the filesystem has no links. Equivalent here and not
+        // merely tolerable: `truncate` publishes the replacement log through a
+        // *rename*, so the segment never shared this name's fate anyway, and
+        // nothing has appended since the tick and `fsync` above.
+        match store::link_or_copy(&self.path, &seg) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                 let there = std::fs::metadata(&seg)
@@ -1478,6 +1525,16 @@ fn sealed(dir: &Path) -> Result<Vec<(u64, u64)>> {
 fn newest_seal(dir: &Path) -> Option<Span> {
     let (origin, _) = *sealed(dir).ok()?.last()?;
     read_seal(dir, origin).ok()?.map(|(span, _)| span)
+}
+
+/// [`horizon`] for one table, by name: the highest recovery LSN its archive
+/// has already pruned away, and therefore the oldest instant a point-in-time
+/// recovery of it can still reach. 0 means nothing has been pruned.
+///
+/// The one thing about an archive an operator cannot infer from `ls`, which is
+/// why it is the column `system.wal` carries.
+pub fn archive_horizon(root: &Path, db: &str, table: &str) -> Result<u64> {
+    horizon(&archive_dir(root, db, table))
 }
 
 /// The highest recovery LSN this table's archive no longer holds.

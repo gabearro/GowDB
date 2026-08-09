@@ -70,6 +70,7 @@ pub enum Kind {
     Columns,
     Settings,
     QueryLog,
+    Wal,
     InfoTables,
     InfoColumns,
 }
@@ -93,6 +94,7 @@ pub fn classify(name: &ObjectName, catalog: &Catalog) -> Option<Kind> {
             ("columns", Kind::Columns),
             ("settings", Kind::Settings),
             ("query_log", Kind::QueryLog),
+            ("wal", Kind::Wal),
         ])?
     } else if db.eq_ignore_ascii_case(INFO_SCHEMA_DB) {
         match_lower(name.last(), &[
@@ -389,6 +391,35 @@ const QUERY_LOG: Columns = &[
     ("error", Text),
 ];
 
+/// Durability, per table, as an operator has to reason about it: how much log
+/// is unfolded, how far recovery would have to replay, when the parts were
+/// last written, and how much history the archive still holds.
+///
+/// A table of its own rather than columns on `system.tables`, and that is the
+/// design decision worth stating: every column here costs at least a `stat`
+/// and `segments` costs a `read_dir`, so hanging them off `system.tables`
+/// would put filesystem I/O on a query people run to see their schema.
+const WAL: Columns = &[
+    ("database", Text),
+    ("table", Text),
+    // Bytes in the live log, and the offset the parts already cover. Their
+    // difference is exactly what a crash would replay.
+    ("wal_bytes", Num),
+    ("wal_committed", Num),
+    ("replay_bytes", Num),
+    ("last_checkpoint", Time),
+    // The archive: segment count, their total size, the recovery-LSN range
+    // they span, and the horizon below which pruning has already discarded.
+    ("segments", Num),
+    ("archive_bytes", Num),
+    ("archive_first_seq", Num),
+    ("archive_last_seq", Num),
+    ("horizon_seq", Num),
+    // 1 when this table's live log holds records the archive does not, i.e.
+    // when a point-in-time recovery cannot yet reach the present.
+    ("lags", Num),
+];
+
 const INFO_TABLES: Columns = &[
     ("table_catalog", Text),
     ("table_schema", Text),
@@ -419,6 +450,7 @@ pub fn schema_of(kind: Kind) -> Columns {
         Kind::Columns => COLUMNS,
         Kind::Settings => SETTINGS,
         Kind::QueryLog => QUERY_LOG,
+        Kind::Wal => WAL,
         Kind::InfoTables => INFO_TABLES,
         Kind::InfoColumns => INFO_COLUMNS,
     }
@@ -438,6 +470,7 @@ fn rows_of(
         // otherwise pay for a settings snapshot it never looks at.
         Kind::Settings => settings_rows(&settings.snapshot())?,
         Kind::QueryLog => query_log(log),
+        Kind::Wal => wal(catalog)?,
         Kind::InfoTables => info_tables(catalog)?,
         Kind::InfoColumns => columns(catalog, true)?,
     };
@@ -532,6 +565,69 @@ fn tables(catalog: &Catalog) -> Result<Vec<Vec<Value>>> {
             _ => [num(0), num(0), num(0), num(0), num(0), num(1)],
         };
         out.push(head.into_iter().chain(body).collect());
+    }
+    Ok(out)
+}
+
+/// One row per table with a directory on disk.
+///
+/// Every number here comes from a `stat` or a `read_dir` on files that already
+/// exist -- nothing is cached, and nothing is computed unless this table is
+/// selected. An in-memory session has no directory and so no rows, which is
+/// the honest answer rather than a screenful of zeroes.
+///
+/// Damage is *not* a reason to skip a table. A quarantined table is exactly
+/// the one whose log an operator needs the size of at 3am, and none of these
+/// readings goes through the parts that failed to decode.
+fn wal(catalog: &Catalog) -> Result<Vec<Vec<Value>>> {
+    let Some(root) = catalog.dir() else { return Ok(Vec::new()) };
+    let mut out = Vec::new();
+    for (db, name) in roster(catalog)? {
+        let tdir = root.join(&db).join(&name);
+        let log = tdir.join(crate::persist::store::WAL_FILE);
+        let wal_bytes = std::fs::metadata(&log).map_or(0, |m| m.len());
+        // The `TABLE` file's own header, not `read_table_image`: the watermark
+        // is in the first few bytes and reading the image would decode every
+        // part file to find it.
+        let table_file = tdir.join(crate::persist::store::TABLE_FILE);
+        let meta = std::fs::metadata(&table_file);
+        let committed = std::fs::read(&table_file)
+            .ok()
+            .and_then(|b| crate::persist::reader::table_parts_from_bytes(&b).ok())
+            .map_or(0, |(_, _, c)| c);
+        // Seconds, because `Value::DateTime` is seconds and a checkpoint is
+        // not a sub-second event. 0 for a table that has never been written.
+        let checkpointed = meta
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map_or(0, |d| d.as_secs());
+        let segs = crate::persist::wal::segments(root, &db, &name).unwrap_or_default();
+        let archive_bytes: u64 = segs.iter().map(|s| s.end - s.origin).sum();
+        let first = segs.first().map_or(0, |s| s.span.first_seq);
+        let last = segs.last().map_or(0, |s| s.span.last_seq);
+        let horizon = crate::persist::wal::archive_horizon(root, &db, &name).unwrap_or(0);
+        // An empty log is a header and nothing else; anything longer is a
+        // record the archive will not hold until the next checkpoint.
+        let empty = crate::persist::format::HEADER_LEN as u64;
+        let lags = !segs.is_empty() && wal_bytes > empty;
+        out.push(vec![
+            text(&db),
+            text(&name),
+            Value::UInt(wal_bytes),
+            Value::UInt(committed),
+            // What a crash right now would have to replay. `committed` is 0 on
+            // a table that has never been checkpointed, and the log's own
+            // header is not a record, so the floor is the header length.
+            Value::UInt(wal_bytes.saturating_sub(committed.max(empty))),
+            Value::DateTime(checkpointed as i64),
+            num(segs.len()),
+            Value::UInt(archive_bytes),
+            Value::UInt(first),
+            Value::UInt(last),
+            Value::UInt(horizon),
+            Value::UInt(lags as u64),
+        ]);
     }
     Ok(out)
 }

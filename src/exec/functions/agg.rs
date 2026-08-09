@@ -1076,6 +1076,12 @@ impl Accumulator for HllAcc {
     fn boxed_clone(&self) -> Box<dyn Accumulator> {
         Box::new(HllAcc::new())
     }
+    /// `HLL_M` bytes, for every group, from construction to the end of the
+    /// query -- 16 KiB against the flat 48 the budget used to assume. At
+    /// 100,000 groups that is 1.6 GiB the budget could not see.
+    fn heap_bytes(&self) -> usize {
+        self.regs.capacity()
+    }
 }
 
 // ------------------------------------------------------------- groupArray
@@ -1579,6 +1585,10 @@ impl Accumulator for CondAcc {
     }
     fn boxed_clone(&self) -> Box<dyn Accumulator> {
         Box::new(CondAcc { inner: self.inner.boxed_clone() })
+    }
+    /// Delegated, or `uniqIf` would be the hole `uniq` no longer is.
+    fn heap_bytes(&self) -> usize {
+        self.inner.heap_bytes()
     }
 }
 

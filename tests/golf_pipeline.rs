@@ -315,7 +315,7 @@ fn a_keyless_limit_returns_input_order_and_gives_its_budget_back() {
 
     let ctx = QueryContext::new();
     let mut op: Box<dyn operators::Operator> = Box::new(operators::sort::Sort::top_k(
-        Box::new(operators::scan::Scan::new(&node, cat).unwrap()),
+        Box::new(operators::scan::Scan::new(&node, cat, &ctx).unwrap()),
         &no_keys,
         5,
         &ctx,
@@ -338,7 +338,7 @@ fn a_keyless_limit_returns_input_order_and_gives_its_budget_back() {
     // hand back everything it charged either way.
     let tight = QueryContext::with_budget(64 << 10);
     let mut op: Box<dyn operators::Operator> = Box::new(operators::sort::Sort::top_k(
-        Box::new(operators::scan::Scan::new(&node, cat).unwrap()),
+        Box::new(operators::scan::Scan::new(&node, cat, &tight).unwrap()),
         &no_keys,
         5,
         &tight,
@@ -366,12 +366,14 @@ fn the_general_projection_paths_still_run() {
         Field::new("x", DataType::Int64),
         Field::new("y", DataType::Int64),
     ]);
+    let pctx = QueryContext::new();
     macro_rules! project {
         ($exprs:expr, $sch:expr) => {
             operators::project::Project::new(
                 Box::new(operators::values::Values::new(&rows, &s)),
                 $exprs,
                 $sch,
+                &pctx,
             )
         };
     }

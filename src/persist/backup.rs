@@ -183,11 +183,17 @@ pub struct Report {
 /// point leaves either no archive or a complete one -- never the half file that
 /// a `cp` interrupted at the wrong moment leaves, which is the failure this
 /// whole module exists to replace.
+///
+/// `instance` is the identity of the data directory being archived; a restore
+/// that rolls this archive forward checks it against the directory whose log
+/// it is reading, and 0 means "this database was never stamped", which no
+/// check can act on.
 pub fn write_archive(
     path: &Path,
     dbs: &[String],
     src: &[Source<'_>],
     base: Option<&Path>,
+    instance: u64,
 ) -> Result<Report> {
     // The base is opened first, so a typo in its path fails before anything is
     // written and the operator still has the archive they meant to extend.
@@ -231,6 +237,10 @@ pub fn write_archive(
             }
         }
 
+        // Last field in the body, so an archive from a build without it simply
+        // ends after the databases and decodes as "unstamped". No version
+        // bump, and every existing `.gbak` still restores.
+        man.u64(instance);
         let body = man.finish();
         let at = sink.pos;
         sink.frame(&body)?;
@@ -392,6 +402,12 @@ struct Manifest {
     /// smaller one is already inside the parts this archive holds.
     boundary: u64,
     dbs: Vec<(String, Vec<ArchivedTable>)>,
+    /// The identity of the data directory this was taken from, or 0 for an
+    /// archive written before the field existed. `boundary` alone cannot tell
+    /// two databases apart -- it is a counter that starts at 1 everywhere --
+    /// so without this a point-in-time recovery will happily roll one
+    /// database's archived log forward onto another's parts.
+    instance: u64,
 }
 
 struct ArchivedTable {
@@ -549,7 +565,10 @@ fn decode_manifest(buf: &[u8]) -> Result<Manifest> {
         }
         dbs.push((name, tables));
     }
-    Ok(Manifest { base, created, boundary, dbs })
+    // Absent in archives written before the field existed; 0 there, and every
+    // reader of it treats 0 as "cannot say".
+    let instance = if r.is_empty() { 0 } else { r.u64()? };
+    Ok(Manifest { base, created, boundary, dbs, instance })
 }
 
 fn bounded(v: u64, what: &str) -> Result<usize> {
@@ -683,6 +702,28 @@ fn walk(chain: &Chain, f: OnPart<'_>, bad: &mut Vec<String>) -> Result<Report> {
 /// part decoded -- and a failure leaves the target as it was found, because
 /// nothing is written until the whole archive has passed.
 pub fn restore(path: &Path, into: &Path) -> Result<Report> {
+    let (rep, publish) = unpack(path, into)?;
+    publish()?;
+    Ok(rep)
+}
+
+/// [`restore`] up to but *not including* the root `CATALOG`, which is returned
+/// as a thunk for the caller to fire once it has finished writing.
+///
+/// The split is the whole of the torn-restore fix. `CATALOG` is this
+/// directory's single commit point: without it `Catalog::on_disk` refuses to
+/// open a directory that holds table data, with a diagnostic naming the tables
+/// it found. `restore` had that protection already -- a failure part-way
+/// through left no `CATALOG` and the next open said so -- and
+/// [`restore_until`] lost it by committing before its roll-forward loop, so a
+/// tear in the loop left a directory that opened clean with one table at the
+/// recovery target and the rest at the backup instant. Half a transaction,
+/// silently. Publishing last restores the guarantee for both callers, and it
+/// is a reordering: no marker file, no temp directory, no new failure mode.
+fn unpack<'a>(
+    path: &Path,
+    into: &'a Path,
+) -> Result<(Report, impl FnOnce() -> Result<bool> + 'a)> {
     if let Ok(md) = std::fs::metadata(into) {
         let occupied = md.is_dir()
             && std::fs::read_dir(into)
@@ -738,8 +779,16 @@ pub fn restore(path: &Path, into: &Path) -> Result<Report> {
         roster.push((db.clone(), defs));
     }
     // And the root catalog last of all, for the same reason one level up.
-    store::commit(&into.join(store::CATALOG_FILE), &writer::catalog_doc(&roster))?;
-    Ok(rep)
+    //
+    // The restored copy inherits the archive's instance id rather than minting
+    // one: restore-and-swap is the ordinary recovery, and a fresh id would
+    // make every archive the operator already holds foreign to the database
+    // they just recovered. An unstamped archive leaves 0, which the first
+    // checkpoint replaces.
+    let id = chain.mans[0].instance;
+    Ok((rep, move || {
+        store::commit(&into.join(store::CATALOG_FILE), &writer::catalog_doc(&roster, id))
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -768,21 +817,25 @@ pub fn restore_until(
     let end = wal::archive_end(data_root)?;
     check_target(archive, data_root, &man, &end, target)?;
 
-    let mut rep = restore(archive, into)?;
+    let (mut rep, publish) = unpack(archive, into)?;
     for (db, tables) in &man.dbs {
         for t in tables {
             let rec = wal::recover(data_root, db, &t.def.name, man.boundary, target)?;
             if rec.records == 0 {
                 continue;
             }
-            // Written last, after `restore` has published the parts and the
-            // commit record: a directory that holds a log and no commit record
-            // is one the loader would replay from the beginning of time.
+            // Written after the parts and each table's own commit record: a
+            // directory that holds a log and no commit record is one the
+            // loader would replay from the beginning of time.
             let tdir = into.join(db).join(&t.def.name);
             store::atomic_write(&tdir.join(store::WAL_FILE), &rec.bytes)?;
             rep.replayed += rec.records;
         }
     }
+    // Only now. A failure anywhere in the loop above leaves no root `CATALOG`,
+    // and the loader refuses a directory that holds table data without one --
+    // which is exactly the state a half-rolled-forward restore is in.
+    publish()?;
     Ok(rep)
 }
 
@@ -795,6 +848,37 @@ fn check_target(
     end: &wal::Span,
     target: Target,
 ) -> Result<()> {
+    // First, because it is the one refusal that says the operator is pointing
+    // at the wrong *database* rather than at the wrong instant of the right
+    // one -- and because every check below it is meaningless across two
+    // databases. `boundary` cannot tell them apart: it is a counter that
+    // starts at 1 in every data directory, so an archive from database A rolls
+    // forward against database B's log and reports success, having merged two
+    // unrelated tenants. Confirmed, and the reason this field exists.
+    //
+    // Only when *both* sides carry an id. A 0 on either side is a directory or
+    // an archive written before the field existed, and refusing on an identity
+    // nobody recorded would break every archive taken until today.
+    //
+    // What this does *not* catch, said plainly: a restore inherits the id it
+    // came from (see `unpack`), so a database and a restored copy of it that
+    // are both kept live share one identity and their archives stay mutually
+    // acceptable. Separating a fork would need a lineage chain, not an id, and
+    // inheriting is what makes the ordinary restore-and-swap keep working with
+    // the archives the operator already holds. Two databases with no common
+    // ancestor -- the confirmed failure -- are told apart.
+    let here = store::instance_at(data_root);
+    if here != 0 && man.instance != 0 && here != man.instance {
+        return Err(Error::storage(format!(
+            "{} was taken from a different database than {}: the archive is stamped \
+             {:016x} and that data directory is {here:016x}. Rolling it forward would \
+             replay one database's log onto another's parts and report success. Point \
+             `--data` at the directory this archive came from",
+            archive.display(),
+            data_root.display(),
+            man.instance
+        )));
+    }
     // A backup restores its own instant with no archive at all; asking for any
     // *other* instant needs one.
     if end.last_seq == 0 && target != Target::Latest {
@@ -997,7 +1081,7 @@ mod tests {
         let s = Scratch::new("bk-full");
         let tables = vec![sample_table("hits", &[600, 400]), sample_table("misc", &[120])];
         let arc = s.join("a.gbak");
-        let rep = write_archive(&arc, &roster(), &sources(&tables), None).unwrap();
+        let rep = write_archive(&arc, &roster(), &sources(&tables), None, 0).unwrap();
         assert_eq!(rep.tables, 2);
         assert_eq!(rep.parts, 3);
         assert_eq!(rep.reused, 0);
@@ -1025,7 +1109,7 @@ mod tests {
         let s = Scratch::new("bk-verify");
         let tables = vec![sample_table("hits", &[900])];
         let arc = s.join("a.gbak");
-        let rep = write_archive(&arc, &roster(), &sources(&tables), None).unwrap();
+        let rep = write_archive(&arc, &roster(), &sources(&tables), None, 0).unwrap();
         assert_eq!(verify(&arc).unwrap(), rep);
 
         // A byte in the middle of the first part body. The frame checksum has
@@ -1050,7 +1134,7 @@ mod tests {
         let s = Scratch::new("bk-trunc");
         let tables = vec![sample_table("hits", &[400])];
         let arc = s.join("a.gbak");
-        write_archive(&arc, &roster(), &sources(&tables), None).unwrap();
+        write_archive(&arc, &roster(), &sources(&tables), None, 0).unwrap();
         let mut bytes = std::fs::read(&arc).unwrap();
         bytes.truncate(bytes.len() - 32);
         let cut = s.join("cut.gbak");
@@ -1064,7 +1148,7 @@ mod tests {
         let s = Scratch::new("bk-occupied");
         let tables = vec![sample_table("hits", &[100])];
         let arc = s.join("a.gbak");
-        write_archive(&arc, &roster(), &sources(&tables), None).unwrap();
+        write_archive(&arc, &roster(), &sources(&tables), None, 0).unwrap();
         let out = s.join("live");
         std::fs::create_dir_all(&out).unwrap();
         std::fs::write(out.join("CATALOG"), b"pretend this is a database").unwrap();
@@ -1080,7 +1164,7 @@ mod tests {
         let s = Scratch::new("bk-incr");
         let mut t = sample_table("hits", &[600, 400]);
         let full = s.join("full.gbak");
-        let base_rep = write_archive(&full, &roster(), &sources(std::slice::from_ref(&t)), None).unwrap();
+        let base_rep = write_archive(&full, &roster(), &sources(std::slice::from_ref(&t)), None, 0).unwrap();
         assert_eq!(base_rep.parts, 2);
 
         // One more part; the first two are untouched.
@@ -1098,6 +1182,7 @@ mod tests {
                 &roster(),
                 &sources(std::slice::from_ref(&t)),
                 Some(Path::new("full.gbak")),
+                0,
             )
             .unwrap();
         assert_eq!(rep.parts, 3);
@@ -1119,9 +1204,9 @@ mod tests {
         let s = Scratch::new("bk-orphan");
         let t = sample_table("hits", &[600, 400]);
         let full = s.join("full.gbak");
-        write_archive(&full, &roster(), &sources(std::slice::from_ref(&t)), None).unwrap();
+        write_archive(&full, &roster(), &sources(std::slice::from_ref(&t)), None, 0).unwrap();
         let incr = s.join("incr.gbak");
-        write_archive(&incr, &roster(), &sources(std::slice::from_ref(&t)), Some(Path::new("full.gbak")))
+        write_archive(&incr, &roster(), &sources(std::slice::from_ref(&t)), Some(Path::new("full.gbak")), 0)
             .unwrap();
         std::fs::remove_file(&full).unwrap();
         let e = verify(&incr).expect_err("an orphaned incremental must not verify");
@@ -1134,7 +1219,7 @@ mod tests {
         let s = Scratch::new("bk-empty");
         let t = Table::new(table_def("t"), 1 << 20);
         let arc = s.join("a.gbak");
-        let rep = write_archive(&arc, &roster(), &sources(std::slice::from_ref(&t)), None).unwrap();
+        let rep = write_archive(&arc, &roster(), &sources(std::slice::from_ref(&t)), None, 0).unwrap();
         assert_eq!((rep.tables, rep.parts, rep.rows), (1, 0, 0));
         assert_eq!(verify(&arc).unwrap(), rep);
         let out = s.join("out");
@@ -1158,7 +1243,7 @@ mod tests {
         assert!(live < before, "the test deleted nothing");
 
         let arc = s.join("a.gbak");
-        let rep = write_archive(&arc, &roster(), &sources(std::slice::from_ref(&t)), None).unwrap();
+        let rep = write_archive(&arc, &roster(), &sources(std::slice::from_ref(&t)), None, 0).unwrap();
         assert_eq!(rep.rows, live as u64);
         let out = s.join("out");
         restore(&arc, &out).unwrap();
@@ -1176,7 +1261,7 @@ mod tests {
         let t = sample_table("hits", &[100]);
         let arc = s.join("a.gbak");
         let before = crate::persist::wal::commit_seq();
-        write_archive(&arc, &roster(), &sources(std::slice::from_ref(&t)), None).unwrap();
+        write_archive(&arc, &roster(), &sources(std::slice::from_ref(&t)), None, 0).unwrap();
         let at = boundary_of(&arc).unwrap();
         assert_eq!(at, before, "the boundary is the counter as it stood");
         assert!(at >= 1, "and it is never zero, so zero can mean `no tick`");
@@ -1196,7 +1281,7 @@ mod tests {
         let s = Scratch::new("bk-noarchive");
         let t = sample_table("hits", &[100]);
         let arc = s.join("a.gbak");
-        write_archive(&arc, &roster(), &sources(std::slice::from_ref(&t)), None).unwrap();
+        write_archive(&arc, &roster(), &sources(std::slice::from_ref(&t)), None, 0).unwrap();
 
         let root = s.join("root");
         let e = restore_until(&arc, &root, &s.join("out"), Target::Lsn(1))

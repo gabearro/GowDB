@@ -713,30 +713,77 @@ fn a_re_created_table_does_not_inherit_the_old_ones_constraints() {
     assert!(!rows(&dir, "SHOW TABLES").iter().any(|r| r == "_granular_ddl"));
 }
 
-/// The one write path that does not go through `run_insert` is the CSV bulk
-/// import, and it enforces nothing. It is refused rather than left as a door
-/// around the constraints -- and the refusal says why, so it is a limitation
-/// rather than a mystery. When `io::emit` routes its blocks through
-/// `Session::import_block`, this test is the one to invert.
+/// The inversion of `a_bulk_import_is_refused_while_the_database_has
+/// _constraints`, which is what this test used to be called.
+///
+/// The CSV bulk import was the one write path that did not go through
+/// `run_insert`: `io::emit` handed blocks straight to the catalog, so it
+/// enforced nothing, and the whole feature was therefore refused on any
+/// database holding a single constraint -- including imports into tables that
+/// had none. `emit` calls `Session::import_block` now, so the constraint is
+/// enforced where it belongs and the database-wide ban is gone.
 #[test]
-fn a_bulk_import_is_refused_while_the_database_has_constraints() {
+fn a_bulk_import_enforces_check_constraints() {
     let d = Scratch::new("import");
     let dir = d.s();
     let csv = format!("{dir}/rows.csv");
     std::fs::write(&csv, "id,v,s\n1,1,a\n2,-9,b\n").unwrap();
+    // The same rows without the column `k` does not have.
+    let bad = format!("{dir}/bad.csv");
+    std::fs::write(&bad, "id,v\n1,1\n2,-9\n").unwrap();
+    let good = format!("{dir}/good.csv");
+    std::fs::write(&good, "id,v\n3,3\n4,4\n").unwrap();
 
     run(&dir, "CREATE TABLE plain (id UInt64, v Int64, s String) ENGINE = MergeTree ORDER BY id")
         .ok();
-    // No constraints yet: the import works, which is what makes the refusal
-    // below about constraints rather than about imports.
-    run(&dir, &format!("INSERT INTO plain FROM INFILE '{csv}' FORMAT CSVWithNames")).ok();
-    assert_eq!(cell(&dir, "SELECT count() FROM plain"), "2");
-
     run(&dir, "CREATE TABLE k (id UInt64, v Int64 CHECK (v > 0)) ENGINE = MergeTree ORDER BY id")
         .ok();
-    run(&dir, &format!("INSERT INTO k FROM INFILE '{csv}' FORMAT CSVWithNames"))
-        .fails_with("does not enforce");
+
+    // The violating row fails the import, by the constraint's own message --
+    // not by a blanket "bulk load is not available here".
+    run(&dir, &format!("INSERT INTO k FROM INFILE '{bad}' FORMAT CSVWithNames"))
+        .fails_with("CHECK constraint");
     assert_eq!(cell(&dir, "SELECT count() FROM k"), "0");
+
+    // A file the constraint accepts loads, into the same constrained table.
+    run(&dir, &format!("INSERT INTO k FROM INFILE '{good}' FORMAT CSVWithNames")).ok();
+    assert_eq!(cell(&dir, "SELECT count() FROM k"), "2");
+
+    // And the unconstrained table in the same database is importable, which is
+    // exactly what the database-wide ban used to take away.
+    run(&dir, &format!("INSERT INTO plain FROM INFILE '{csv}' FORMAT CSVWithNames")).ok();
+    assert_eq!(cell(&dir, "SELECT count() FROM plain"), "2");
+}
+
+/// The other half of the bypass: a `UNIQUE` key was unenforced on the import
+/// path, so the ban covered it too. It is a real constraint now, and it holds
+/// both within one file and against rows an earlier statement stored.
+#[test]
+fn a_bulk_import_enforces_unique_keys() {
+    let d = Scratch::new("import-unique");
+    let dir = d.s();
+    let dupe = format!("{dir}/dupe.csv");
+    std::fs::write(&dupe, "id,v\n1,a\n2,b\n1,c\n").unwrap();
+    let uniq = format!("{dir}/uniq.csv");
+    std::fs::write(&uniq, "id,v\n1,a\n2,b\n3,c\n").unwrap();
+
+    run(
+        &dir,
+        "CREATE TABLE u (id UInt64, v String, UNIQUE (id)) \
+         ENGINE = MergeTree PRIMARY KEY id ORDER BY id",
+    )
+    .ok();
+    run(&dir, &format!("INSERT INTO u FROM INFILE '{dupe}' FORMAT CSVWithNames"))
+        .fails_with("shared with another row in the same statement");
+    assert_eq!(cell(&dir, "SELECT count() FROM u"), "0");
+
+    run(&dir, &format!("INSERT INTO u FROM INFILE '{uniq}' FORMAT CSVWithNames")).ok();
+    assert_eq!(cell(&dir, "SELECT count() FROM u"), "3");
+    // Against rows already stored, in a second process, so it is the key index
+    // answering and not session state.
+    run(&dir, &format!("INSERT INTO u FROM INFILE '{uniq}' FORMAT CSVWithNames"))
+        .fails_with("shared with a row already stored");
+    assert_eq!(cell(&dir, "SELECT count() FROM u"), "3");
 }
 
 /// A view stores a query, so it has no rows to write to -- and the error says

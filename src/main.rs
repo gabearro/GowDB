@@ -50,6 +50,9 @@ USAGE:
 
 OPTIONS:
     --data <DIR>     open a persistent database in DIR (default: in-memory)
+    --read-only      open --data under a shared lock: queries only, no writes,
+                     no checkpoint, and several of these (or a live writer) may
+                     hold the same directory at once
     -q, --query SQL  run SQL and exit
     -f, --file PATH  run the statements in PATH and exit
     --format FMT     output as `table` (default), `tsv` or `csv`
@@ -112,12 +115,17 @@ fn real_main() -> i32 {
         None => None,
     };
 
-    let mut session = match &args.dir {
-        Some(d) => match Session::open(d) {
-            Ok(s) => s,
-            Err(e) => return die(&e),
-        },
-        None => Session::in_memory(),
+    let opened = match (&args.dir, args.read_only) {
+        (Some(d), false) => Session::open(d),
+        // A shared directory lock and every mutation refused by name. There is
+        // no read-only in-memory database to open: `parse_args` has already
+        // refused the combination.
+        (Some(d), true) => Session::open_read_only(d),
+        (None, _) => Ok(Session::in_memory()),
+    };
+    let mut session = match opened {
+        Ok(s) => s,
+        Err(e) => return die(&e),
     };
 
     // A terminal on stdin with no work named on the command line is the only
@@ -163,9 +171,15 @@ fn real_main() -> i32 {
     // acknowledged, and dropping them here would turn a reported error into
     // silent data loss. `Session` deliberately has no `Drop` checkpoint, so
     // this call is the only one.
-    if let Err(e) = session.checkpoint() {
-        die(&e);
-        code = EXIT_FAIL;
+    //
+    // Except on a read-only session, which refuses `CHECKPOINT` by design --
+    // unguarded, this line would `die` on every `--read-only` run that had
+    // just answered every query correctly.
+    if !session.is_read_only() {
+        if let Err(e) = session.checkpoint() {
+            die(&e);
+            code = EXIT_FAIL;
+        }
     }
     code
 }
@@ -192,13 +206,20 @@ struct Args {
     file: Option<String>,
     fmt: Format,
     header: bool,
+    read_only: bool,
 }
 
 /// Parse the command line. `Ok(None)` means `--help` was asked for and
 /// printed; `Err` carries the message and earns [`EXIT_USAGE`].
 fn parse_args(argv: &[String]) -> Result<Option<Args>, String> {
-    let mut a =
-        Args { dir: None, query: None, file: None, fmt: Format::Table, header: true };
+    let mut a = Args {
+        dir: None,
+        query: None,
+        file: None,
+        fmt: Format::Table,
+        header: true,
+        read_only: false,
+    };
 
     let mut i = 0;
     while i < argv.len() {
@@ -255,6 +276,7 @@ fn parse_args(argv: &[String]) -> Result<Option<Args>, String> {
                 }
             }
             "--no-header" => a.header = false,
+            "--read-only" => a.read_only = true,
             // `argv[i]`, not `name`: the message should quote what was typed,
             // `=value` and all.
             _ => return Err(format!("unknown argument `{}`", argv[i])),
@@ -265,6 +287,12 @@ fn parse_args(argv: &[String]) -> Result<Option<Args>, String> {
     if a.query.is_some() && a.file.is_some() {
         // The old parser let -f win and dropped -q without a word.
         return Err("-q and -f are mutually exclusive".into());
+    }
+    if a.read_only && a.dir.is_none() {
+        // An in-memory database that refuses writes can only ever be empty,
+        // so the flag is silently useless there -- which is the class of quiet
+        // wrongness this binary reports instead.
+        return Err("--read-only needs --data: an in-memory database has nothing to read".into());
     }
     Ok(Some(a))
 }

@@ -470,9 +470,27 @@ fn join_strictness_is_refused_not_dropped() {
 /// message naming the feature". They parsed clean instead. `TTL` is the one
 /// with consequences: a table declared to expire rows, and silently given no
 /// expiry, keeps returning rows the DDL said would be gone.
+///
+/// `PARTITION BY` joined them: it parsed, persisted, and came back out of
+/// `SHOW CREATE TABLE`, while three rows spanning three years went into a
+/// single part with no partition directories and no pruning anywhere in
+/// storage or the planner.
 #[test]
-fn ttl_and_sample_by_are_refused() {
+fn ttl_sample_by_and_partition_by_are_refused() {
     let mut s = db();
+    refused(
+        &mut s,
+        "CREATE TABLE t (d Date, a Int64) ENGINE = MergeTree PARTITION BY d ORDER BY a",
+        &["PARTITION BY"],
+    );
+    // The ClickHouse idiom too, which used to reach a *different* refusal
+    // ("PARTITION BY only accepts column names") and so read like a syntax
+    // limit rather than a missing feature.
+    refused(
+        &mut s,
+        "CREATE TABLE t (d Date, a Int64) ENGINE = MergeTree PARTITION BY toYYYYMM(d) ORDER BY a",
+        &["PARTITION BY"],
+    );
     not_implemented(
         &mut s,
         "CREATE TABLE t (id Int64, ts DateTime) ENGINE = MergeTree ORDER BY id TTL ts + 30",
@@ -509,7 +527,6 @@ fn show_create_table_round_trips_every_accepted_declaration() {
          ENGINE = MergeTree ORDER BY id PRIMARY KEY id",
         "CREATE TABLE t (id Int64, x String DEFAULT 'z', n Int32 NULL) \
          ENGINE = ReplacingMergeTree ORDER BY id",
-        "CREATE TABLE t (id Int64, p UInt32) ENGINE = MergeTree ORDER BY id PARTITION BY p",
         "CREATE TABLE t (id Int64) ENGINE = MergeTree ORDER BY id SETTINGS index_granularity = 1024",
         "CREATE TABLE t (id Int64, s String CODEC(ZSTD(3))) ENGINE = MergeTree ORDER BY id",
         // A decimal DEFAULT is the case where the printed DDL used to differ

@@ -409,6 +409,7 @@ fn an_import_streams_a_file_far_larger_than_its_budget() {
     let mut cfg = Settings::default();
     cfg.set("max_memory_usage", "2M").unwrap();
     cfg.set("max_insert_block_size", "16384").unwrap();
+    let ictx = cfg.context(&s2);
     let st = io::import(
         &mut s2,
         "default.big",
@@ -417,6 +418,7 @@ fn an_import_streams_a_file_far_larger_than_its_budget() {
         &Dialect { delim: b',', null: "".into(), header: true },
         &cfg,
         ErrorPolicy { allow: 0 },
+        &ictx,
     )
     .unwrap();
     assert_eq!(st.rows, ROWS as usize);
@@ -720,4 +722,238 @@ fn a_set_after_a_semicolon_is_still_a_set() {
         Some("5"),
         "the SET in the middle of the script took"
     );
+}
+
+// --------------------------------------------------- E. what the load path lets in
+
+/// `DateTime` could not be bulk-loaded at all, and the error's own suggested
+/// remedy made it worse.
+///
+/// `DataType::physical` puts `DateTime` on the `U64` lane, so `Sink::new`
+/// allocated one; the decode arm was keyed on `I64`, so every field fell
+/// through to the "buffer cannot take a field" internal error. Raising
+/// `input_format_allow_errors_num`, which the message suggested, then skipped
+/// every row in the file and reported success with nothing loaded.
+///
+/// The second half is the part that matters beyond the arm: bulk load and
+/// `INSERT ... VALUES` must agree about the range. `parse_datetime` is signed
+/// and reads pre-1970 fine, but the lane is compared and sorted as `u64`, so a
+/// negative would sort pre-1970 above 2262. `VALUES` already refuses it, and
+/// now so does the importer.
+#[test]
+fn datetime_bulk_loads_and_agrees_with_insert_values_about_its_range() {
+    let sc = Scratch::new("datetime");
+    let file = sc.path("dt.csv");
+    std::fs::write(&file, "ts\n2020-01-02 03:04:05\n2021-06-07 08:09:10\n1600000000\n").unwrap();
+
+    let h = Handle::default();
+    let mut s = Session::in_memory();
+    ok(&h, &mut s, "CREATE TABLE dt (ts DateTime) ENGINE = MergeTree ORDER BY ts");
+    let rs = one(&h, &mut s, &format!("INSERT INTO dt FROM INFILE '{}'", file.display()));
+    assert_eq!(rs.affected, Some(3), "every row loads, including a bare epoch integer");
+    assert_eq!(
+        s.query("SELECT toString(ts) FROM dt ORDER BY ts").unwrap().to_values(),
+        vec![
+            vec![Value::str("2020-01-02 03:04:05")],
+            vec![Value::str("2020-09-13 12:26:40")],
+            vec![Value::str("2021-06-07 08:09:10")],
+        ]
+    );
+
+    // The remedy the old message suggested no longer skips the whole file,
+    // because there is nothing left to skip.
+    let rs = one(
+        &h,
+        &mut s,
+        &format!(
+            "INSERT INTO dt FROM INFILE '{}' SETTINGS input_format_allow_errors_num = 100",
+            file.display()
+        ),
+    );
+    assert_eq!(rs.affected, Some(3), "allow_errors must not turn a good file into zero rows");
+
+    // Pre-1970 through the file, and pre-1970 through VALUES, fail the same way.
+    let old = sc.path("old.csv");
+    std::fs::write(&old, "ts\n1960-03-04 05:06:07\n").unwrap();
+    let e = sql(&h, &mut s, &format!("INSERT INTO dt FROM INFILE '{}'", old.display()))
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("1960-03-04 05:06:07") && e.contains("DateTime"), "{e}");
+    let v = s.execute("INSERT INTO dt VALUES ('1960-03-04 05:06:07')").unwrap_err().to_string();
+    assert!(v.contains("1960-03-04 05:06:07") && v.contains("DateTime"), "{v}");
+}
+
+/// A headerless file narrower than the table loaded, zero-filling the columns
+/// it did not carry, and said "2 rows affected".
+///
+/// The width check was already there and could not fire: the column map was
+/// built as `0..rec.width().min(schema.len())`, so it always matched the file
+/// by construction. A mid-file short row was caught; a uniformly short *file*
+/// was not.
+#[test]
+fn a_headerless_file_narrower_than_the_table_is_refused() {
+    let sc = Scratch::new("narrow");
+    let file = sc.path("short.csv");
+    std::fs::write(&file, "7,8\n9,10\n").unwrap();
+
+    let h = Handle::default();
+    let mut s = Session::in_memory();
+    ok(&h, &mut s, "SET input_format_with_names_use_header = 0");
+    ok(
+        &h,
+        &mut s,
+        "CREATE TABLE t (a Int64, b Int64, c Int64 DEFAULT 42) ENGINE = MergeTree ORDER BY a",
+    );
+
+    let e = sql(&h, &mut s, &format!("INSERT INTO t FROM INFILE '{}'", file.display()))
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("2 fields") && e.contains("3 columns"), "{e}");
+    assert_eq!(s.query("SELECT count() FROM t").unwrap().scalar(), Some(Value::UInt(0)));
+
+    // Naming the columns is how a partial load is asked for -- and it fills the
+    // rest with the DEFAULT rather than a zero the table never declared.
+    let rs = one(&h, &mut s, &format!("INSERT INTO t (a, b) FROM INFILE '{}'", file.display()));
+    assert_eq!(rs.affected, Some(2));
+    assert_eq!(
+        s.query("SELECT c FROM t ORDER BY a").unwrap().to_values(),
+        vec![vec![Value::Int(42)], vec![Value::Int(42)]]
+    );
+
+    // A file *wider* than the table was already refused, and still is.
+    let wide = sc.path("wide.csv");
+    std::fs::write(&wide, "1,2,3,4\n").unwrap();
+    assert!(sql(&h, &mut s, &format!("INSERT INTO t FROM INFILE '{}'", wide.display())).is_err());
+}
+
+/// The bulk loader refuses an impossible date, where it used to roll it over
+/// into a real one and store it.
+#[test]
+fn an_impossible_date_in_a_file_fails_the_import() {
+    let sc = Scratch::new("baddate");
+    let file = sc.path("d.csv");
+    std::fs::write(&file, "d\n2021-02-30\n").unwrap();
+
+    let h = Handle::default();
+    let mut s = Session::in_memory();
+    ok(&h, &mut s, "CREATE TABLE d (d Date) ENGINE = MergeTree ORDER BY d");
+    let e = sql(&h, &mut s, &format!("INSERT INTO d FROM INFILE '{}'", file.display()))
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("2021-02-30"), "{e}");
+    assert_eq!(s.query("SELECT count() FROM d").unwrap().scalar(), Some(Value::UInt(0)));
+}
+
+/// A failed import says how many rows it already committed, because it cannot
+/// take them back.
+///
+/// `io::emit` publishes each block to storage as it fills, so a file that goes
+/// bad partway leaves a durable prefix. The message said the opposite -- "No
+/// rows before it were lost" -- while a quarter of a million rows sat in four
+/// active parts, and an operator who fixed the bad row and retried got them
+/// twice.
+///
+/// Through the binary in two processes: the count is read back by a fresh
+/// process, so what it proves is durability and not session state.
+#[test]
+fn a_failed_import_reports_the_rows_it_already_committed() {
+    let sc = Scratch::new("prefix");
+    let dir = sc.path("db");
+    let dir = dir.display().to_string();
+    let file = sc.path("prefix.csv");
+    // Six good rows, then one that will not decode. `max_insert_block_size = 2`
+    // makes three blocks land before the failure without needing a big file.
+    std::fs::write(&file, "a\n1\n2\n3\n4\n5\n6\noops\n").unwrap();
+
+    let (c, _, _) = cli(&["--data", &dir, "-q", "CREATE TABLE t (a Int64) ENGINE = MergeTree ORDER BY a"]);
+    assert_eq!(c, 0);
+
+    let stmt = format!(
+        "INSERT INTO t FROM INFILE '{}' SETTINGS max_insert_block_size = 2",
+        file.display()
+    );
+    let (code, _, err) = cli(&["--data", &dir, "-q", &stmt]);
+    assert_eq!(code, 1, "the import must still fail: {err}");
+    assert!(err.contains("line 8"), "the failing line is still named: {err}");
+    assert!(
+        err.contains("6 rows before it are ALREADY COMMITTED"),
+        "the message must own the durable prefix: {err}"
+    );
+    assert!(
+        !err.contains("No rows before it were lost"),
+        "the old promise must be gone when rows did land: {err}"
+    );
+
+    // A second process sees them, which is what makes the message true.
+    let (c, out, _) = cli(&["--data", &dir, "-q", "SELECT count() FROM t", "--format", "tsv", "--no-header"]);
+    assert_eq!((c, out.trim()), (0, "6"));
+
+    // And when nothing was published, the original wording is still the honest
+    // one -- the first block never emitted, so there is nothing to warn about.
+    let head = sc.path("head.csv");
+    std::fs::write(&head, "a\noops\n1\n").unwrap();
+    let (code, _, err) =
+        cli(&["--data", &dir, "-q", &format!("INSERT INTO t FROM INFILE '{}'", head.display())]);
+    assert_eq!(code, 1);
+    assert!(err.contains("No rows before it were lost"), "{err}");
+    let (_, out, _) = cli(&["--data", &dir, "-q", "SELECT count() FROM t", "--format", "tsv", "--no-header"]);
+    assert_eq!(out.trim(), "6", "the failed retry added nothing");
+}
+
+/// The same promise for the *other* way an import dies past a block boundary.
+///
+/// Routing the bulk path through `Session::import_block` is what made CHECK
+/// and UNIQUE reachable from `FROM INFILE` at all -- and it created a second
+/// exit that the durable-prefix message did not cover, because that message
+/// only wrapped the decode failure. A constraint violation on row 200,002
+/// reported the offending row and nothing else while 196,608 rows sat durable
+/// on disk, so an operator who fixed the file and retried got them twice.
+#[test]
+fn a_constraint_that_fails_mid_import_reports_the_rows_it_already_committed() {
+    let sc = Scratch::new("prefix-check");
+    let dir = sc.path("db");
+    let dir = dir.display().to_string();
+    let file = sc.path("late.csv");
+    // Six good rows, then one the CHECK rejects. Two rows per block, so three
+    // blocks are durable before the fourth is refused.
+    std::fs::write(&file, "a\n1\n2\n3\n4\n5\n6\n-1\n").unwrap();
+
+    let (c, _, err) = cli(&[
+        "--data",
+        &dir,
+        "-q",
+        "CREATE TABLE t (a Int64, CONSTRAINT nonneg CHECK (a >= 0)) ENGINE = MergeTree ORDER BY a",
+    ]);
+    assert_eq!(c, 0, "{err}");
+
+    let stmt = format!(
+        "INSERT INTO t FROM INFILE '{}' SETTINGS max_insert_block_size = 2",
+        file.display()
+    );
+    let (code, _, err) = cli(&["--data", &dir, "-q", &stmt]);
+    assert_eq!(code, 1, "the import must fail: {err}");
+    assert!(err.contains("nonneg"), "the constraint is still named: {err}");
+    assert!(err.contains("line 8"), "the block's last line must be named: {err}");
+    assert!(
+        err.contains("6 rows before it are ALREADY COMMITTED"),
+        "the message must own the durable prefix: {err}"
+    );
+    assert!(
+        err.contains("input_format_allow_errors_num` does not skip this"),
+        "the message must say the obvious workaround does not apply: {err}"
+    );
+
+    // A second process sees exactly the prefix the message claimed.
+    let (c, out, _) =
+        cli(&["--data", &dir, "-q", "SELECT count() FROM t", "--format", "tsv", "--no-header"]);
+    assert_eq!((c, out.trim()), (0, "6"));
+
+    // And raising the skip count really does not rescue it, as the message says.
+    let stmt = format!(
+        "INSERT INTO t FROM INFILE '{}' SETTINGS max_insert_block_size = 2, \
+         input_format_allow_errors_num = 100",
+        file.display()
+    );
+    let (code, _, err) = cli(&["--data", &dir, "-q", &stmt]);
+    assert_eq!(code, 1, "a constraint violation is not a skippable bad row: {err}");
 }

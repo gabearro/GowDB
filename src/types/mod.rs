@@ -13,6 +13,6 @@ pub use block::{Block, Column, ColumnBuilder, ColumnData};
 pub use datatype::{DataType, PhysicalType};
 pub use schema::{Engine, Field, Schema, TableDef};
 pub use value::{
-    parse_civil_days,
-    civil_from_days, days_from_civil, fmt_date, fmt_datetime, parse_date, parse_datetime, Value,
+    civil_from_days, days_from_civil, days_in_month, fmt_date, fmt_datetime, parse_civil_days,
+    parse_date, parse_datetime, Value,
 };

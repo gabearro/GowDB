@@ -95,8 +95,8 @@ use super::ScalarFn;
 use crate::common::{hash_bytes, hash_key, splitmix64, BitSet, Error, Result};
 use crate::types::value::{decimal_rescale, DECIMAL_MAX_UNITS, POW10};
 use crate::types::{
-    civil_from_days, days_from_civil, fmt_date, fmt_datetime, parse_datetime, Column, ColumnData,
-    DataType, PhysicalType, Value,
+    civil_from_days, days_from_civil, days_in_month, fmt_date, fmt_datetime, parse_datetime, Column,
+    ColumnData, DataType, PhysicalType, Value,
 };
 use std::borrow::Cow;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -1972,11 +1972,6 @@ fn temporal_secs(c: &Column, rows: usize) -> Result<Vec<i64>> {
         ColumnData::I64(v) => (0..rows).map(|i| v[i].wrapping_mul(mul)).collect(),
         _ => return Err(Error::exec(format!("{} is not a temporal column", c.ty))),
     })
-}
-
-fn days_in_month(y: i64, m: u32) -> u32 {
-    let (ny, nm) = if m == 12 { (y + 1, 1) } else { (y, m + 1) };
-    (days_from_civil(ny, nm, 1) - days_from_civil(y, m, 1)) as u32
 }
 
 /// Shift epoch seconds by `n` units, clamping the day-of-month when a calendar

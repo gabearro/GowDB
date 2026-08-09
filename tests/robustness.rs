@@ -1695,13 +1695,14 @@ fn fuzz_catalog_and_table_documents_body() {
     let mut fp = Fp::default();
 
     let roster = fixture_catalog();
-    let cat = writer::catalog_doc(&roster);
+    let cat = writer::catalog_doc(&roster, 0x5EED_1234_5678_9ABC);
     let parts: Vec<String> = (1..=9).map(|i| format!("part_{i:06}.gpart")).collect();
     let tbl = writer::table_doc(&fixture_def("hits"), &parts, 4096);
 
     // Round-trip first: a document the writer just produced must decode to
     // exactly what went in, or nothing below means anything.
-    let back = reader::catalog_from_bytes(&cat).expect("catalog round-trip");
+    let (back, instance) = reader::catalog_from_bytes(&cat).expect("catalog round-trip");
+    assert_eq!(instance, 0x5EED_1234_5678_9ABC, "the instance id survives the round trip");
     assert_eq!(back.len(), roster.len());
     for ((a, ad), (b, bd)) in back.iter().zip(&roster) {
         assert_eq!(a, b);

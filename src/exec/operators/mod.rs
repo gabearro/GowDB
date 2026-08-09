@@ -118,6 +118,8 @@ pub mod window;
 
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::path::Path;
+use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -278,6 +280,85 @@ pub struct QueryContext {
     /// `Instant::now` out of the loop for queries that did not ask for one.
     pub deadline: Option<Instant>,
     pub mem: Arc<MemTracker>,
+    /// Where this query's spill files go, and what they may weigh. One `Arc`,
+    /// so every spilling operator in the query shares one root and one total.
+    pub spill: Arc<SpillBudget>,
+}
+
+/// The temporary-data half of a query's governance: a root directory and a
+/// ceiling on what may be written under it.
+///
+/// The root used to be `env::temp_dir()` unconditionally, which put a spill
+/// on a different filesystem from the one the operator sized for the database
+/// -- a per-user `/var/folders` path on macOS, and typically a small tmpfs
+/// `/tmp` on Linux, where a spill is an out-of-memory rather than a relief.
+/// A session rooted on disk points this at `<data>/.spill` instead.
+impl std::fmt::Debug for SpillBudget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "SpillBudget({}, limit {})", self.root.display(), self.limit)
+    }
+}
+
+pub struct SpillBudget {
+    root: Arc<Path>,
+    /// 0 is "no ceiling", the convention `max_execution_time` already uses in
+    /// the settings table. It is also what makes the charge free: with no
+    /// limit `used` is never touched, so the default pays one perfectly
+    /// predicted branch per `write(2)` and no atomic at all.
+    limit: u64,
+    used: AtomicU64,
+}
+
+impl SpillBudget {
+    pub fn new(root: Arc<Path>, limit: u64) -> Arc<SpillBudget> {
+        Arc::new(SpillBudget { root, limit, used: AtomicU64::new(0) })
+    }
+
+    /// The default for a caller with no data directory: `env::temp_dir()`, no
+    /// ceiling. Shared process-wide rather than minted per context, which is
+    /// safe here for the one reason the ambient *memory* tracker was not: with
+    /// `limit == 0` there is no mutable state to share, because `charge`
+    /// returns before it reads `used`.
+    pub fn ambient() -> Arc<SpillBudget> {
+        static D: OnceLock<Arc<SpillBudget>> = OnceLock::new();
+        Arc::clone(D.get_or_init(|| SpillBudget::new(std::env::temp_dir().into(), 0)))
+    }
+
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    pub fn limit(&self) -> u64 {
+        self.limit
+    }
+
+    /// Charge bytes about to be written. Called once per `write(2)` -- the run
+    /// writers batch at 256 KiB -- so never per row and never per block, and
+    /// nothing next to the syscall it precedes.
+    #[inline]
+    pub fn charge(&self, n: u64) -> Result<()> {
+        if self.limit == 0 {
+            return Ok(());
+        }
+        let total = self.used.fetch_add(n, Ordering::Relaxed) + n;
+        if total > self.limit {
+            return Err(self.over(total));
+        }
+        Ok(())
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn over(&self, total: u64) -> Error {
+        Error::exec(format!(
+            "query exceeded max_temporary_data_on_disk: it has spilled {} to `{}` \
+             against a ceiling of {}. Raise the setting, raise max_memory_usage so \
+             it spills less, or add a filter",
+            human(total as i64),
+            self.root.display(),
+            human(self.limit as i64),
+        ))
+    }
 }
 
 impl Default for QueryContext {
@@ -293,6 +374,7 @@ impl QueryContext {
             cancel: Arc::new(AtomicBool::new(false)),
             deadline: None,
             mem: MemTracker::with_limit(DEFAULT_MEM_BUDGET),
+            spill: SpillBudget::ambient(),
         }
     }
 
@@ -342,14 +424,6 @@ impl QueryContext {
             Error::exec("query exceeded its deadline")
         }
     }
-}
-
-/// The context used by callers that do not supply one. Static so the common
-/// `execute(plan, catalog)` path allocates nothing extra and every operator
-/// can hold a plain reference.
-fn ambient_context() -> &'static QueryContext {
-    static C: OnceLock<QueryContext> = OnceLock::new();
-    C.get_or_init(QueryContext::new)
 }
 
 /// An RAII reservation held by one operator for its lifetime.
@@ -425,16 +499,17 @@ pub fn build_physical<'a>(
     ctx: &'a QueryContext,
 ) -> Result<Box<dyn Operator + 'a>> {
     Ok(match plan {
-        PhysicalPlan::Scan(s) => Box::new(scan::Scan::new(s, catalog)?),
+        PhysicalPlan::Scan(s) => Box::new(scan::Scan::new(s, catalog, ctx)?),
         PhysicalPlan::IndexLookup(path) => Box::new(scan::IndexLookup::new(*path, catalog)?),
         PhysicalPlan::MetaAggregate(path) => Box::new(scan::MetaAggregate::new(*path, catalog)?),
         PhysicalPlan::Filter { input, predicate } => {
-            Box::new(filter::Filter::new(build_physical(*input, catalog, ctx)?, predicate))
+            Box::new(filter::Filter::new(build_physical(*input, catalog, ctx)?, predicate, ctx))
         }
         PhysicalPlan::Project { input, exprs, schema } => Box::new(project::Project::new(
             build_physical(*input, catalog, ctx)?,
             exprs,
             schema,
+            ctx,
         )),
         PhysicalPlan::Aggregate { input, group, aggs, schema } => {
             Box::new(aggregate::Aggregate::new(
@@ -468,7 +543,7 @@ pub fn build_physical<'a>(
             ctx,
         )),
         PhysicalPlan::Distinct { input } => {
-            Box::new(distinct::Distinct::new(build_physical(*input, catalog, ctx)?))
+            Box::new(distinct::Distinct::new(build_physical(*input, catalog, ctx)?, ctx))
         }
         PhysicalPlan::Join { left, right, op, on, residual, schema } => Box::new(join::Join::new(
             build_physical(*left, catalog, ctx)?,
@@ -503,11 +578,23 @@ pub fn execute<'a>(plan: &'a LogicalPlan, catalog: &'a Catalog) -> Result<Vec<Bl
 }
 
 /// [`execute`], plus the access-path counters the query actually paid.
+///
+/// A **fresh** context per call. This used to hand out one
+/// `static OnceLock<QueryContext>` for the whole process, which is the same
+/// mistake the parallel sibling was fixed for -- see the doc on
+/// [`exchange::execute_with_stats`](crate::exec::execute_parallel_stats) and
+/// its `each_query_gets_its_own_context` test. A process-static tracker means
+/// a per-query budget, deadline and cancel flag are unreachable by
+/// construction, every session in the process shares one ceiling, and a
+/// reservation leaked between `grow_to` and a guard's drop stays charged
+/// forever. Two `Arc` allocations against a plan that has already been parsed,
+/// bound, optimized and lowered are not measurable. Callers that *have* a
+/// context -- a session with settings -- must call [`execute_ctx`].
 pub fn execute_with_stats<'a>(
     plan: &'a LogicalPlan,
     catalog: &'a Catalog,
 ) -> Result<(Vec<Block>, ScanStats)> {
-    execute_ctx(plan, catalog, ambient_context())
+    execute_ctx(plan, catalog, &QueryContext::new())
 }
 
 /// [`execute_with_stats`] under a caller-supplied budget, deadline and cancel

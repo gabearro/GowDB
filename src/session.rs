@@ -113,8 +113,8 @@
 
 use std::fs::File;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, RwLock, RwLockWriteGuard};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, RwLock, RwLockWriteGuard, Weak};
 use std::time::{Duration, Instant};
 
 use crate::catalog::Catalog;
@@ -372,6 +372,18 @@ pub struct Session {
     /// The open transaction, if any. `None` on every autocommit path, and the
     /// only thing `BEGIN` has to write.
     txn: Option<Txn>,
+    /// Which connection is driving right now: stamped by [`Db::writer`] as it
+    /// takes the lock, and left at 0 for a session nobody shared. `COMMIT` and
+    /// `ROLLBACK` compare it against [`Txn::owner`], which is the whole of the
+    /// mechanism that stops one connection ending another's transaction.
+    owner: u64,
+    /// Whether that connection is still *alive*, stamped alongside it. `BEGIN`
+    /// copies it into the transaction, and that is what tells "another
+    /// connection is still working on this" apart from "the connection that
+    /// opened this is gone and nothing will ever end it" -- see
+    /// [`Session::reap_txn`]. `None` for a bare `Session`, which is one
+    /// connection by construction and cannot orphan anything.
+    owner_tok: Option<Weak<u64>>,
     /// Session-scoped settings, and the hook `SET` / `SHOW SETTINGS` /
     /// `SETTINGS` reach the engine through. Per-session rather than global on
     /// purpose: two `Session`s in one process -- which `Db` and most of the
@@ -395,6 +407,21 @@ pub struct Session {
     /// open. Empty -- and so free to consult -- on a database that declares
     /// neither.
     ext: Extensions,
+    /// `wal_fold_bytes`: the per-table log size above which a statement
+    /// boundary folds that log into parts. 0 disables it. Pushed in by
+    /// [`crate::settings::Settings::apply_to`], the way the memory budget and
+    /// the timeout are.
+    fold_bytes: u64,
+    /// Tables whose log has outgrown `fold_bytes` and have not been folded
+    /// yet. Empty on every path that has not crossed the threshold, so the
+    /// drain at each statement boundary is one length check.
+    ///
+    /// Deferred rather than folded where the threshold is noticed, and that is
+    /// the whole of the care this needs: the insert path is *log before
+    /// apply*, so a fold inside the append would `write_table` a table that is
+    /// missing the record it is about to truncate the log for -- a durability
+    /// hole with a checkpoint's name on it.
+    fold_due: Vec<String>,
 }
 
 /// The per-query governance a session applies, as *settings* rather than as a
@@ -416,6 +443,21 @@ struct Limits {
     mem: i64,
     timeout: Option<Duration>,
     cancel: Arc<AtomicBool>,
+    /// The data directory, when there is one. Spill files go under
+    /// `<root>/.spill` rather than into `env::temp_dir()`, so an operator who
+    /// sized the data volume for the database sized it for the spill too. A
+    /// leading dot, like `.wal-archive`: `store::valid_name` already refuses
+    /// those as database names, so it can never collide with one.
+    spill_root: Option<Arc<Path>>,
+    /// `max_temporary_data_on_disk`, 0 for unlimited.
+    temp_disk: u64,
+}
+
+/// Where a data directory keeps its spill files.
+pub const SPILL_DIR: &str = ".spill";
+
+fn spill_root(root: &Path) -> Arc<Path> {
+    root.join(SPILL_DIR).into()
 }
 
 impl Default for Limits {
@@ -424,6 +466,8 @@ impl Default for Limits {
             mem: crate::exec::operators::DEFAULT_MEM_BUDGET,
             timeout: None,
             cancel: Arc::new(AtomicBool::new(false)),
+            spill_root: None,
+            temp_disk: 0,
         }
     }
 }
@@ -437,10 +481,24 @@ impl Limits {
             cancel: Arc::clone(&self.cancel),
             deadline: None,
             mem: crate::exec::operators::MemTracker::with_limit(self.mem),
+            spill: self.spill(self.temp_disk),
         };
         match self.timeout {
             Some(d) => ctx.deadline_in(d),
             None => ctx,
+        }
+    }
+
+    /// The spill root and ceiling for one query. `ambient()` -- shared, no
+    /// allocation -- for an in-memory session with no ceiling, which is what
+    /// most of the test suite is; one small `Arc` otherwise.
+    fn spill(&self, limit: u64) -> Arc<crate::exec::operators::SpillBudget> {
+        match (&self.spill_root, limit) {
+            (None, 0) => crate::exec::operators::SpillBudget::ambient(),
+            (Some(r), l) => crate::exec::operators::SpillBudget::new(Arc::clone(r), l),
+            (None, l) => {
+                crate::exec::operators::SpillBudget::new(std::env::temp_dir().into(), l)
+            }
         }
     }
 }
@@ -455,6 +513,17 @@ impl Limits {
 #[derive(Default)]
 struct Txn {
     tables: Vec<Enlisted>,
+    /// The connection that ran `BEGIN`. Copied from [`Session::owner`], so it
+    /// is 0 -- and therefore always a match -- for a bare `Session`, which is
+    /// one connection by construction and is what the CLI has.
+    owner: u64,
+    /// A handle on that connection's *liveness*, copied from
+    /// [`Session::owner_tok`]. Dead means the `Db` clone that ran `BEGIN` has
+    /// been dropped, so no `COMMIT` and no `ROLLBACK` can ever arrive: the
+    /// transaction is swept rather than left to refuse every other connection
+    /// forever. `None` for a bare `Session`, whose transaction is never
+    /// foreign and must never be swept.
+    tok: Option<Weak<u64>>,
     /// The first error a statement raised while this transaction was open.
     ///
     /// Once set the transaction is *poisoned*: every later statement is
@@ -655,6 +724,10 @@ impl Session {
     pub fn in_memory() -> Session {
         Session {
             catalog: Catalog::in_memory(),
+            fold_bytes: crate::persist::wal::DEFAULT_FOLD_BYTES,
+            fold_due: Vec::new(),
+            owner: 0,
+            owner_tok: None,
             wals: Default::default(),
             wal_enabled: false,
             // Nothing on disk to guard: an in-memory session shares no files
@@ -686,16 +759,24 @@ impl Session {
         crate::persist::load_catalog(&mut catalog)?;
         let mut s = Session {
             catalog,
+            fold_bytes: crate::persist::wal::DEFAULT_FOLD_BYTES,
+            fold_due: Vec::new(),
+            owner: 0,
+            owner_tok: None,
             wals: Default::default(),
             wal_enabled: true,
             _lock: lock,
             txn: None,
             settings: crate::settings::Handle::new(Default::default()),
             read_only: false,
-            limits: Limits::default(),
+            limits: Limits { spill_root: Some(spill_root(&root)), ..Limits::default() },
             log: crate::system::QueryLog::new(),
             ext: Extensions::default(),
         };
+        // Before the first query, and only from the writer: a spill directory
+        // whose owner is gone is unlinked here, because `SpillDir`'s `Drop`
+        // cannot run on a `SIGKILL`, a panic-abort or a power loss.
+        crate::exec::operators::sort::spill::reap(&spill_root(&root));
         s.load_extensions()?;
         Ok(s)
     }
@@ -722,12 +803,23 @@ impl Session {
         crate::persist::load_catalog(&mut catalog)?;
         let mut s = Session {
             catalog,
+            fold_bytes: crate::persist::wal::DEFAULT_FOLD_BYTES,
+            fold_due: Vec::new(),
+            owner: 0,
+            owner_tok: None,
             wals: Default::default(),
             wal_enabled: false,
             _lock: lock,
             txn: None,
             settings: crate::settings::Handle::new(Default::default()),
             read_only: true,
+            // No `spill_root`, so spilling falls back to `env::temp_dir()`.
+            // A session that has promised not to write the data directory must
+            // not write scratch into it either: on the read-only media this
+            // mode exists to open, `<data>/.spill` is not creatable and every
+            // spilling query failed with a permission error where a plain read
+            // succeeded -- and on writable media it left spill directories
+            // nothing collects, because `open_read_only` runs no reaper.
             limits: Limits::default(),
             log: crate::system::QueryLog::new(),
             ext: Extensions::default(),
@@ -741,6 +833,22 @@ impl Session {
 
     pub fn is_read_only(&self) -> bool {
         self.read_only
+    }
+
+    /// This session's spill root under a caller-supplied ceiling. The settings
+    /// layer holds `max_temporary_data_on_disk` and the session holds the
+    /// root, so neither can build the pair alone.
+    pub(crate) fn spill_budget(
+        &self,
+        limit: u64,
+    ) -> Arc<crate::exec::operators::SpillBudget> {
+        self.limits.spill(limit)
+    }
+
+    /// `max_temporary_data_on_disk`, pushed in by `Settings::apply_to` the way
+    /// the memory budget and the timeout are.
+    pub fn set_temp_disk_limit(&mut self, bytes: u64) {
+        self.limits.temp_disk = bytes;
     }
 
     // ------------------------------------------------------- query governance
@@ -760,6 +868,12 @@ impl Session {
     /// per statement, from the moment it starts.
     pub fn set_timeout(&mut self, d: Option<Duration>) {
         self.limits.timeout = d;
+    }
+
+    /// `wal_fold_bytes`, pushed in by `Settings::apply_to`. 0 disables the
+    /// automatic fold, which is what the engine did before it existed.
+    pub fn set_wal_fold_bytes(&mut self, bytes: u64) {
+        self.fold_bytes = bytes;
     }
 
     /// A flag another thread can set to stop this session's queries.
@@ -885,6 +999,9 @@ impl Session {
             return Ok(());
         }
         self.catalog.flush_all()?;
+        // This checkpoint covers every table, so any pending per-table fold is
+        // work that is about to be done twice.
+        self.fold_due.clear();
         // Drop the cached handles first: `save_catalog` truncates each log and
         // resets its watermark, which would leave a cached `Wal`'s idea of the
         // file length stale and make the next append land at the wrong offset.
@@ -999,6 +1116,39 @@ impl Session {
         self.ext
             .views
             .retain(|k, _| dbs.iter().any(|d| k.starts_with(d) && k[d.len()..].starts_with('.')));
+    }
+
+    /// Refuse a name that would take a directory entry something else already
+    /// owns: `None` checks a database against the root's siblings and the
+    /// root's own two file names, `Some(db)` checks a table against that
+    /// database's siblings.
+    ///
+    /// Case-folded, which is the whole point -- see [`store::folds_onto`] for
+    /// what the fold prevents and why the answer is a refusal. One pass over a
+    /// name list that is DDL-sized, on statements that are about to `mkdir`
+    /// and `fsync`; nothing per row and nothing in a loop.
+    fn guard_dir_name(&self, db: Option<&str>, name: &str) -> Result<()> {
+        use crate::persist::store;
+        let hit = match db {
+            None => {
+                if let Some(r) = store::ROOT_RESERVED.iter().find(|r| r.eq_ignore_ascii_case(name))
+                {
+                    return Err(Error::storage(format!(
+                        "refusing to create `DATABASE {name}`: the data directory keeps its \
+                         own `{r}` file under that name. Creating a directory there wins the \
+                         race against the file and leaves the database permanently \
+                         unopenable"
+                    )));
+                }
+                store::folds_onto(name, self.catalog.db_names())
+            }
+            Some(db) => store::folds_onto(name, self.catalog.table_names_in(db)),
+        };
+        let what = if db.is_none() { "DATABASE" } else { "TABLE" };
+        match hit {
+            Some(other) => Err(store::name_collision(what, name, other)),
+            None => Ok(()),
+        }
     }
 
     /// Rewrite `<db>._granular_ddl` from what is in memory.
@@ -1141,7 +1291,13 @@ impl Session {
             }
             src.push(crate::backup::Source { db, def: &t.def, snap: t.snapshot() });
         }
-        let r = crate::backup::write_archive(Path::new(to), &dbs, &src, base.map(Path::new))?;
+        let r = crate::backup::write_archive(
+            Path::new(to),
+            &dbs,
+            &src,
+            base.map(Path::new),
+            self.catalog.instance(),
+        )?;
         report(
             &["archive", "tables", "parts", "rows", "bytes", "reused_parts"],
             Value::str(to),
@@ -1258,14 +1414,24 @@ impl Session {
     /// by [`crate::persist::Wal::replay`] by construction.
     fn log_insert(&mut self, path: &str, b: &Block) -> Result<()> {
         let seq = self.enlist(path)?;
+        let t = self.fold_bytes;
         let Some(w) = self.wal_for(path)? else { return Ok(()) };
         match seq {
-            Some(s) => w.append_insert_staged(s, b).map(|_| ()),
+            Some(s) => {
+                w.append_insert_staged(s, b)?;
+            }
             None => {
                 w.append_insert(b)?;
-                w.sync()
+                w.sync()?;
             }
         }
+        // One `u64` compare per logged *block*, against an append and (outside
+        // a transaction) an fsync the same block already pays. `w.len()` is a
+        // field read, not a `stat`.
+        if t != 0 && w.len() >= t {
+            self.mark_fold_due(path);
+        }
+        Ok(())
     }
 
     /// Append one key delete per lane, enlisting once for the batch.
@@ -1282,14 +1448,59 @@ impl Session {
     /// table of sizes is next to the mutation section below.
     fn log_deletes(&mut self, path: &str, lanes: &[u64]) -> Result<()> {
         let seq = self.enlist(path)?;
+        let t = self.fold_bytes;
         let Some(w) = self.wal_for(path)? else { return Ok(()) };
         match seq {
-            Some(s) => w.append_deletes_staged(s, lanes).map(|_| ()),
+            Some(s) => {
+                w.append_deletes_staged(s, lanes)?;
+            }
             None => {
                 w.append_deletes(lanes)?;
-                w.sync()
+                w.sync()?;
             }
         }
+        if t != 0 && w.len() >= t {
+            self.mark_fold_due(path);
+        }
+        Ok(())
+    }
+
+    /// Note that `path`'s log has outgrown `wal_fold_bytes`.
+    ///
+    /// `#[cold]` and allocating on purpose: this runs once per threshold-worth
+    /// of log -- 64 MiB by default -- not once per row or once per block, and
+    /// the linear scan is over a list that holds one entry per *table* a
+    /// statement has written to.
+    #[cold]
+    fn mark_fold_due(&mut self, path: &str) {
+        if !self.fold_due.iter().any(|p| p == path) {
+            self.fold_due.push(path.to_string());
+        }
+    }
+
+    /// Fold every table whose log has outgrown the threshold.
+    ///
+    /// Called at a statement boundary with no transaction open, which is the
+    /// only place it is safe: the log is written *before* the mutation it
+    /// describes is applied (see the ordering note on `apply_insert`), so a
+    /// fold any earlier would write a table out and then truncate a log whose
+    /// last record had not reached it. Inside a transaction the overlays are
+    /// still private, so the entries simply wait for `COMMIT`.
+    ///
+    /// One `Vec` length check per statement when nothing is due, which is
+    /// every statement between two folds.
+    fn drain_folds(&mut self) -> Result<()> {
+        while let Some(p) = self.fold_due.pop() {
+            self.fold_to_parts(&p).map_err(|e| {
+                Error::storage(format!(
+                    "the statement succeeded and its write is durable in the log, but \
+                     folding `{p}`'s log into parts afterwards failed: {e}. Nothing is \
+                     lost -- the log replays at the next open -- but it cannot be \
+                     truncated until this succeeds, so it will keep growing"
+                ))
+            })?;
+        }
+        Ok(())
     }
 
     // --------------------------------------------------------- transactions
@@ -1312,12 +1523,55 @@ impl Session {
     /// answer that cannot silently publish somebody else's rows.
     pub fn begin(&mut self) -> Result<()> {
         if let Some(txn) = self.txn.as_mut() {
+            // Somebody else's transaction is not this connection's to poison:
+            // the refusal below is a diagnosis of *this* block's mistake, and
+            // stamping it on another connection would let any caller kill a
+            // transaction it cannot even see.
+            if txn.owner != self.owner {
+                return Err(foreign_txn("BEGIN"));
+            }
             let msg = "a transaction is already open; nested transactions are not supported";
             txn.poisoned.get_or_insert_with(|| msg.to_string());
             return Err(Error::unsupported(msg));
         }
-        self.txn = Some(Txn::default());
+        self.txn = Some(Txn { owner: self.owner, tok: self.owner_tok.clone(), ..Txn::default() });
         Ok(())
+    }
+
+    /// Discard an open transaction that nothing can ever end.
+    ///
+    /// Reached from exactly two places, both of which have already decided
+    /// that the `Db` clone which ran `BEGIN` is gone: [`Db::drop`], which is
+    /// the prompt path, and [`Db::writer`], which is the backstop for when the
+    /// prompt one could not take the lock. Without it the owner token turned a
+    /// client disconnect into a permanent wedge -- owners are monotonic, so
+    /// the identity that could have ended the transaction was unrecoverable
+    /// and every statement from every connection was refused forever.
+    ///
+    /// A rewind failure is swallowed on purpose: the half that matters is
+    /// detaching the overlay, which is infallible, and the caller here is a
+    /// `drop` or an unrelated statement, neither of which authored the
+    /// transaction or has any action to take. Dead bytes in the log are what
+    /// replay already discards.
+    #[cold]
+    fn reap_txn(&mut self) {
+        if let Some(txn) = self.txn.take() {
+            let _ = self.discard(txn);
+        }
+    }
+
+    /// Refuse to end a transaction this connection did not open.
+    ///
+    /// The same rule the nested-`BEGIN` refusal enforces, one scope out: there
+    /// the inner block's `COMMIT` would have published the outer block's
+    /// uncommitted work, here a second connection's would. One `u64` compare
+    /// per `COMMIT`/`ROLLBACK`, and none at all outside a transaction.
+    #[inline]
+    fn check_owner(&self, what: &str) -> Result<()> {
+        match &self.txn {
+            Some(t) if t.owner != self.owner => Err(foreign_txn(what)),
+            _ => Ok(()),
+        }
     }
 
     /// Make the transaction's writes durable and then visible, in that order.
@@ -1332,6 +1586,9 @@ impl Session {
     /// client that gets `Ok` from `COMMIT` is entitled to believe its writes
     /// landed, and here they did not.
     pub fn commit(&mut self) -> Result<()> {
+        // Before the `take`, because a refused COMMIT must leave the other
+        // connection's transaction exactly where it found it.
+        self.check_owner("COMMIT")?;
         // Taken up front so the durable half can borrow the roster while it
         // holds `&mut self` for the catalog and the logs -- the alternative is
         // a `Vec` of cloned paths per COMMIT, and a transaction is allowed to
@@ -1382,23 +1639,42 @@ impl Session {
         }
     }
 
-    /// Refuse a statement when the open transaction has already failed.
+    /// Refuse a statement that must not run against the open transaction:
+    /// one belonging to another connection, or one that has already failed.
     ///
-    /// One `Option` test on the fast path; `None` for every autocommit
-    /// statement and for every healthy transaction.
+    /// One `Option` test on the fast path -- `None` for every autocommit
+    /// statement -- and one `u64` compare inside a healthy transaction.
+    ///
+    /// The owner arm is not a nicety. This engine holds **one** transaction
+    /// per shared `Session`, so a second connection's statement used to
+    /// *enlist in it*: its rows went into an overlay the other connection was
+    /// free to roll back, and it was told they had landed. That is the
+    /// nested-`BEGIN` failure again with connections in place of blocks, and
+    /// it is refused for the same reason. Refusing reads too matches
+    /// [`Reader`], which already declines to read through an open transaction
+    /// rather than serve a dirty row.
     #[inline]
-    fn check_poisoned(&self) -> Result<()> {
-        match self.txn.as_ref().and_then(|t| t.poisoned.as_deref()) {
+    fn check_txn(&self, kind: &str) -> Result<()> {
+        match self.txn.as_ref() {
             None => Ok(()),
-            Some(why) => Err(poisoned_err(why)),
+            Some(t) if t.owner != self.owner => Err(foreign_txn(kind)),
+            Some(t) => match t.poisoned.as_deref() {
+                None => Ok(()),
+                Some(why) => Err(poisoned_err(why)),
+            },
         }
     }
 
     /// Record `e` as the reason the open transaction (if any) is poisoned, and
     /// hand it back unchanged.
+    /// Only ever this connection's transaction. A statement refused *because*
+    /// the open transaction belongs to somebody else must not then poison it:
+    /// that would hand any caller a way to kill a transaction it is not even
+    /// allowed to read.
     #[cold]
     fn poison(&mut self, e: Error) -> Error {
-        if let Some(txn) = self.txn.as_mut() {
+        let owner = self.owner;
+        if let Some(txn) = self.txn.as_mut().filter(|t| t.owner == owner) {
             txn.poisoned.get_or_insert_with(|| e.to_string());
         }
         e
@@ -1470,9 +1746,20 @@ impl Session {
     /// pre-transaction state. Replay would have dropped those staged records
     /// anyway; the rewind is what makes "no trace" true of the disk too.
     pub fn rollback(&mut self) -> Result<()> {
+        // A foreign ROLLBACK is the worse half of the pair: the connection
+        // that runs it has been told `Ok` for an autocommitted write, and
+        // discarding somebody else's overlay would take that write with it.
+        self.check_owner("ROLLBACK")?;
         let Some(txn) = self.txn.take() else {
             return Err(Error::exec("ROLLBACK without an open transaction"));
         };
+        self.discard(txn)
+    }
+
+    /// The body of `ROLLBACK`, over a transaction already detached from the
+    /// session. Split out so [`Session::reap_txn`] can undo an orphan without
+    /// going back through the owner check that would refuse it.
+    fn discard(&mut self, txn: Txn) -> Result<()> {
         // Every table is rolled back even if one of the log rewinds fails:
         // leaving an overlay attached would keep uncommitted parts visible,
         // which is far worse than a log with dead bytes in it. The first
@@ -1647,27 +1934,12 @@ impl Session {
         // `&mut Session`; the state is behind an `Arc`, so it is two atomics
         // per *statement* against a statement about to be lexed, parsed, bound
         // and lowered.
-        // `INSERT ... FROM INFILE` is intercepted below and streams straight
-        // into `Table::insert` (`io::emit`), so it passes none of the checks
-        // `run_insert` applies. Rather than let a bulk load be the one door
-        // constraints do not cover, it is refused while this database has any
-        // -- coarse on purpose, because the alternative is picking the target
-        // table out of the text a second time, and a mistake there would be a
-        // silent import rather than a refusal.
         //
-        // The narrow fix is one line in `io::emit` (see the report): route the
-        // block through `Session::import_block`. When that lands, this gate
-        // goes.
-        if !(self.ext.checks.is_empty() && self.ext.uniques.is_empty())
-            && mentions_infile(sql)
-        {
-            return Err(self.poison(Error::unsupported(
-                "INSERT ... FROM INFILE does not enforce CHECK or UNIQUE constraints, and \
-                 this database has some -- so it is refused rather than allowed to load \
-                 rows the table's own INSERT would reject. Import into an unconstrained \
-                 table and `INSERT ... SELECT` from it, which is checked",
-            )));
-        }
+        // `INSERT ... FROM INFILE` used to be refused outright here whenever
+        // the database had any CHECK or UNIQUE, because `io::emit` published
+        // blocks straight at the catalog and passed none of the checks
+        // `run_insert` applies. It routes through `Session::import_block` now,
+        // so the gate -- and the byte scan that fed it -- is gone.
         if let Some(r) = self.settings.clone().intercept(self, sql) {
             return r;
         }
@@ -1744,7 +2016,13 @@ impl Session {
                     rs
                 });
                 self.log_stmt(text, t.name(), t0, &r);
-                out.push(r?);
+                let rs = r?;
+                // A COMMIT is the statement boundary a transaction's logs have
+                // been waiting for; see `Session::drain_folds`.
+                if self.txn.is_none() && !self.fold_due.is_empty() {
+                    self.drain_folds()?;
+                }
+                out.push(rs);
                 continue;
             }
             if let Some(a) = admin_stmt(span) {
@@ -1783,17 +2061,33 @@ impl Session {
     /// exactly the ones an operator is looking for.
     fn exec_statement(&mut self, stmt: &Statement, sql: &str) -> Result<ResultSet> {
         let t0 = Instant::now();
-        let r = self.dispatch(stmt, t0);
-        self.log_stmt(sql, stmt_kind(stmt), t0, &r);
+        // Once, and handed down: the dispatcher's two refusals and the log
+        // entry all want the same `&'static str`.
+        let kind = stmt_kind(stmt);
+        let r = self.dispatch(stmt, kind, t0);
+        self.log_stmt(sql, kind, t0, &r);
+        // The statement is over, applied and logged, and no transaction is
+        // holding an overlay: the first moment a log that crossed
+        // `wal_fold_bytes` can safely be folded and truncated. Two loads and a
+        // predicted branch when nothing is due, which is every statement
+        // between two folds.
+        if r.is_ok() && self.txn.is_none() && !self.fold_due.is_empty() {
+            self.drain_folds()?;
+        }
         r
     }
 
-    fn dispatch(&mut self, stmt: &Statement, t0: Instant) -> Result<ResultSet> {
+    fn dispatch(
+        &mut self,
+        stmt: &Statement,
+        kind: &'static str,
+        t0: Instant,
+    ) -> Result<ResultSet> {
         // Nothing runs in a transaction that has already failed. Returning
         // `Ok` here is the shape of the bug: the statement's writes go into an
         // overlay the session is committed to discarding, and the client is
         // told they landed.
-        self.check_poisoned()?;
+        self.check_txn(kind)?;
         // DDL persists itself immediately (see the checkpoint below), and a
         // checkpoint inside a transaction would write out uncommitted parts.
         // Refused rather than silently promoted to an implicit commit, which
@@ -1810,7 +2104,7 @@ impl Session {
         // but it writes nothing, and a read-only session that could not
         // change database would be able to query only one of them.
         if self.read_only && !is_read(stmt) && !matches!(stmt, Statement::Use(_)) {
-            return Err(read_only_err(stmt_kind(stmt)));
+            return Err(read_only_err(kind));
         }
         // The read set goes through the `&self` path, and the only thing the
         // `&mut` half adds is the flush -- which is exactly the line that used
@@ -1828,6 +2122,7 @@ impl Session {
             Statement::Insert(i) => self.run_insert(i)?,
             Statement::CreateTable(c) => self.run_create_table(c)?,
             Statement::CreateDatabase { name, if_not_exists } => {
+                self.guard_dir_name(None, name)?;
                 self.catalog.create_database(name, *if_not_exists)?;
                 ResultSet::empty()
             }
@@ -2677,7 +2972,10 @@ impl Session {
                         plan.schema().len()
                     )));
                 }
-                operators::execute(&plan, &self.catalog)?
+                // The session's real budget, deadline and cancel flag, not
+                // the process-static tracker this used to reach. The identical
+                // aggregate was refused as a `SELECT` and accepted here.
+                operators::execute_ctx(&plan, &self.catalog, &self.limits.context())?.0
             }
         };
 
@@ -2740,14 +3038,10 @@ impl Session {
 
     /// One block from a bulk importer, checked the way an `INSERT` is.
     ///
-    /// The hook `io::emit` should call instead of reaching for
-    /// `catalog.table_by_path_mut(..).insert(..)`, which is the one write path
-    /// in the engine that bypasses constraints. Until it does, `Session::run`
-    /// refuses an import into a database that has any; see the gate there.
-    // Dead until that one line changes, and deliberately kept anyway: the
-    // whole point of the note above is that the fix should be a call, not a
-    // reimplementation of the checks somewhere else.
-    #[allow(dead_code)]
+    /// What `io::emit` calls instead of reaching for
+    /// `catalog.table_by_path_mut(..).insert(..)`, which was the one write path
+    /// in the engine that bypassed constraints -- and which is why an import
+    /// into a database with any constraint at all used to be refused outright.
     pub(crate) fn import_block(&mut self, path: &str, b: Block) -> Result<usize> {
         self.enforce_checks(path, &b)?;
         if self.ext.uniques.contains_key(path) {
@@ -2805,9 +3099,22 @@ impl Session {
             .insert_with(full, KeyConflict::Reject);
         match (&applied, staged) {
             (Ok(_), Some((seq, _))) => {
+                let t = self.fold_bytes;
                 let w = self.wal_for(path)?.expect("the log that staged the record");
                 w.commit(seq)?;
                 w.sync()?;
+                // The same threshold `log_insert` checks, and it has to be
+                // repeated because this path stages and commits by hand rather
+                // than routing through it. Without it a table declared UNIQUE
+                // is the one shape `wal_fold_bytes` does not reach: measured at
+                // a 128 KiB threshold, 200 single-row inserts left 414356 bytes
+                // of log against 16484 for the same inserts into a table with
+                // no UNIQUE. One `u64` load and one compare, beside the `fsync`
+                // on the line above.
+                let over = t != 0 && w.len() >= t;
+                if over {
+                    self.mark_fold_due(path);
+                }
             }
             (Err(_), Some((_, lsn))) => {
                 if let Some(w) = self.wal_for(path)? {
@@ -3037,7 +3344,7 @@ impl Session {
         m.source = optimizer::optimize(m.source)?;
         // Strictly before the sweep: hiding the rows first would leave the
         // scan under this nothing to read.
-        let blocks = operators::execute(&m.source, &self.catalog)?;
+        let blocks = operators::execute_ctx(&m.source, &self.catalog, &self.limits.context())?.0;
         if blocks.iter().all(|b| b.rows() == 0) {
             return Ok(ResultSet::with_affected(0));
         }
@@ -3437,6 +3744,12 @@ impl Session {
                 "table name `{to_name}` cannot be a directory name"
             )));
         }
+        // Includes `from_name` itself when the two databases are the same, so
+        // `RENAME TABLE beta TO ALPHA` beside an `alpha` is refused -- and so
+        // is `RENAME TABLE alpha TO ALPHA`, which has no safe spelling on a
+        // case-insensitive filesystem. Both destroyed *both* tables before
+        // this line existed: the link and the drop resolve to one directory.
+        self.guard_dir_name(Some(&to_db), &to_name)?;
 
         // Everything the old name owns has to be on disk before the parts can
         // be linked under the new one, and the delta has to be empty because
@@ -3581,7 +3894,8 @@ impl Session {
             Some(q) => {
                 let plan = self.plan(q)?;
                 let s = plan.schema().clone();
-                let blocks = operators::execute(&plan, &self.catalog)?;
+                let blocks =
+                    operators::execute_ctx(&plan, &self.catalog, &self.limits.context())?.0;
                 (s.fields().to_vec(), Some(blocks))
             }
             None => (
@@ -3645,13 +3959,6 @@ impl Session {
         if !primary_key.is_empty() && !order_by.is_empty() && primary_key[0] != order_by[0] {
             return Err(Error::bind("PRIMARY KEY must be a prefix of ORDER BY"));
         }
-        let partition_by = match &c.partition_by {
-            Some(e) => {
-                Some(resolve_key_exprs(std::slice::from_ref(e), &schema, "PARTITION BY")?[0])
-            }
-            None => None,
-        };
-
         let name = self.catalog.qualify(&c.name);
         // The reverse of the check in `run_create_view`: one namespace, so a
         // table may not take a name a view already answers to. Without this
@@ -3662,8 +3969,12 @@ impl Session {
                 "`{name}` is a view; a table cannot shadow it (DROP VIEW it first)"
             )));
         }
+        // `PARTITION BY` is refused by the parser, so no table this engine
+        // creates has one. The slot stays on `TableDef` because it is a fixed
+        // field of the TABLE file format: a database written before the
+        // refusal must still open and still describe itself truthfully.
         let def =
-            TableDef { name, schema, order_by, primary_key, partition_by, engine: c.engine };
+            TableDef { name, schema, order_by, primary_key, partition_by: None, engine: c.engine };
 
         // Both constraint kinds are decided *before* the table exists, so a
         // declaration this engine cannot enforce leaves nothing behind.
@@ -3678,6 +3989,11 @@ impl Session {
             self.catalog.create_table(def, c.if_not_exists)?;
             return Ok(ResultSet::empty());
         }
+        // Past the exact-name branch above, so this only ever sees a *new*
+        // name -- `IF NOT EXISTS` on the table that is already there never
+        // reaches it.
+        let (db, tbl) = self.catalog.resolve(&c.name);
+        self.guard_dir_name(Some(&db), &tbl)?;
         self.catalog.create_table(def, c.if_not_exists)?;
         // A re-created table must not inherit the constraints of the one that
         // had the name before it: a CREATE TABLE that declares none has
@@ -3878,9 +4194,88 @@ impl Session {
 /// A `Reader` is `Send + Sync + Clone` and owns no lifetime, which is what a
 /// connection pool and a wire server's per-connection model need: hand each
 /// connection a clone, and they run in parallel.
-#[derive(Clone)]
+///
+/// ## A `Db` *is* a connection
+///
+/// Cloning one mints a new identity, and that identity is what owns a
+/// transaction: `COMMIT` and `ROLLBACK` are refused when the open transaction
+/// belongs to a different clone. Without it a second connection's `COMMIT`
+/// durably published work it never authored and its `ROLLBACK` silently
+/// discarded a write it had been told was committed -- the same failure the
+/// engine already ruled a bug at the nested-`BEGIN` boundary, one scope out.
+/// So: **one clone per connection**, and share a clone only where you would
+/// share a connection.
+///
+/// The identity is the clone rather than the [`Writer`] guard because a wire
+/// server takes one guard per *statement*: `writer().execute("BEGIN")` and a
+/// later `writer().execute("COMMIT")` are one transaction on one connection,
+/// and a per-guard token would refuse them.
+///
+/// **Dropping a `Db` closes that connection**, which ends its transaction if
+/// one is open -- the same thing every other database does when a client hangs
+/// up, and mandatory once identity exists: connection ids are monotonic, so
+/// without it an abandoned handle left a transaction nothing in the process
+/// could ever name again, and every statement from every connection was
+/// refused forever.
 pub struct Db {
     inner: Arc<RwLock<Session>>,
+    /// This connection's budget and deadline, held here rather than read out
+    /// of the session so that [`Db::reader`] takes no lock at all. It used to:
+    /// opening a connection waited out an unrelated `INSERT`, and taking one
+    /// on a thread already holding the writer deadlocked with no query in
+    /// sight. The one honest consequence is that
+    /// `writer().set_memory_limit(..)` after `into_shared` no longer reaches
+    /// later `Reader`s -- set it on the `Reader`, which is where a per-
+    /// connection budget belongs.
+    limits: Limits,
+    /// This connection's identity *and* its liveness, in one allocation: the
+    /// `u64` is the id every ownership check compares, and the `Arc` is what
+    /// an open transaction holds a `Weak` on so a dropped connection can be
+    /// told from a busy one. Ids are monotonic and never reused, so without
+    /// the second half a disconnect while a transaction was open wedged the
+    /// database permanently -- nothing in the process could produce that id
+    /// again, and every statement from every connection was refused.
+    owner: Arc<u64>,
+}
+
+/// Connection identities. Never 0: that is the bare-`Session` caller, whose
+/// transactions are its own by construction.
+static NEXT_OWNER: AtomicU64 = AtomicU64::new(1);
+
+fn mint_owner() -> Arc<u64> {
+    Arc::new(NEXT_OWNER.fetch_add(1, Ordering::Relaxed))
+}
+
+impl Clone for Db {
+    /// A new connection, not a second name for this one. See the type's docs.
+    fn clone(&self) -> Db {
+        Db {
+            inner: Arc::clone(&self.inner),
+            limits: self.limits.clone(),
+            owner: mint_owner(),
+        }
+    }
+}
+
+impl Drop for Db {
+    /// Closing a connection ends its transaction, which is what every other
+    /// database does and what the owner token made mandatory: a `Db` clone
+    /// *is* a connection, so a client that hangs up mid-transaction -- no
+    /// panic, just a dropped handle -- must not leave one nothing can end.
+    ///
+    /// `try_write` rather than `write`, always: this drop can run on a thread
+    /// that already holds the writer through *another* clone, and blocking
+    /// there would trade a wedge for a deadlock. When it loses the race the
+    /// transaction is swept by the next [`Db::writer`] instead, which is why
+    /// the token is the guarantee and this is only the prompt path -- worth
+    /// having because a reader refuses while any transaction is open, and
+    /// readers alone would otherwise wait for a writer that may never come.
+    fn drop(&mut self) {
+        let Ok(mut g) = self.inner.try_write() else { return };
+        if g.txn.as_ref().is_some_and(|t| t.owner == *self.owner) {
+            g.reap_txn();
+        }
+    }
 }
 
 impl Db {
@@ -3900,11 +4295,11 @@ impl Db {
 
     /// A handle that can run reads concurrently with every other one.
     ///
-    /// Cheap: one `Arc` clone and the session's current limits. Take one per
-    /// connection and give each its own budget and deadline.
+    /// Cheap, and now *unconditionally* cheap: one `Arc` clone and a copy of
+    /// this connection's limits, with no lock taken. Take one per connection
+    /// and give each its own budget and deadline.
     pub fn reader(&self) -> Reader {
-        let limits = self.inner.read().unwrap_or_else(|e| e.into_inner()).limits.clone();
-        Reader { inner: Arc::clone(&self.inner), limits }
+        Reader { inner: Arc::clone(&self.inner), limits: self.limits.clone() }
     }
 
     /// Exclusive access, for the write set. Held until the guard drops, so a
@@ -3913,12 +4308,31 @@ impl Db {
     /// Readers block for exactly this long, which is why the guard should not
     /// be parked in a local across a `BEGIN`: use [`Db::transaction`].
     ///
-    /// One rule: do not take a [`Reader`] query on the thread that holds this
-    /// guard -- it would wait for a lock the same thread already owns. The
-    /// guard derefs to `Session`, so `writer().read(sql)` answers the same
+    /// One rule: do not run a [`Reader`] *query* on the thread that holds this
+    /// guard -- it would wait for a lock the same thread already owns. Taking
+    /// the handle is free (see [`Db::reader`]); it is the query that blocks.
+    /// The guard derefs to `Session`, so `writer().read(sql)` answers the same
     /// question without a second acquisition.
+    ///
+    /// The one store here is this connection's identity, which is what makes
+    /// `COMMIT` and `ROLLBACK` able to tell whose transaction they are ending.
     pub fn writer(&self) -> Writer<'_> {
-        Writer { g: self.inner.write().unwrap_or_else(|e| e.into_inner()) }
+        let mut g = self.inner.write().unwrap_or_else(|e| e.into_inner());
+        // The backstop for a connection whose own `Drop` could not take the
+        // lock. One `Option` test on every acquisition, one `u64` compare when
+        // a transaction is open, and the `Weak` is only touched for one that
+        // belongs to somebody else -- the path that was about to raise an
+        // error anyway.
+        if g.txn.as_ref().is_some_and(|t| {
+            t.owner != *self.owner && t.tok.as_ref().is_some_and(|w| w.strong_count() == 0)
+        }) {
+            g.reap_txn();
+        }
+        if g.owner != *self.owner {
+            g.owner = *self.owner;
+            g.owner_tok = Some(Arc::downgrade(&self.owner));
+        }
+        Writer { g }
     }
 
     /// Run `f` with exclusive access, wrapped in `BEGIN`/`COMMIT`.
@@ -3960,7 +4374,11 @@ impl Session {
     /// By value, because that is the honest signature: the whole point is that
     /// nobody keeps a `&mut Session` on the side while readers are running.
     pub fn into_shared(self) -> Db {
-        Db { inner: Arc::new(RwLock::new(self)) }
+        // The limits are copied out here rather than read per `reader()`, and
+        // `cancel` is an `Arc`, so a handle taken from the session before this
+        // call still stops the queries a `Reader` runs after it.
+        let limits = self.limits.clone();
+        Db { inner: Arc::new(RwLock::new(self)), limits, owner: mint_owner() }
     }
 }
 
@@ -3968,6 +4386,29 @@ impl Session {
 /// the entire existing write API is reachable unchanged.
 pub struct Writer<'a> {
     g: RwLockWriteGuard<'a, Session>,
+}
+
+impl Drop for Writer<'_> {
+    /// Roll back this connection's open transaction when the stack is
+    /// unwinding.
+    ///
+    /// **Only** when unwinding. A guard that drops normally with a
+    /// transaction still open is the wire-server shape -- one guard per
+    /// statement, `BEGIN` in one and `COMMIT` in a later one -- and rolling
+    /// back there would break it. A thread that dies mid-transaction is the
+    /// other case entirely: nobody is coming back for it, and the row it left
+    /// staged is one an unrelated connection used to be able to commit.
+    ///
+    /// One `thread::panicking()` read per guard drop, against the `RwLock`
+    /// release the same drop is already paying. Nothing at all in the shipped
+    /// binary, which is `panic = "abort"` -- which is why the owner token, not
+    /// this, is the fix for that case; this is the second line.
+    fn drop(&mut self) {
+        if std::thread::panicking() && self.g.txn.as_ref().is_some_and(|t| t.owner == self.g.owner)
+        {
+            let _ = self.g.rollback();
+        }
+    }
 }
 
 impl std::ops::Deref for Writer<'_> {
@@ -4260,6 +4701,28 @@ mod flock_sys {
     }
 }
 
+/// Take `LOCK_EX|LOCK_NB` on an already-open file, reporting only whether it
+/// was taken.
+///
+/// The spill reaper's whole test: a spill directory holds this on its `LOCK`
+/// for its lifetime, so success here means the owner's descriptor is closed
+/// and the tree is orphaned. Non-unix returns `false`, so the reaper there
+/// deletes nothing rather than deleting blind -- the same shape the non-unix
+/// `lock_data_dir` already takes.
+#[cfg(unix)]
+pub(crate) fn try_lock_exclusive(f: &File) -> bool {
+    use std::os::unix::io::AsRawFd;
+    // SAFETY: `f` owns a valid open descriptor for the whole call, and `flock`
+    // only inspects the descriptor -- it neither retains it nor touches user
+    // memory.
+    unsafe { flock_sys::flock(f.as_raw_fd(), flock_sys::LOCK_EX | flock_sys::LOCK_NB) == 0 }
+}
+
+#[cfg(not(unix))]
+pub(crate) fn try_lock_exclusive(_f: &File) -> bool {
+    false
+}
+
 /// Which claim a session makes on the data directory.
 ///
 /// `Shared` is what makes [`Session::open_read_only`] plural: `flock` lets any
@@ -4323,16 +4786,45 @@ fn lock_data_dir(root: &Path, mode: LockMode) -> Result<Option<File>> {
     use std::os::unix::io::AsRawFd;
 
     let path = root.join(LOCK_FILE);
-    let mut f = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        // Emphatically not `truncate`: the file is opened before the lock is
-        // held, and erasing the incumbent's pid would destroy the only thing
-        // that makes the failure diagnosable.
-        .truncate(false)
-        .open(&path)
-        .map_err(|e| Error::Io(format!("cannot open lock file {}: {e}", path.display())))?;
+    let shared = mode == LockMode::Shared;
+    let open = |write: bool| {
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(write)
+            .create(write)
+            // Emphatically not `truncate`: the file is opened before the lock
+            // is held, and erasing the incumbent's pid would destroy the only
+            // thing that makes the failure diagnosable.
+            .truncate(false)
+            .open(&path)
+    };
+    // The read-only-media fallback below fires for *this* and nothing else.
+    // "Any error at all" was too wide: a transient `EMFILE` or a bad path on a
+    // perfectly writable directory then produced a session holding no lock,
+    // which is exactly the race the lock exists to prevent -- reported as
+    // success.
+    const EROFS: i32 = 30;
+    let unwritable = |e: &std::io::Error| {
+        e.kind() == std::io::ErrorKind::PermissionDenied || e.raw_os_error() == Some(EROFS)
+    };
+    let failed = |e: &std::io::Error| {
+        Error::Io(format!("cannot open lock file {}: {e}", path.display()))
+    };
+    let mut f = match open(true) {
+        Ok(f) => f,
+        // A forensic copy on read-only media has no writable `LOCK`, and a
+        // shared holder never writes to one anyway -- it does not stamp its
+        // pid (see below), it only needs a descriptor to `flock`. So fall
+        // back to a read-only open, and then to no lock at all: a directory
+        // nobody can write cannot have a writer to exclude, which is the
+        // entire thing the lock is for.
+        Err(ref e) if shared && unwritable(e) => match open(false) {
+            Ok(f) => f,
+            Err(ref e) if unwritable(e) => return Ok(None),
+            Err(e) => return Err(failed(&e)),
+        },
+        Err(e) => return Err(failed(&e)),
+    };
 
     // SAFETY: `f` owns a valid open descriptor for the whole call, and `flock`
     // only inspects the descriptor -- it neither retains it nor touches user
@@ -4362,7 +4854,7 @@ fn lock_data_dir(root: &Path, mode: LockMode) -> Result<Option<File>> {
     // hold the lock at once, so the last writer would win a race nobody
     // arbitrates, and the pid is only there to name the *exclusive* holder in
     // the message above.
-    if mode == LockMode::Shared {
+    if shared {
         return Ok(Some(f));
     }
 
@@ -4446,6 +4938,20 @@ impl Sweep {
             zone: node.zone_filters,
         }))
     }
+}
+
+/// One refusal for every way a connection can reach another connection's
+/// transaction: ending it (`COMMIT`/`ROLLBACK`), nesting inside it (`BEGIN`),
+/// or quietly enlisting in it (any other statement).
+#[cold]
+fn foreign_txn(what: &str) -> Error {
+    Error::unsupported(format!(
+        "{what} refused: a transaction opened by another connection to this database is \
+         still in progress, and this connection has none of its own. Running {what} here \
+         would publish, discard or read writes this connection did not author -- the same \
+         failure a nested BEGIN is refused for, one scope out. This engine has a single \
+         writer, so wait for the other connection to COMMIT or ROLLBACK"
+    ))
 }
 
 #[cold]
@@ -4633,19 +5139,6 @@ fn mentions_admin_keyword(sql: &str) -> bool {
         }
     }
     false
-}
-
-/// Does the text contain the word `INFILE`?
-///
-/// The same shape as [`mentions_admin_keyword`] and for the same reason: it
-/// answers "no" for every statement that is not a bulk import, in one pass over
-/// the bytes and with no lexer, so the gate above costs a scan only on a
-/// database that actually has a constraint to protect.
-fn mentions_infile(sql: &str) -> bool {
-    let b = sql.as_bytes();
-    b.iter().enumerate().any(|(i, &c)| {
-        c | 0x20 == b'i' && b.len() - i >= 6 && b[i..i + 6].eq_ignore_ascii_case(b"infile")
-    })
 }
 
 /// Classify one statement's tokens as an operator statement.
@@ -5313,7 +5806,13 @@ fn link_table_dir(from: &Path, to: &Path, def: &TableDef, snap: &crate::storage:
     std::fs::create_dir_all(to)
         .map_err(|e| Error::Io(format!("cannot create {}: {e}", to.display())))?;
     for n in &names {
-        std::fs::hard_link(from.join(n), to.join(n)).map_err(|e| {
+        // A copy on a filesystem with no links, decided once for the process
+        // rather than re-attempted per part -- a big table is a lot of parts.
+        // Preferred over the `Ok(false)` contract below, which is also a legal
+        // answer here: that path makes the checkpoint re-encode every part
+        // from memory, where a copy just moves the bytes that are already
+        // right.
+        store::link_or_copy(&from.join(n), &to.join(n)).map_err(|e| {
             Error::Io(format!("cannot link {} into {}: {e}", n, to.display()))
         })?;
     }

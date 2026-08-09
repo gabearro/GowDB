@@ -43,9 +43,9 @@
 use crate::common::Result;
 use crate::exec::expr;
 use crate::planner::logical::BoundExpr;
-use crate::types::{Block, Column, Schema};
+use crate::types::{Block, Column, PhysicalType, Schema};
 
-use super::{Operator, ScanStats};
+use super::{MemGuard, Operator, ScanStats};
 
 /// How one output column is produced. Decided once, at construction: the
 /// classification depends only on the expression list, never on the block.
@@ -74,13 +74,56 @@ pub struct Project<'a> {
     /// the `Vec` is reused; the `Column`s in it are moved out and replaced with
     /// empty placeholders as the output is assembled.
     scratch: Vec<Column>,
+    /// What the computed columns of one block are allowed to weigh.
+    ///
+    /// `None` unless some *computed* output column is variable-width, decided
+    /// once here and never per block. Everything else is already bounded:
+    /// fixed-width output is `BLOCK_SIZE` times a small constant, and a column
+    /// taken or cloned from the input block is the input's memory, charged by
+    /// whoever produced it -- counting it again here would double it. What is
+    /// left is the one thing this operator can actually allocate without a
+    /// ceiling, and it needs one: `MAX_STR` is 16 MiB per value, so 8192 rows
+    /// of one computed `String` column is 128 GiB by construction.
+    guard: Option<MemGuard>,
+    /// Blocks until the next charge; see [`CHARGE_STRIDE`].
+    tick: u8,
 }
+
+/// Charge the computed columns on the first block and every this-many-th block
+/// after it.
+///
+/// The reason is structural, not measured. A `String` column's size can only
+/// be had by walking it -- `Column::bytes` sums `len` per row -- so charging
+/// every block puts 8192 dependent pointer loads per block on the projection
+/// path, which is a per-*row* cost in all but name and is what the mandate
+/// says not to add. A stride keeps it off fifteen blocks in sixteen.
+///
+/// Said honestly, because this machine has produced wrong performance
+/// conclusions before: two interleaved rounds of
+/// `max(length(concat(toString(a), toString(b))))` over 10M rows first read
+/// 1.13x and 1.18x against a build with the charge removed -- but a three-way
+/// isolate (no accounting at all / this file's charge removed / charge
+/// present) flipped the ordering run to run, with the *charged* build fastest
+/// in two of four rounds. So the cost is **below this machine's resolution**
+/// and the stride is not paying for a regression anyone measured. It is here
+/// because the walk is O(rows) by construction and a wider block or a slower
+/// allocator would surface it.
+///
+/// What the stride does *not* cost is the ceiling. Each projected block is
+/// transient -- it is handed upstream and dropped -- so the peak footprint is
+/// one block's worth whether it is charged or not; what the guard is for is
+/// refusing the *query*, and a projection that is over budget is over budget
+/// on every block, so it is refused within 16 of them. The first block is
+/// always charged, which is what catches the one-block query the 128 GiB
+/// worst case is built from.
+const CHARGE_STRIDE: u8 = 16;
 
 impl<'a> Project<'a> {
     pub fn new(
         input: Box<dyn Operator + 'a>,
         exprs: &'a [BoundExpr],
         schema: &'a Schema,
+        ctx: &super::QueryContext,
     ) -> Project<'a> {
         let mut plan = Vec::with_capacity(exprs.len());
         let mut computed = 0usize;
@@ -104,7 +147,23 @@ impl<'a> Project<'a> {
                 }
             });
         }
-        Project { input, exprs, schema, plan, width_needed, scratch: Vec::with_capacity(computed) }
+        let guard = plan
+            .iter()
+            .zip(schema.fields())
+            .any(|(s, f)| {
+                matches!(s, Step::Computed(_)) && f.ty.physical() == PhysicalType::Str
+            })
+            .then(|| MemGuard::new(ctx, "the projected block"));
+        Project {
+            input,
+            exprs,
+            schema,
+            plan,
+            width_needed,
+            scratch: Vec::with_capacity(computed),
+            guard,
+            tick: 0,
+        }
     }
 }
 
@@ -134,19 +193,36 @@ impl Operator for Project<'_> {
                 return Ok(Some(Block::rows_only(b.rows())));
             }
             // A projection naming a column the block does not have is a plan
-            // bug, and `expr::eval_all` owns the message for it. Deferring to
-            // it here keeps one wording for that mistake and keeps the check
-            // out of the per-column loop below.
+            // bug, and `expr::eval_all` owns the message for it -- this arm
+            // never returns `Ok`. Deferring to it here keeps one wording for
+            // that mistake and keeps the check out of the per-column loop
+            // below.
             if self.width_needed > b.width() {
                 return Ok(Some(Block::new(expr::eval_all(self.exprs, &b)?)?));
             }
+            // Decided once per block, never per column: two instructions, and
+            // `false` forever for a fixed-width projection.
+            let charge = self.guard.is_some() && self.tick == 0;
+            self.tick = if self.tick == 0 { CHARGE_STRIDE - 1 } else { self.tick - 1 };
             // Computed expressions read the *whole* input block, so they all
             // run before the first `Take` empties one of its columns. This
             // ordering is the invariant the whole operator rests on.
             self.scratch.clear();
+            let mut held = 0usize;
             for (e, s) in self.exprs.iter().zip(&self.plan) {
                 if matches!(s, Step::Computed(_)) {
-                    self.scratch.push(expr::eval(e, &b)?);
+                    let c = expr::eval(e, &b)?;
+                    // Charged as each column lands, so a projection with four
+                    // of these is refused on the first rather than after all
+                    // four are resident.
+                    if charge {
+                        held += c.bytes();
+                        self.guard
+                            .as_mut()
+                            .expect("`charge` is false without a guard")
+                            .grow_to(held)?;
+                    }
+                    self.scratch.push(c);
                 }
             }
             let mut out = Vec::with_capacity(self.plan.len());
@@ -200,7 +276,8 @@ mod tests {
             right: Box::new(col(1)),
             ty: DataType::Int64,
         }];
-        let mut p = Project::new(Box::new(Values::new(&r, &s)), &exprs, &out_schema);
+        let ctx = crate::exec::operators::QueryContext::new();
+        let mut p = Project::new(Box::new(Values::new(&r, &s)), &exprs, &out_schema, &ctx);
         let b = p.next().unwrap().unwrap();
         assert_eq!(b.column(0).as_i64().unwrap(), &[11, 22]);
         assert!(p.next().unwrap().is_none());
@@ -216,7 +293,8 @@ mod tests {
             Field::new("b2", DataType::Int64),
         ]);
         let exprs = vec![col(1), col(0), col(1)];
-        let mut p = Project::new(Box::new(Values::new(&r, &s)), &exprs, &out_schema);
+        let ctx = crate::exec::operators::QueryContext::new();
+        let mut p = Project::new(Box::new(Values::new(&r, &s)), &exprs, &out_schema, &ctx);
         let b = p.next().unwrap().unwrap();
         assert_eq!(b.width(), 3);
         assert_eq!(b.column(0).as_i64().unwrap(), &[10, 20]);
@@ -245,7 +323,8 @@ mod tests {
             },
             col(0),
         ];
-        let mut p = Project::new(Box::new(Values::new(&r, &s)), &exprs, &out_schema);
+        let ctx = crate::exec::operators::QueryContext::new();
+        let mut p = Project::new(Box::new(Values::new(&r, &s)), &exprs, &out_schema, &ctx);
         let b = p.next().unwrap().unwrap();
         assert_eq!(b.column(0).as_i64().unwrap(), &[10, 20]);
         assert_eq!(b.column(1).as_i64().unwrap(), &[11, 22]);
@@ -258,7 +337,8 @@ mod tests {
         let r = rows();
         let out_schema = Schema::empty();
         let exprs: Vec<BoundExpr> = vec![];
-        let mut p = Project::new(Box::new(Values::new(&r, &s)), &exprs, &out_schema);
+        let ctx = crate::exec::operators::QueryContext::new();
+        let mut p = Project::new(Box::new(Values::new(&r, &s)), &exprs, &out_schema, &ctx);
         let b = p.next().unwrap().unwrap();
         assert_eq!(b.rows(), 2);
         assert_eq!(b.width(), 0);
@@ -270,7 +350,8 @@ mod tests {
         let r = rows();
         let out_schema = Schema::new(vec![Field::new("x", DataType::Int64)]).unwrap();
         let exprs = vec![col(7)];
-        let mut p = Project::new(Box::new(Values::new(&r, &s)), &exprs, &out_schema);
+        let ctx = crate::exec::operators::QueryContext::new();
+        let mut p = Project::new(Box::new(Values::new(&r, &s)), &exprs, &out_schema, &ctx);
         let e = p.next().unwrap_err().to_string();
         assert!(e.contains("c7"), "{e}");
     }
@@ -281,7 +362,8 @@ mod tests {
         let r = rows();
         let out_schema = Schema::new(vec![Field::new("only", DataType::Int64)]).unwrap();
         let exprs = vec![col(0)];
-        let p = Project::new(Box::new(Values::new(&r, &s)), &exprs, &out_schema);
+        let ctx = crate::exec::operators::QueryContext::new();
+        let p = Project::new(Box::new(Values::new(&r, &s)), &exprs, &out_schema, &ctx);
         assert_eq!(p.schema().name(0), "only");
     }
 }

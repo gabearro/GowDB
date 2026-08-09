@@ -264,7 +264,7 @@ impl<'a> Sort<'a> {
                 // the one moment it means anything: `held` is what this sort
                 // got out of the shared budget before it ran out. See
                 // `share_of`.
-                None => runs.insert(RunSet::new(share_of(&guard))?),
+                None => runs.insert(RunSet::new(share_of(&guard), self.ctx)?),
             };
             set.push_run(&b, &perm, self.ctx)?;
             drop(b);
@@ -1495,9 +1495,9 @@ pub(crate) struct RunSet {
 }
 
 impl RunSet {
-    pub(crate) fn new(budget: usize) -> Result<RunSet> {
+    pub(crate) fn new(budget: usize, ctx: &QueryContext) -> Result<RunSet> {
         Ok(RunSet {
-            dir: spill::SpillDir::new()?,
+            dir: spill::SpillDir::new(&ctx.spill)?,
             runs: Vec::new(),
             schema: None,
             block_rows: BLOCK_SIZE,
@@ -1930,7 +1930,7 @@ fn fanin(ctx: &QueryContext, set: &RunSet) -> usize {
 /// it has been consumed so peak disk stays near one copy of the relation
 /// rather than two.
 fn merge_pass(set: RunSet, keys: &[SortKey], ctx: &QueryContext, fanin: usize) -> Result<RunSet> {
-    let mut out = RunSet::new(set.budget)?;
+    let mut out = RunSet::new(set.budget, ctx)?;
     out.rows = set.rows;
     out.schema = set.schema.clone();
     out.block_rows = set.block_rows;
@@ -1974,7 +1974,9 @@ pub(crate) mod spill {
     use std::io::{BufReader, Read, Write};
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
 
+    use super::super::SpillBudget;
     use crate::common::Result;
     use crate::persist::format::{Reader, Writer};
     use crate::persist::{reader, store, writer};
@@ -1994,6 +1996,40 @@ pub(crate) mod spill {
             const { std::cell::RefCell::new(Vec::new()) };
     }
 
+    /// The prefix every spill directory's name starts with. One place, so the
+    /// reaper and the creator cannot disagree about what is reapable.
+    const PREFIX: &str = "granular-spill-";
+
+    /// The flock'd file inside each spill directory that says its owner is
+    /// still alive. See [`reap`].
+    const OWNER: &str = "LOCK";
+
+    /// Unlink every spill directory under `root` whose owner is gone.
+    ///
+    /// Exact rather than heuristic, and deliberately not a pid or mtime test:
+    /// a live directory holds `LOCK_EX` on its `LOCK` file for as long as it
+    /// exists, so a successful `LOCK_EX|LOCK_NB` here *proves* the owner's
+    /// descriptor is closed -- which the kernel guarantees on `SIGKILL`, on a
+    /// panic-abort and on a crash. A recycled pid cannot make this delete a
+    /// live directory, and a busy one is skipped rather than raced.
+    ///
+    /// Best effort throughout: this runs at `Session::open`, one `open` plus
+    /// one `flock` per stale directory, and a temp directory that cannot be
+    /// read is a worse thing to fail a database open over than to leave.
+    pub(crate) fn reap(root: &Path) {
+        let Ok(entries) = std::fs::read_dir(root) else { return };
+        for e in entries.flatten() {
+            if !e.file_name().to_string_lossy().starts_with(PREFIX) {
+                continue;
+            }
+            let dir = e.path();
+            let Ok(f) = File::open(dir.join(OWNER)) else { continue };
+            if crate::session::try_lock_exclusive(&f) {
+                let _ = std::fs::remove_dir_all(&dir);
+            }
+        }
+    }
+
     /// A directory of spill files that unlinks itself when dropped.
     pub(crate) struct SpillDir {
         root: PathBuf,
@@ -2001,24 +2037,45 @@ pub(crate) mod spill {
         /// A second handle on someone else's directory: it may create files
         /// there but must not delete the tree. See [`SpillDir::borrowed`].
         owned: bool,
+        /// Held open, and flock'd, for exactly as long as this directory
+        /// exists. Never read; closing the descriptor is what tells [`reap`]
+        /// the tree is orphaned, so the field's only job is to stay alive.
+        _owner: Option<File>,
+        budget: Arc<SpillBudget>,
     }
 
     impl SpillDir {
-        pub(crate) fn new() -> Result<SpillDir> {
+        pub(crate) fn new(budget: &Arc<SpillBudget>) -> Result<SpillDir> {
             let n = SEQ.fetch_add(1, Ordering::Relaxed);
-            let root = std::env::temp_dir()
-                .join(format!("granular-spill-{}-{n}", std::process::id()));
+            let root = budget.root().join(format!("{PREFIX}{}-{n}", std::process::id()));
             std::fs::create_dir_all(&root)
                 .map_err(|e| store::io_err("create the spill directory", &root, e))?;
+            // One `create` and one `flock` per spill *directory* -- once per
+            // spilling operator, never per file and never per block.
+            let owner = File::create(root.join(OWNER))
+                .map_err(|e| store::io_err("create the spill lock", &root, e))?;
+            crate::session::try_lock_exclusive(&owner);
             #[cfg(test)]
             SPILLED.with(|s| s.borrow_mut().push(root.clone()));
-            Ok(SpillDir { root, next: 0, owned: true })
+            Ok(SpillDir {
+                root,
+                next: 0,
+                owned: true,
+                _owner: Some(owner),
+                budget: Arc::clone(budget),
+            })
         }
 
         /// A non-owning view, so a merge pass can read run files out of a
         /// directory whose lifetime belongs to the set it is consuming.
         pub(crate) fn borrowed(d: &SpillDir) -> SpillDir {
-            SpillDir { root: d.root.clone(), next: u64::MAX / 2, owned: false }
+            SpillDir {
+                root: d.root.clone(),
+                next: u64::MAX / 2,
+                owned: false,
+                _owner: None,
+                budget: Arc::clone(&d.budget),
+            }
         }
 
         /// A fresh, empty run file.
@@ -2033,7 +2090,7 @@ pub(crate) mod spill {
         pub(crate) fn create_buffered(&mut self, flush_at: usize) -> Result<RunWriter> {
             let path = self.root.join(format!("run-{:06}.grun", self.next));
             self.next += 1;
-            RunWriter::create(path, flush_at)
+            RunWriter::create(path, flush_at, Arc::clone(&self.budget))
         }
     }
 
@@ -2053,14 +2110,19 @@ pub(crate) mod spill {
         path: PathBuf,
         w: Writer,
         flush_at: usize,
+        budget: Arc<SpillBudget>,
     }
 
     impl RunWriter {
-        fn create(path: PathBuf, flush_at: usize) -> Result<RunWriter> {
+        fn create(
+            path: PathBuf,
+            flush_at: usize,
+            budget: Arc<SpillBudget>,
+        ) -> Result<RunWriter> {
             let file =
                 File::create(&path).map_err(|e| store::io_err("create the spill file", &path, e))?;
             let w = Writer::with_capacity(flush_at + (flush_at >> 2));
-            Ok(RunWriter { file, path, w, flush_at })
+            Ok(RunWriter { file, path, w, flush_at, budget })
         }
 
         pub(crate) fn push(&mut self, b: &Block) -> Result<()> {
@@ -2088,6 +2150,9 @@ pub(crate) mod spill {
             if bytes.is_empty() {
                 return Ok(());
             }
+            // Charged per `write(2)`, which is where the disk actually grows.
+            // Before the write, so the ceiling is a ceiling and not a report.
+            self.budget.charge(bytes.len() as u64)?;
             self.file
                 .write_all(&bytes)
                 .map_err(|e| store::io_err("write the spill file", &self.path, e))

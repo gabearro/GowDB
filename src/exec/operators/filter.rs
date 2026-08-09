@@ -37,16 +37,21 @@ use crate::exec::expr;
 use crate::planner::logical::BoundExpr;
 use crate::types::{Block, Schema};
 
-use super::{Operator, ScanStats};
+use super::{Operator, QueryContext, ScanStats};
 
 pub struct Filter<'a> {
     input: Box<dyn Operator + 'a>,
     predicate: &'a BoundExpr,
+    ctx: &'a QueryContext,
 }
 
 impl<'a> Filter<'a> {
-    pub fn new(input: Box<dyn Operator + 'a>, predicate: &'a BoundExpr) -> Filter<'a> {
-        Filter { input, predicate }
+    pub fn new(
+        input: Box<dyn Operator + 'a>,
+        predicate: &'a BoundExpr,
+        ctx: &'a QueryContext,
+    ) -> Filter<'a> {
+        Filter { input, predicate, ctx }
     }
 }
 
@@ -63,6 +68,15 @@ impl Operator for Filter<'_> {
         while let Some(b) = self.input.next()? {
             let sel = expr::eval_predicate(self.predicate, &b)?;
             if sel.is_empty() {
+                // On the `continue` arm ONLY. A filter that keeps anything
+                // returns below and never runs this, so the common path pays
+                // literally nothing and stays covered by the caller's
+                // per-block check. Only the loop that can spin without ever
+                // returning -- a predicate rejecting a whole table -- pays,
+                // and it pays one relaxed load against a block that just
+                // bought a full `eval_predicate` (3.16 ms per 2M rows, per
+                // this file's own header).
+                self.ctx.check()?;
                 continue;
             }
             // Nothing was rejected: hand the block through untouched rather
@@ -109,7 +123,8 @@ mod tests {
     fn run(data: &[Option<i64>], pred: &BoundExpr) -> Vec<i64> {
         let s = schema();
         let src = rows(data);
-        let mut f = Filter::new(Box::new(Values::new(&src, &s)), pred);
+        let ctx = QueryContext::new();
+        let mut f = Filter::new(Box::new(Values::new(&src, &s)), pred, &ctx);
         let mut out = Vec::new();
         while let Some(b) = f.next().unwrap() {
             for i in 0..b.rows() {
@@ -142,7 +157,8 @@ mod tests {
         let s = schema();
         let src = rows(&[Some(1)]);
         let p = gt(0);
-        let f = Filter::new(Box::new(Values::new(&src, &s)), &p);
+        let ctx = QueryContext::new();
+        let f = Filter::new(Box::new(Values::new(&src, &s)), &p, &ctx);
         assert_eq!(f.schema().len(), 1);
         assert_eq!(f.schema().name(0), "a");
     }

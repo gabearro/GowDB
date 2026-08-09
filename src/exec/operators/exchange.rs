@@ -336,6 +336,7 @@ impl<'a> Shape<'a> {
         &'s self,
         snap: &'s Snapshot,
         work: &'s [(u32, u32)],
+        ctx: &'s QueryContext,
     ) -> Box<dyn Operator + 's>
     where
         'a: 's,
@@ -348,12 +349,13 @@ impl<'a> Shape<'a> {
             sel: Vec::new(),
             acc: None,
             stats: ScanStats::default(),
+            ctx,
         });
         for l in &self.links {
             op = match l {
-                Link::Filter(p) => Box::new(filter::Filter::new(op, p)),
+                Link::Filter(p) => Box::new(filter::Filter::new(op, p, ctx)),
                 Link::Project { exprs, schema } => {
-                    Box::new(project::Project::new(op, exprs, schema))
+                    Box::new(project::Project::new(op, exprs, schema, ctx))
                 }
             };
         }
@@ -380,6 +382,7 @@ struct ShardScan<'s> {
     /// Survivors waiting to reach [`BLOCK_SIZE`].
     acc: Option<Block>,
     stats: ScanStats,
+    ctx: &'s QueryContext,
 }
 
 impl Operator for ShardScan<'_> {
@@ -403,6 +406,12 @@ impl Operator for ShardScan<'_> {
             let mut blk = p.read_columns(gi, &self.node.projection, live)?;
             self.stats.rows_read += blk.rows() as u64;
             if blk.rows() == 0 {
+                // On the `continue` arms only, for the reason `scan::Scan`
+                // spells out: this loop coalesces to `BLOCK_SIZE`, so a worker
+                // whose whole slice is tombstoned or PREWHERE-rejected would
+                // otherwise walk every granule it owns without ever returning
+                // to a checkpoint.
+                self.ctx.check()?;
                 continue;
             }
 
@@ -416,6 +425,7 @@ impl Operator for ShardScan<'_> {
                 }
             }
             if blk.rows() == 0 {
+                self.ctx.check()?;
                 continue;
             }
 
@@ -519,7 +529,7 @@ impl<'a> Exchange<'a> {
         let (shape, snap, work, ctx) = (&self.shape, &self.snap, &self.work, self.ctx);
         let parts: Vec<Result<(Partial, ScanStats)>> = pool::global().map(n, |k| {
             let mine = &work[span(work.len(), n, k)];
-            let pipe = shape.pipeline(snap, mine);
+            let pipe = shape.pipeline(snap, mine, ctx);
             run_shard(&shape.top, pipe, ctx)
         });
 
@@ -655,6 +665,13 @@ fn fleet<'a>(
     workers: usize,
 ) -> Option<Box<dyn Operator + 'a>> {
     let shape = analyze(plan)?;
+    // Built once per query, off the prototypes, so the width below can be
+    // sized against what one worker's block of new groups actually costs.
+    // `run_shard` builds the same list per worker anyway.
+    let per_group_heap = match &shape.top {
+        Top::Aggregate { aggs, .. } => aggregate::per_group_heap(&aggregate::protos(aggs).ok()?),
+        Top::Sort { .. } => 0,
+    };
     let table = catalog.table_by_path(&shape.node.table).ok()?;
     if shape.node.projection.iter().any(|&c| c >= table.schema().len()) {
         return None;
@@ -670,7 +687,11 @@ fn fleet<'a>(
         schema,
         snap,
         work,
-        workers,
+        // The planner sized the fleet on the *table*; the budget gets the last
+        // word, because N workers each hold a partial and the merge holds all
+        // N at once. See `aggregate::fleet_degree` -- a no-op at the default
+        // budget, one division and one `min` at any other.
+        workers: workers.min(aggregate::fleet_degree(ctx, per_group_heap)),
         out: Vec::new(),
         ready: false,
         stats: ScanStats::default(),
@@ -737,10 +758,10 @@ fn build_node<'a>(
             }
         }
         PhysicalPlan::Filter { input, predicate } => {
-            Box::new(filter::Filter::new(down(input)?, predicate))
+            Box::new(filter::Filter::new(down(input)?, predicate, ctx))
         }
         PhysicalPlan::Project { input, exprs, schema } => {
-            Box::new(project::Project::new(down(input)?, exprs, schema))
+            Box::new(project::Project::new(down(input)?, exprs, schema, ctx))
         }
         PhysicalPlan::Aggregate { input, group, aggs, schema } => {
             Box::new(aggregate::Aggregate::new(down(input)?, group, aggs, schema, ctx)?)
@@ -758,7 +779,7 @@ fn build_node<'a>(
         PhysicalPlan::LimitBy { input, limit, keys } => {
             Box::new(limit::LimitBy::new(down(input)?, limit, keys, ctx))
         }
-        PhysicalPlan::Distinct { input } => Box::new(distinct::Distinct::new(down(input)?)),
+        PhysicalPlan::Distinct { input } => Box::new(distinct::Distinct::new(down(input)?, ctx)),
         PhysicalPlan::Join { left, right, op, on, residual, schema } => Box::new(join::Join::new(
             down(left)?,
             down(right)?,

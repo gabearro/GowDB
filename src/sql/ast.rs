@@ -1041,7 +1041,6 @@ pub struct CreateTable {
     pub engine: Engine,
     pub order_by: Vec<Expr>,
     pub primary_key: Vec<Expr>,
-    pub partition_by: Option<Expr>,
     /// Every `CHECK` the statement declared, in source order.
     pub checks: Vec<CheckDef>,
     /// `AS SELECT ...`

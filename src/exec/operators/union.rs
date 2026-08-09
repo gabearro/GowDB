@@ -204,7 +204,7 @@ pub fn build_set<'a>(
     // unless `ALL`. Falling through to the concatenation gets that for free.
     if op == SetOp::Union || ops.len() < 2 {
         let u = Union { inputs: ops, schema, cur: 0 };
-        return Ok(if all { Box::new(u) } else { Box::new(Distinct::new(Box::new(u))) });
+        return Ok(if all { Box::new(u) } else { Box::new(Distinct::new(Box::new(u), ctx)) });
     }
     let mut branches = ops.into_iter();
     Ok(Box::new(SetDiff {

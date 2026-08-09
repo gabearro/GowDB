@@ -693,6 +693,18 @@ pub fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
     era * 146_097 + doe as i64 - 719_468
 }
 
+/// How many days month `m` of year `y` has, leap rules included by
+/// construction: it is the distance to the first of the next month, so there
+/// is no table to get wrong and no century rule to remember.
+///
+/// Lives here rather than beside its other caller in `exec` because it is
+/// written purely in terms of [`days_from_civil`], and because `src/types/`
+/// may not import from `src/exec/` -- the parser below needs it too.
+pub fn days_in_month(y: i64, m: u32) -> u32 {
+    let (ny, nm) = if m == 12 { (y + 1, 1) } else { (y, m + 1) };
+    (days_from_civil(ny, nm, 1) - days_from_civil(y, m, 1)) as u32
+}
+
 pub fn fmt_date(days: u32) -> String {
     let (y, m, d) = civil_from_days(days as i64);
     format!("{y:04}-{m:02}-{d:02}")
@@ -720,7 +732,12 @@ pub fn parse_civil_days(s: &str) -> Result<i64> {
     let y: i64 = parts[0].parse().map_err(|_| Error::exec(format!("bad year in '{s}'")))?;
     let m: u32 = parts[1].parse().map_err(|_| Error::exec(format!("bad month in '{s}'")))?;
     let d: u32 = parts[2].parse().map_err(|_| Error::exec(format!("bad day in '{s}'")))?;
-    if !(1..=12).contains(&m) || !(1..=31).contains(&d) {
+    // `d > 28 &&` short-circuits the calendar call for ~90% of real dates, so
+    // the common path pays one predictable compare and only days 29-31 reach
+    // `days_in_month`. Without the upper bound `2021-02-30` rolled over into
+    // `2021-03-02` and was stored as a success -- through `VALUES` and through
+    // `INFILE` both.
+    if !(1..=12).contains(&m) || d == 0 || (d > 28 && d > days_in_month(y, m)) {
         return Err(Error::exec(format!("'{s}' is not a valid date")));
     }
     Ok(days_from_civil(y, m, d))
@@ -751,10 +768,18 @@ pub fn parse_datetime(s: &str) -> Result<i64> {
     }
     let mut secs = 0i64;
     let mult = [3600i64, 60, 1];
+    // Bounded in both directions: unbounded components let `25:99:99` carry
+    // into the next day and `-5:00:00` walk time *backwards* into the previous
+    // one, both reported as a successful parse. One index and one range
+    // compare per component, on the parse path only.
+    let max = [23i64, 59, 59];
     for (i, p) in hms.iter().enumerate() {
         // tolerate fractional seconds by truncating them
         let p = p.split('.').next().unwrap_or(p);
         let v: i64 = p.parse().map_err(|_| Error::exec(format!("bad time in '{s}'")))?;
+        if !(0..=max[i]).contains(&v) {
+            return Err(Error::exec(format!("bad time in '{s}'")));
+        }
         secs += v * mult[i];
     }
     Ok(days * 86_400 + secs)

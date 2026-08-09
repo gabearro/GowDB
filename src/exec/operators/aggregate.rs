@@ -208,7 +208,7 @@ impl<'a> Aggregate<'a> {
     fn materialize(&mut self) -> Result<()> {
         self.ready = true;
         let mut guard = MemGuard::new(self.ctx, guard_name(self.nkeys));
-        let mut parts = Partitions::new(0, 0);
+        let mut parts = Partitions::new(0, 0, self.ctx);
         // A bare aggregate is one group that exists before the first row and
         // has no key to partition by, so it is the one shape that still fails
         // rather than spills -- and the one shape that cannot grow by
@@ -518,7 +518,7 @@ pub(crate) fn accumulate(
     ctx: &QueryContext,
     guard: &mut MemGuard,
 ) -> Result<Groups> {
-    let mut parts = Partitions::new(0, worker_ceiling(ctx));
+    let mut parts = Partitions::new(0, worker_ceiling(ctx, protos), ctx);
     // Same exception the serial path makes: a bare aggregate's one group exists
     // before the first row and has no key to partition by.
     let spill = (nkeys_of(group, aggs)? > 0).then_some(&mut parts);
@@ -556,16 +556,90 @@ pub(crate) fn accumulate(
 /// cheaper: the comparison is against `groups.bytes()`, which the `grow_to` on
 /// the same line already computed, so the block loop gains no load at all.
 ///
-/// `threads` and not the exchange's actual degree, because a worker is not told
-/// how many others there are. Over-dividing is the safe direction -- a narrower
-/// fleet spills a little earlier than it had to.
-///
 /// None of this makes the parallel aggregate stricter than it was: above a half
 /// the merge already failed, so the change is that the query spills at three
 /// eighths instead of failing at a half.
-fn worker_ceiling(ctx: &QueryContext) -> usize {
+///
+/// ## Why the divisor is [`fleet_degree`] and not the pool's width
+///
+/// It used to be `pool::global().threads()`, and that made the smallest budget
+/// a query could run under a function of the machine it ran on: an eighth of
+/// the budget split N ways is a per-worker ceiling that shrinks as 1/N, while
+/// the overshoot past it stays fixed at one block's worth of groups (the check
+/// is once per block, by design, and stays that way). Past some width the
+/// ceiling is below the granularity at which it can fire at all. Measured, same
+/// query and same 2M-row table, the smallest `max_memory_usage` that completed:
+/// 4M at 1 thread, 16M at 4, 48M at 32, **192M at 128** -- dead linear, 48x
+/// from 1 to 128 cores. A query sized on a dev box OOMs on a bigger server.
+///
+/// So the fleet is clamped instead of the ceiling: both sides derive the width
+/// from the *budget* via [`fleet_degree`], the per-worker ceiling never falls
+/// below [`MIN_WORKER_TABLE`], and the floor stops depending on the hardware.
+fn worker_ceiling(ctx: &QueryContext, protos: &[Box<dyn Accumulator>]) -> usize {
     let share = (ctx.mem.limit().max(0) as usize) / 8;
-    (share / crate::common::pool::global().threads().max(1)).max(1)
+    (share / fleet_degree(ctx, per_group_heap(protos))).max(MIN_WORKER_TABLE)
+}
+
+/// Heap one group's accumulators own, summed over the aggregates. One pass
+/// over the prototype list, once per query. See [`Accumulator::heap_bytes`].
+pub(crate) fn per_group_heap(protos: &[Box<dyn Accumulator>]) -> usize {
+    protos.iter().map(|p| p.heap_bytes()).sum()
+}
+
+/// The smallest per-worker group table worth running a worker for.
+///
+/// Below this the worker spills more than it holds, and the eighth-of-budget
+/// share is finer than the once-per-block check can resolve. 512 KiB is what
+/// one worker had at the narrowest width the sweep above found workable
+/// (1 thread, 4 MiB budget, `4M/8/1`), so a clamped fleet reproduces the
+/// serial floor rather than inventing a new one.
+const MIN_WORKER_TABLE: usize = 1 << 19;
+
+/// How many parallel workers this **budget** can pay for.
+///
+/// `pool::global().threads()` for the default 8 GiB budget and anything near
+/// it, so an unbudgeted query is untouched and this costs one division and one
+/// `min`, once per query, at plan-build time. A tight budget gets a narrower
+/// fleet instead of a fleet that cannot fit -- which is also what bounds the
+/// *merge*, since the partial count is the same number.
+///
+/// Called from [`exchange::fleet`](super::exchange) as well as from
+/// [`worker_ceiling`], and it has to be the same answer in both: a worker is
+/// never told how many others there are, so the two agree by both being a
+/// function of `ctx` alone.
+pub(crate) fn fleet_degree(ctx: &QueryContext, per_group_heap: usize) -> usize {
+    let threads = crate::common::pool::global().threads().max(1);
+    // `unlimited()` is `i64::MAX`; every product below would overflow it.
+    let limit = match ctx.mem.limit() {
+        l if l <= 0 => return threads,
+        l => l as usize,
+    };
+    // Two different things are being paid for out of two different pockets,
+    // and folding them into one `unit` cost real parallelism at the default
+    // budget -- see the note below.
+    //
+    // The steady-state group tables come out of the eighth `worker_ceiling`
+    // hands round, and no worker is worth running below `MIN_WORKER_TABLE`.
+    let by_table = (limit / 8) / MIN_WORKER_TABLE;
+    // The once-per-block overshoot comes out of the *whole* budget. The freeze
+    // is once per block by design, so a block may create up to `BLOCK_SIZE`
+    // groups and each allocates its accumulators' heap before anything is
+    // checked: 0 for `sum`/`count`, and 8192 x 16 KiB = 128 MiB for a `uniq`.
+    // That is transient peak, not table residency, so it is not the eighth's
+    // to pay for.
+    //
+    // Charging it to the eighth as well made the fleet width `budget / 1 GiB`
+    // for *any* aggregate holding a `uniq`, i.e. 8 workers at the default
+    // 8 GiB budget no matter how wide the machine. Measured on a 14-thread
+    // box, `SELECT uniq(s) FROM t` over 8M rows: 0.111 s at the pool's width,
+    // 0.122 s capped at 8 -- and 0.154 s at a 4 GiB budget, where the cap fell
+    // to 4. The cap is hardware-independent, so the wider the server the worse
+    // it reads.
+    let by_heap = match crate::common::BLOCK_SIZE.saturating_mul(per_group_heap) {
+        0 => threads,
+        u => limit / u,
+    };
+    by_table.min(by_heap).clamp(1, threads)
 }
 
 /// Where one aggregate's argument columns come from, decided once per query.
@@ -679,7 +753,7 @@ pub(crate) fn accumulate_into(
     // keys, plus the set id when there is more than one grouping.
     let ngroup = group.len() + sets.is_some() as usize;
     let nsets = sets.as_ref().map_or(1, |s| s.masks.len());
-    let mut groups = Groups::new(ngroup, aggs);
+    let mut groups = Groups::new(ngroup, aggs, protos);
 
     // No GROUP BY: exactly one group, and it has to exist even if no row
     // ever arrives.
@@ -1381,7 +1455,7 @@ fn fold_bucket(
     let mut guard = MemGuard::new(ctx, guard_name(group.len()));
     let mut input: Box<dyn Operator> =
         Box::new(SpillScan::open(bucket[0].schema.clone(), &paths));
-    let mut parts = Partitions::new(bucket[0].level, 0);
+    let mut parts = Partitions::new(bucket[0].level, 0, ctx);
     let mut t =
         accumulate_into(&mut input, group, aggs, protos, ctx, &mut guard, Some(&mut parts))?;
     // Unlinked as soon as it has been folded rather than with the whole
@@ -1554,6 +1628,11 @@ pub(crate) struct Groups {
     /// per worker -- for every aggregate that fit, and for the serial operator,
     /// which folds its own partitions as it streams them. See [`Overflow`].
     over: Option<Box<Overflow>>,
+    /// Heap owned by one group's accumulators, summed over the aggregates and
+    /// measured once per query off the prototypes. Multiplied by `len` rather
+    /// than by a capacity because it is exact that way: a reserved-but-unused
+    /// slot in `accs` holds no accumulator and therefore no heap.
+    per_group_heap: usize,
 }
 
 /// A parallel worker's spilled rows, and enough of the query context to fold
@@ -1572,7 +1651,12 @@ struct Overflow {
 /// An owned copy of a query's stop conditions: same cancel flag, same deadline,
 /// same meter, no borrow.
 fn own_ctx(ctx: &QueryContext) -> QueryContext {
-    QueryContext { cancel: ctx.cancel.clone(), deadline: ctx.deadline, mem: ctx.mem.clone() }
+    QueryContext {
+        cancel: ctx.cancel.clone(),
+        deadline: ctx.deadline,
+        mem: ctx.mem.clone(),
+        spill: ctx.spill.clone(),
+    }
 }
 
 /// Feed argument tuples straight into an accumulator, bypassing a block.
@@ -1603,14 +1687,14 @@ fn replay(acc: &mut dyn Accumulator, agg: &BoundAgg, tuples: &[GroupKey]) -> Res
     acc.update(&cols, &sel)
 }
 
-/// Charged per accumulator on top of its `Box`.
+/// Charged per accumulator slot for the accumulator struct itself.
 ///
-/// The `Accumulator` trait does not report its own footprint, so this is a
-/// flat estimate: about right for `sum`/`count`/`min`/`max`, an undercount for
-/// the stateful ones (`uniq`'s HLL, `quantile`'s reservoir). Making it exact
-/// needs an `Accumulator::heap_bytes()` in `exec::functions`; until then a
-/// `uniq` over millions of groups is accounted low, which is worth knowing
-/// before trusting the budget on that shape of query.
+/// A flat estimate of the *inline* part, which is about right for every
+/// accumulator here. What it never covered was the heap hanging off one, and
+/// [`Accumulator::heap_bytes`] now reports that: `Groups` reads it once per
+/// query off the prototypes and multiplies, so `uniq`'s 16 KiB register array
+/// is visible to the budget for every group without a virtual call anywhere
+/// near the block loop. See `Groups::per_group_heap`.
 const ACC_BYTES: usize = 48;
 
 // ------------------------------------------------------- integer group keys
@@ -1984,11 +2068,14 @@ fn lane_col<'c>(c: &'c Column) -> Option<LaneCol<'c>> {
 }
 
 impl Groups {
-    fn new(nkeys: usize, aggs: &[BoundAgg]) -> Groups {
+    fn new(nkeys: usize, aggs: &[BoundAgg], protos: &[Box<dyn Accumulator>]) -> Groups {
         Groups {
             nkeys,
             has_distinct: aggs.iter().any(|a| a.distinct),
             slots: vec![0; 64],
+            // One sum over the aggregate list, once per query. Zero per block
+            // and zero per row.
+            per_group_heap: protos.iter().map(|p| p.heap_bytes()).sum(),
             ..Default::default()
         }
     }
@@ -2152,6 +2239,7 @@ impl Groups {
             + self.slots.capacity() * size_of::<u64>()
             + self.hashes.capacity() * size_of::<u64>()
             + self.accs.capacity() * (size_of::<Box<dyn Accumulator>>() + ACC_BYTES)
+            + self.len * self.per_group_heap
             + self.seen.capacity() * size_of::<Option<FastSet<GroupKey>>>()
     }
 
@@ -2393,6 +2481,10 @@ pub(crate) struct Partitions {
     /// still succeeds; `0` disables it. Only a parallel worker sets it -- see
     /// [`worker_ceiling`].
     soft: usize,
+    /// Where the runs go and what they may weigh. An `Arc` clone taken at
+    /// construction rather than a `&QueryContext` borrowed: a `Partitions`
+    /// crosses out of `pool::map` on a `Groups`, exactly as `Overflow` does.
+    spill: std::sync::Arc<super::SpillBudget>,
 }
 
 /// One spilled partition, and its share of the directory's lifetime.
@@ -2417,8 +2509,9 @@ pub(crate) struct Partition {
 }
 
 impl Partitions {
-    pub(crate) fn new(level: u32, soft: usize) -> Partitions {
+    pub(crate) fn new(level: u32, soft: usize, ctx: &QueryContext) -> Partitions {
         Partitions {
+            spill: ctx.spill.clone(),
             dir: None,
             writers: Vec::new(),
             level,
@@ -2540,7 +2633,7 @@ impl Partitions {
         if self.writers[p].is_none() {
             let dir = match &mut self.dir {
                 Some(d) => d,
-                None => self.dir.insert(spill::SpillDir::new()?),
+                None => self.dir.insert(spill::SpillDir::new(&self.spill)?),
             };
             self.writers[p] = Some(dir.create_buffered(self.flush_at)?);
         }
@@ -2628,7 +2721,7 @@ impl Aggregate<'_> {
         let mut guard = MemGuard::new(self.ctx, guard_name(self.nkeys));
         let mut input: Box<dyn Operator> =
             Box::new(SpillScan::open(p.schema.clone(), std::slice::from_ref(&p.path)));
-        let mut parts = Partitions::new(p.level, 0);
+        let mut parts = Partitions::new(p.level, 0, self.ctx);
         // A spilled row already names the grouping set it missed under, so the
         // replay reads its keys straight off the block; re-expanding it here
         // would fold it into every *other* set as well. See [`replay_group`].
@@ -3246,7 +3339,13 @@ mod tests {
             fields.push((names[i].as_str(), a.ty.clone()));
         }
         let out = out_schema(fields);
-        let want = under(&rows, &s, &group, &aggs, &out, 512 << 20);
+        // 1 GiB, not the 512 MiB this asked for before `Accumulator::heap_bytes`
+        // existed. The list above contains a `uniq`, and 20,000 groups x a
+        // 16 KiB HLL register array is 312 MiB the flat `ACC_BYTES = 48` could
+        // not see: the reference run always held it, and now the budget knows.
+        // Raising the reference budget is the honest edit -- lowering the
+        // accounting back would be a test dictating the engine's numbers.
+        let want = under(&rows, &s, &group, &aggs, &out, 1 << 30);
         assert!(spilled_dirs().is_empty(), "the reference run spilled");
         let got = under(&rows, &s, &group, &aggs, &out, 2 << 20);
         assert!(!spilled_dirs().is_empty(), "nothing spilled");
@@ -3741,5 +3840,45 @@ mod tests {
             let want: i64 = (0..10).map(|j| k + j * 500).sum();
             assert_eq!(r[4], Value::Int(want), "sum of group {k}");
         }
+    }
+
+    /// `uniq`'s 16 KiB-per-group sketch must not cost the query its workers.
+    ///
+    /// The overshoot term (`BLOCK_SIZE * per_group_heap` = 128 MiB) used to be
+    /// charged against the same eighth of the budget the steady-state group
+    /// tables come out of, which made the fleet width `budget / 1 GiB` for any
+    /// aggregate holding a `uniq` -- 8 workers at the default budget, on a
+    /// machine of any width. Measured on a 14-thread box, `SELECT uniq(s)`
+    /// over 8M rows: 0.111 s at the pool's width against 0.122 s capped at 8,
+    /// and 0.154 s at a 4 GiB budget where the cap fell to 4.
+    #[test]
+    fn a_uniq_does_not_narrow_the_fleet_at_an_ordinary_budget() {
+        const HLL: usize = 16 * 1024;
+        let threads = crate::common::pool::global().threads().max(1);
+        let default = crate::exec::operators::DEFAULT_MEM_BUDGET;
+        for budget in [default, default / 2] {
+            // What the *whole* budget can pay for: one block of brand-new
+            // groups per worker. Written out rather than borrowed from the
+            // function under test, so this fails if the divisor moves again.
+            let cap = budget as usize / (crate::common::BLOCK_SIZE * HLL);
+            assert_eq!(
+                fleet_degree(&QueryContext::with_budget(budget), HLL),
+                threads.min(cap),
+                "a `uniq` gave up workers at a {budget}-byte budget"
+            );
+        }
+        // Still bounded where the bound means something: a budget too small
+        // for one worker's block of sketches gets exactly one worker.
+        assert_eq!(fleet_degree(&QueryContext::with_budget(64 << 20), HLL), 1);
+    }
+
+    /// The width is a function of the *budget*, never of the pool -- the
+    /// property `tests/resource_governance.rs` pins end to end at 1, 8, 64 and
+    /// 128 threads.
+    #[test]
+    fn the_per_worker_floor_is_a_function_of_the_budget_alone() {
+        let ctx = QueryContext::with_budget(16 << 20);
+        let threads = crate::common::pool::global().threads().max(1);
+        assert_eq!(fleet_degree(&ctx, 0), threads.min((16 << 20) / 8 / MIN_WORKER_TABLE));
     }
 }

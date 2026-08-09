@@ -72,6 +72,14 @@ pub struct Settings {
     /// this budget refuses them, so there is deliberately no second threshold
     /// setting to keep consistent with it.
     pub max_memory_usage: i64,
+    /// Ceiling on what one query may write to the spill directory. 0 -- the
+    /// default -- means no ceiling, the same convention `max_execution_time`
+    /// uses, and it is also the value that keeps the counter untouched: the
+    /// charge returns before it reads the atomic.
+    ///
+    /// Separate from `max_memory_usage` because spilling *amplifies*: an 8 MiB
+    /// budget measured 272 MB on disk, 34x, with nothing to stop it.
+    pub max_temporary_data_on_disk: u64,
     /// Per-statement wall clock. 0 means no deadline, which is the only value
     /// that keeps `Instant::now` out of the operator loop entirely.
     pub max_execution_time_ms: u64,
@@ -97,12 +105,34 @@ pub struct Settings {
     /// Read the first line of an import as column names and match by name
     /// rather than by position.
     pub input_format_with_names_use_header: bool,
+    /// Write-ahead log bytes, per table, that trigger an automatic fold into
+    /// parts at the next statement boundary. 0 disables it, which is what the
+    /// engine did unconditionally before this existed: nothing auto-
+    /// checkpointed, so a long-running writer grew `wal.log` without bound and
+    /// wrote no part file at all until a DDL, a BACKUP, an import or process
+    /// exit happened to call one.
+    pub wal_fold_bytes: u64,
+    /// Archived write-ahead log bytes to keep under `<data>/.wal-archive`.
+    ///
+    /// The value that governs is a process-wide static in `persist::wal` --
+    /// the archive tick runs where no `Settings` is in scope -- and this field
+    /// is the session's *mirror* of it: [`Handle::snapshot`] seeds it from the
+    /// static and [`Settings::apply_to`] pushes it back. That is not
+    /// bookkeeping for its own sake. Without a field, `set` wrote the static
+    /// directly, so this was the one setting a statement-scoped `SETTINGS`
+    /// clause could not un-scope: `SELECT count() FROM t SETTINGS
+    /// wal_archive_retention='1'` trimmed the archive to one segment and left
+    /// every later statement in the process at that value. Seeding from the
+    /// static rather than from `default()` is what keeps a second session in
+    /// the same process from pushing its default over the first one's `SET`.
+    pub wal_archive_retention: u64,
 }
 
 impl Default for Settings {
     fn default() -> Settings {
         Settings {
             max_memory_usage: crate::exec::operators::DEFAULT_MEM_BUDGET,
+            max_temporary_data_on_disk: 0,
             max_execution_time_ms: 0,
             // 64k rows: 16x `BULK_INSERT_THRESHOLD`, so every block bypasses
             // the delta, and small enough that one block of a 40-column table
@@ -112,6 +142,8 @@ impl Default for Settings {
             format_csv_delimiter: b',',
             format_csv_null: Box::from(""),
             input_format_with_names_use_header: true,
+            wal_fold_bytes: crate::persist::wal::DEFAULT_FOLD_BYTES,
+            wal_archive_retention: crate::persist::wal::DEFAULT_ARCHIVE_BYTES,
         }
     }
 }
@@ -125,12 +157,21 @@ impl Default for Settings {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Slot {
     MaxMemory,
+    MaxTempDisk,
     MaxTime,
     InsertBlock,
     AllowErrors,
     CsvDelim,
     CsvNull,
     CsvHeader,
+    FoldBytes,
+    /// The one slot that writes nothing on `Settings`. The archive's retention
+    /// budget is a *process* global (one `.wal-archive` directory per data
+    /// directory, and the archiver that trims it has no session), so it lives
+    /// in the static it has always lived in and this row is only the name that
+    /// reaches it. Keeping it off `Settings` also keeps `Settings` the size it
+    /// is, which matters because it is cloned into every `SHOW SETTINGS`.
+    WalRetention,
 }
 
 /// How a setting's text is read, and how its value is written back.
@@ -177,6 +218,16 @@ pub static SPECS: &[Spec] = &[
               0 means no limit",
     },
     Spec {
+        name: "max_temporary_data_on_disk",
+        kind: Kind::Bytes,
+        slot: Slot::MaxTempDisk,
+        doc: "ceiling on the bytes one query may write to the spill directory \
+              (<data>/.spill), charged per write as the external sort, GROUP BY and \
+              join flush their runs. Spilling amplifies -- a tight max_memory_usage \
+              buys a large spill -- so this is a separate number, not a multiple of \
+              that one. 0 means no limit",
+    },
+    Spec {
         name: "max_execution_time",
         kind: Kind::Seconds,
         slot: Slot::MaxTime,
@@ -221,6 +272,28 @@ pub static SPECS: &[Spec] = &[
         doc: "read an import's first line as column names and match columns by name \
               rather than by position",
     },
+    Spec {
+        name: "wal_fold_bytes",
+        kind: Kind::Bytes,
+        slot: Slot::FoldBytes,
+        doc: "write-ahead log bytes, per table, above which the next statement boundary \
+              folds that table's log into parts and truncates it. This is the only \
+              automatic checkpoint there is: without it a long-running writer never \
+              writes a part, and disk-full arrives far ahead of the data volume. Large \
+              on purpose -- a fold costs a whole-table rewrite, which is O(table) and \
+              not O(log), so a small threshold turns every few MB of log into one. \
+              0 disables it",
+    },
+    Spec {
+        name: "wal_archive_retention",
+        kind: Kind::Bytes,
+        slot: Slot::WalRetention,
+        doc: "byte budget for the archived write-ahead log under <data>/.wal-archive, \
+              which is what BACKUP ... INCREMENTAL and RESTORE ... UNTIL roll forward \
+              through. Segments older than the budget are trimmed as new ones arrive, \
+              so this is the window a point-in-time recovery can reach back into. \
+              Process-wide, not per session. 0 keeps every segment forever",
+    },
 ];
 
 /// The spec for `name`, case-insensitively.
@@ -259,6 +332,9 @@ impl Settings {
                 let n = parse_bytes(sp.name, value)?;
                 self.max_memory_usage = if n == 0 { i64::MAX } else { n };
             }
+            Slot::MaxTempDisk => {
+                self.max_temporary_data_on_disk = parse_bytes(sp.name, value)?.max(0) as u64
+            }
             Slot::MaxTime => self.max_execution_time_ms = parse_millis(sp.name, value)?,
             Slot::InsertBlock => {
                 let n = parse_u64(sp.name, value)?;
@@ -274,6 +350,12 @@ impl Settings {
             Slot::CsvDelim => self.format_csv_delimiter = parse_char(sp.name, value)?,
             Slot::CsvNull => self.format_csv_null = Box::from(value),
             Slot::CsvHeader => self.input_format_with_names_use_header = parse_bool(sp.name, value)?,
+            Slot::FoldBytes => {
+                self.wal_fold_bytes = parse_bytes(sp.name, value)?.max(0) as u64
+            }
+            Slot::WalRetention => {
+                self.wal_archive_retention = parse_bytes(sp.name, value)?.max(0) as u64
+            }
         }
         Ok(())
     }
@@ -290,12 +372,15 @@ impl Settings {
                     render_bytes(self.max_memory_usage)
                 }
             }
+            Slot::MaxTempDisk => render_zero_or_bytes(self.max_temporary_data_on_disk),
             Slot::MaxTime => render_secs(self.max_execution_time_ms),
             Slot::InsertBlock => self.max_insert_block_size.to_string(),
             Slot::AllowErrors => self.input_format_allow_errors_num.to_string(),
             Slot::CsvDelim => render_char(self.format_csv_delimiter),
             Slot::CsvNull => self.format_csv_null.to_string(),
             Slot::CsvHeader => if self.input_format_with_names_use_header { "1" } else { "0" }.into(),
+            Slot::FoldBytes => render_zero_or_bytes(self.wal_fold_bytes),
+            Slot::WalRetention => render_zero_or_bytes(self.wal_archive_retention),
         }
     }
 
@@ -306,10 +391,18 @@ impl Settings {
     /// already existed on the facade and had no caller that spoke SQL.
     pub fn apply_to(&self, sess: &mut Session) {
         sess.set_memory_limit(self.max_memory_usage);
+        sess.set_temp_disk_limit(self.max_temporary_data_on_disk);
         sess.set_timeout(match self.max_execution_time_ms {
             0 => None,
             ms => Some(Duration::from_millis(ms)),
         });
+        sess.set_wal_fold_bytes(self.wal_fold_bytes);
+        // The one push that leaves the session: process-wide by design, and
+        // written here rather than in `set` so that it takes effect at the
+        // same instant as everything else -- which is what gives a statement-
+        // scoped `SETTINGS` clause its scope back, and what stops a `SET` that
+        // fails on a later pair from having applied this one.
+        crate::persist::wal::set_archive_retention(self.wal_archive_retention);
     }
 
     /// A query context carrying this session's budget, deadline and cancel
@@ -321,6 +414,7 @@ impl Settings {
             cancel: sess.cancel_handle(),
             deadline: None,
             mem: crate::exec::operators::MemTracker::with_limit(self.max_memory_usage),
+            spill: sess.spill_budget(self.max_temporary_data_on_disk),
         };
         match self.max_execution_time_ms {
             0 => ctx,
@@ -367,6 +461,15 @@ fn parse_bytes(name: &str, v: &str) -> Result<i64> {
     n.checked_shl(shift)
         .filter(|&x| x >= 0 && (shift == 0 || (x >> shift) == n))
         .ok_or_else(|| bad(name, v, "overflows a 64-bit byte count"))
+}
+
+/// `render_bytes` for the settings whose 0 means "off" rather than "no bytes":
+/// `0K` is a value `SET` would take back and a reader would misread.
+fn render_zero_or_bytes(n: u64) -> String {
+    match n {
+        0 => "0".into(),
+        n => render_bytes(n as i64),
+    }
 }
 
 fn render_bytes(n: i64) -> String {
@@ -454,7 +557,7 @@ pub fn show(cfg: &Settings, like: Option<&str>) -> Result<ResultSet> {
     for sp in SPECS.iter().filter(|s| like.is_none_or(|p| like_match(p, s.name))) {
         cols[0].push(sp.name.into());
         cols[1].push(cfg.get(sp).into());
-        cols[2].push(def.get(sp).into());
+        cols[2].push(default_of(sp, &def).into());
         cols[3].push(kind_name(sp.kind).into());
         cols[4].push(sp.doc.into());
     }
@@ -465,6 +568,19 @@ pub fn show(cfg: &Settings, like: Option<&str>) -> Result<ResultSet> {
     let mut rs = ResultSet { schema, blocks: vec![block], ..ResultSet::empty() };
     rs.stats.rows = rows;
     Ok(rs)
+}
+
+/// What a fresh process would report for `sp`.
+///
+/// `Settings::default()` answers it for every session-scoped setting. It
+/// cannot answer for [`Slot::WalRetention`], which has no field to default:
+/// reading it back through `get` would return whatever the process is
+/// currently set to and make the `default` column agree with `value` forever.
+fn default_of(sp: &Spec, def: &Settings) -> String {
+    match sp.slot {
+        Slot::WalRetention => render_zero_or_bytes(crate::persist::wal::DEFAULT_ARCHIVE_BYTES),
+        _ => def.get(sp),
+    }
 }
 
 fn kind_name(k: Kind) -> &'static str {
@@ -526,7 +642,13 @@ impl Handle {
     /// statement, and holding the lock across a 10 GB import would deadlock
     /// the `SET` that wanted to change them.
     pub fn snapshot(&self) -> Settings {
-        self.0.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        let mut s = self.0.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        // The static is the truth for this one; the field is its mirror. Read
+        // it here so `SHOW SETTINGS` reports what the archive tick will
+        // actually use, and so the value restored after a scoped `SETTINGS`
+        // clause is the one that was really in force.
+        s.wal_archive_retention = crate::persist::wal::archive_retention();
+        s
     }
 
     pub fn store(&self, s: Settings) {

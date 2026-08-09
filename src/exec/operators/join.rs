@@ -1248,7 +1248,7 @@ impl Partitioner {
             .min(32);
         let n = want.min(hint_rows.max(2).next_power_of_two());
         Ok(Partitioner {
-            dir: spill::SpillDir::new()?,
+            dir: spill::SpillDir::new(&ctx.spill)?,
             sides: [SideFiles::new(n), SideFiles::new(n)],
             mask: n as u64 - 1,
             level,

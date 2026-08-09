@@ -49,8 +49,15 @@ const BIN: &str = env!("CARGO_BIN_EXE_granular");
 const ROWS: u64 = 2_000_000;
 
 /// The budget the `GROUP BY` tests run under. Against ~1.5 GiB of group table
-/// it is deep into the spilling region; see `worker_ceiling` for why the
-/// parallel aggregate's floor is around 96 MiB and not lower.
+/// it is deep into the spilling region.
+///
+/// It used to say "the parallel aggregate's floor is around 96 MiB and not
+/// lower". That number came from the old core-count-dependent
+/// `worker_ceiling`; the floor is now a function of the budget alone
+/// (`MIN_WORKER_TABLE`, plus one block's worth of accumulator heap for an
+/// aggregate that has any), so it is both lower and hardware-independent.
+/// 128 MiB is kept because it is what these tests were calibrated against,
+/// not because it is the edge.
 const TIGHT_AGG: i64 = 128 << 20;
 
 /// The budget the `ORDER BY` test runs under.
@@ -175,19 +182,29 @@ fn a_parallel_group_by_spills_under_a_small_budget_and_answers_exactly() {
     // 1.1M distinct keys out of 2M rows: enough that the fourteen partial
     // tables cannot all be resident, and enough that the fold has to put a key
     // one worker spilled together with the same key another worker held.
-    for q in [
-        "SELECT big, count(*), sum(v), min(v), max(v) FROM t GROUP BY big",
-        "SELECT big, count(DISTINCT k), sum(DISTINCT k), uniq(s) FROM t GROUP BY big",
-        "SELECT big, k, count(*) FROM t GROUP BY big, k",
-        "SELECT big, count(m), quantile(0.9)(m), max(s) FROM t GROUP BY big",
-        "SELECT big, count(*) FROM t WHERE k < 32 GROUP BY big",
+    // The budget is per query because one of them has a floor the others do
+    // not. `uniq` allocates a fixed 16 KiB HLL register array *per group*, and
+    // since `Accumulator::heap_bytes` exists the budget can finally see it:
+    // 1.1M groups is 18 GiB of registers, and the irreducible minimum is one
+    // block's worth of new groups -- 8192 x 16 KiB = 128 MiB -- because the
+    // freeze check is once per block and a block creates its groups before it.
+    // So that query gets room for a few workers' worth of that floor and still
+    // spills by three orders of magnitude; the rest keep the original 128 MiB.
+    // Before `heap_bytes` this query ran at 128 MiB while actually holding
+    // ~1.9 GiB, which is the defect, not the budget.
+    for (q, budget) in [
+        ("SELECT big, count(*), sum(v), min(v), max(v) FROM t GROUP BY big", TIGHT_AGG),
+        ("SELECT big, count(DISTINCT k), sum(DISTINCT k), uniq(s) FROM t GROUP BY big", 4 << 30),
+        ("SELECT big, k, count(*) FROM t GROUP BY big, k", TIGHT_AGG),
+        ("SELECT big, count(m), quantile(0.9)(m), max(s) FROM t GROUP BY big", TIGHT_AGG),
+        ("SELECT big, count(*) FROM t WHERE k < 32 GROUP BY big", TIGHT_AGG),
     ] {
         let p = plan(&mut s, q);
         let mut want = reference(&s, &p);
         want.sort();
         assert!(want.len() > 500_000, "`{q}` produced only {} groups", want.len());
 
-        let tight = QueryContext::with_budget(TIGHT_AGG);
+        let tight = QueryContext::with_budget(budget);
         let (mut got, spilled) = watch(|| {
             rows_of(&granular::exec::execute_parallel(&p, &s.catalog, &tight).unwrap().0)
         });

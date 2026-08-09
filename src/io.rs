@@ -61,7 +61,7 @@ use std::io::{BufWriter, Read, Write};
 use std::path::Path;
 
 use crate::common::{BitSet, Error, Result};
-use crate::exec::operators::{MemTracker, QueryContext};
+use crate::exec::operators::QueryContext;
 use crate::session::{ResultSet, Session, StreamItem};
 use crate::settings::Settings;
 use crate::sql::lexer::{Spanned, Token};
@@ -635,12 +635,20 @@ impl Sink {
                     .or_else(|| atou(text).and_then(|n| u32::try_from(n).ok()))
                     .ok_or_else(|| bad(text, &self.ty))? as u64,
             ),
-            (ColumnData::I64(v), Conv::DateTime) => v.push(
+            // `DateTime` rides the `U64` lane (`DataType::physical`), and is
+            // compared and sorted as one -- so a pre-1970 instant stored as
+            // two's complement would sort *above* 2262 and break `ORDER BY`.
+            // `parse_datetime` is signed and reaches back before the epoch, so
+            // the negative is refused here, at the lane boundary, exactly where
+            // `Value::as_u64` refuses it for `INSERT ... VALUES`. Bulk load
+            // agreeing with row insert is the whole point.
+            (ColumnData::U64(v), Conv::DateTime) => v.push(
                 std::str::from_utf8(text)
                     .ok()
                     .and_then(|s| crate::types::parse_datetime(s).ok())
                     .or_else(|| atoi(text))
-                    .ok_or_else(|| bad(text, &self.ty))?,
+                    .filter(|&n| n >= 0)
+                    .ok_or_else(|| bad(text, &self.ty))? as u64,
             ),
             (ColumnData::I64(v), Conv::Dec(s)) => {
                 v.push(dec_units(text, s).ok_or_else(|| bad(text, &self.ty))?)
@@ -742,6 +750,7 @@ pub fn import<R: Read>(
     dialect: &Dialect,
     cfg: &Settings,
     policy: ErrorPolicy,
+    ctx: &QueryContext,
 ) -> Result<ImportStats> {
     // An import inside a transaction would have to be either rolled back
     // (nothing stages a part) or made durable by a checkpoint (which would
@@ -789,13 +798,27 @@ pub fn import<R: Read>(
             map.push(schema.require(c)?);
         }
     } else {
-        map = (0..rec.width().min(schema.len())).collect();
+        // Every column, not "as many as the file happens to carry": clamping
+        // here made the width check below trivially true, so a two-field file
+        // loaded into a three-column table and the statement was reported as a
+        // success. (It filled the missing column with its DEFAULT, not with
+        // zero as an earlier note here claimed -- so the objection is not that
+        // the rows were wrong, it is that nobody asked for a partial load and
+        // nobody was told they got one.) Naming the columns is how a partial
+        // load is asked for, and that form still fills the rest with DEFAULT.
+        map = (0..schema.len()).collect();
     }
     if map.len() != rec.width() {
         return Err(Error::exec(format!(
-            "the file has {} fields per row and the statement names {} columns",
+            "the file has {} fields per row and the statement names {} columns. \
+             Name the columns the file does carry -- `INSERT INTO <table> ({}) FROM INFILE ..` \
+             -- to load it as a partial row and fill the rest with their DEFAULT",
             rec.width(),
-            map.len()
+            map.len(),
+            (0..rec.width().min(schema.len()))
+                .map(|c| schema.name(map[c]))
+                .collect::<Vec<_>>()
+                .join(", ")
         )));
     }
     // Duplicates would make the later column silently win; say so instead.
@@ -810,7 +833,10 @@ pub fn import<R: Read>(
     // small blocks rather than an out-of-memory error: that is what makes
     // "import a file bigger than the budget" work rather than merely fail
     // politely.
-    let mem = MemTracker::with_limit(cfg.max_memory_usage);
+    // The session's tracker, not a second one built here: an import and the
+    // statements around it share one budget rather than each getting the whole
+    // of it. `export`, one screen down, has taken a `QueryContext` all along.
+    let mem = &ctx.mem;
     let block_rows = cfg.max_insert_block_size as usize;
     let block_bytes = (cfg.max_memory_usage / 4).clamp(1 << 16, 1 << 28) as usize;
     mem.reserve(rec.capacity(), "the CSV read window")?;
@@ -822,7 +848,8 @@ pub fn import<R: Read>(
 
     loop {
         if rec.width() != map.len() {
-            bad_rows = fail_or_skip(bad_rows, policy, rec.line, wrong_width(rec.width(), map.len()))?;
+            let e = wrong_width(rec.width(), map.len());
+            bad_rows = fail_or_skip(bad_rows, policy, rec.line, st.rows, e)?;
             st.skipped += 1;
         } else {
             match decode_row(&mut sinks, &rec, &dialect.null, rows) {
@@ -834,18 +861,25 @@ pub fn import<R: Read>(
                     for s in sinks.iter_mut() {
                         s.rewind(rows);
                     }
-                    bad_rows = fail_or_skip(bad_rows, policy, rec.line, e)?;
+                    bad_rows = fail_or_skip(bad_rows, policy, rec.line, st.rows, e)?;
                     st.skipped += 1;
                 }
             }
         }
         if rows >= block_rows || used >= block_bytes {
+            // The deadline/cancel checkpoint, inside the branch that was
+            // already here: it runs once per emitted block (65,536 rows by
+            // default) and never per row. One relaxed load, plus one clock
+            // read only when a deadline is actually set, against a full column
+            // build and an ingest.
+            ctx.check()?;
             // The high-water mark is here by construction: `used` only grows
             // between emits, so the row before an emit is the widest this
             // import ever holds.
             st.peak_bytes = st.peak_bytes.max(rec.capacity() + used);
             mem.reserve(used, "the import's row block")?;
-            emit(sess, table, &schema, &map, &mut sinks, rows, cap)?;
+            emit(sess, table, &schema, &map, &mut sinks, rows, cap)
+                .map_err(|e| block_rejected(st.rows, rec.line, e))?;
             mem.release(used);
             st.rows += rows;
             (rows, used) = (0, 0);
@@ -856,7 +890,8 @@ pub fn import<R: Read>(
     }
     if rows > 0 {
         st.peak_bytes = st.peak_bytes.max(rec.capacity() + used);
-        emit(sess, table, &schema, &map, &mut sinks, rows, cap)?;
+        emit(sess, table, &schema, &map, &mut sinks, rows, cap)
+            .map_err(|e| block_rejected(st.rows, rec.line, e))?;
         st.rows += rows;
     }
     st.bytes = rec.bytes;
@@ -876,19 +911,65 @@ fn wrong_width(got: usize, want: usize) -> Error {
 
 /// The malformed-row policy, in one place so it cannot drift between the two
 /// ways a row goes bad.
-fn fail_or_skip(seen: u32, policy: ErrorPolicy, line: u64, e: Error) -> Result<u32> {
-    if seen >= policy.allow {
-        return Err(Error::exec(format!(
-            "line {line}: {e}. {}",
-            if policy.allow == 0 {
-                "No rows before it were lost; raise `input_format_allow_errors_num` to skip \
-                 bad rows instead"
-            } else {
-                "That is more bad rows than `input_format_allow_errors_num` allows"
-            }
-        )));
+///
+/// `committed` is [`ImportStats::rows`], which counts only rows an [`emit`] has
+/// already published -- so it is exactly what survives this failure. It has to
+/// be said: an import publishes parts as it streams and there is no prefix to
+/// roll back, and the message used to promise the opposite while a quarter of a
+/// million rows sat durable on disk. An operator who fixed the bad row and
+/// retried got them twice.
+fn fail_or_skip(
+    seen: u32,
+    policy: ErrorPolicy,
+    line: u64,
+    committed: usize,
+    e: Error,
+) -> Result<u32> {
+    if seen < policy.allow {
+        return Ok(seen + 1);
     }
-    Ok(seen + 1)
+    Err(Error::exec(format!(
+        "line {line}: {e}. {}{}",
+        committed_note(committed),
+        if policy.allow == 0 {
+            "; raise `input_format_allow_errors_num` to skip bad rows instead"
+        } else {
+            ". That is more bad rows than `input_format_allow_errors_num` allows"
+        }
+    )))
+}
+
+/// The durable prefix, in words. One place, because an import now has two ways
+/// to die past a block boundary and they owe the operator the same sentence.
+#[cold]
+fn committed_note(committed: usize) -> String {
+    match committed {
+        0 => "No rows before it were lost".into(),
+        n => format!(
+            "{n} rows before it are ALREADY COMMITTED and durable -- an import publishes \
+             parts as it streams, so nothing rolls them back; remove them before retrying \
+             or the retry will duplicate them"
+        ),
+    }
+}
+
+/// A block storage refused: a CHECK or UNIQUE violation.
+///
+/// Routing `emit` through `Session::import_block` is what made CHECK and
+/// UNIQUE reachable from a bulk import, and it created this second exit with
+/// it -- one that arrived with no line, no row count and no warning while a
+/// quarter of a million rows sat durable on disk. It says so now, and it says
+/// the other thing an operator reaches for first does not apply:
+/// `input_format_allow_errors_num` counts *malformed* rows, and a row that
+/// parses fine and breaks a table rule is not one of them.
+#[cold]
+fn block_rejected(committed: usize, line: u64, e: Error) -> Error {
+    Error::exec(format!(
+        "the block ending at line {line} was refused by the table: {e}. {}. \
+         `input_format_allow_errors_num` does not skip this -- it skips rows that will \
+         not parse, not rows a constraint rejects",
+        committed_note(committed)
+    ))
 }
 
 /// Decode one record into the sinks, returning the bytes it added.
@@ -942,7 +1023,11 @@ fn emit(
             None => Column::constant(schema.ty(c), &schema.field(c).fill_value(), rows)?,
         });
     }
-    sess.catalog.table_by_path_mut(table)?.insert(Block::new(full)?)?;
+    // Through `Session`, not straight at the catalog: this used to be the one
+    // write path in the engine that bypassed CHECK and UNIQUE, and the price of
+    // routing it is per *block*, not per row -- `enforce_checks` returns on an
+    // empty map and `import_block` adds one `contains_key`.
+    sess.import_block(table, Block::new(full)?)?;
     Ok(())
 }
 
@@ -1186,7 +1271,8 @@ pub(crate) fn run_import(
     let table = sess.catalog.qualify(&name);
     let f = File::open(&path).map_err(|e| Error::Io(format!("{path}: {e}")))?;
     let policy = ErrorPolicy { allow: cfg2.input_format_allow_errors_num };
-    let st = import(sess, &table, &columns, f, &d, &cfg2, policy)?;
+    let ctx = cfg2.context(sess);
+    let st = import(sess, &table, &columns, f, &d, &cfg2, policy, &ctx)?;
     let mut rs = ResultSet::with_affected(st.rows);
     rs.stats.rows = st.rows;
     rs.stats.rows_scanned = st.rows as u64 + st.skipped as u64;

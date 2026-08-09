@@ -105,13 +105,13 @@ fn run(
 ) -> Result<(Vec<Vec<Value>>, Option<JoinStrategy>, ScanStats)> {
     let ps = probe_schema();
     let vals = || -> Box<dyn Operator + '_> { Box::new(Values::new(rows, &ps)) };
-    let scan = || -> Result<Box<dyn Operator + '_>> { Ok(Box::new(Scan::new(node, cat)?)) };
+    let ctx = QueryContext::new();
+    let scan = || -> Result<Box<dyn Operator + '_>> { Ok(Box::new(Scan::new(node, cat, &ctx)?)) };
     let out = if probe_right {
         node.schema.concat(&ps)
     } else {
         ps.concat(&node.schema)
     };
-    let ctx = QueryContext::new();
     let (l, r) = if probe_right { (scan()?, vals()) } else { (vals(), scan()?) };
     let mut j = Join::new(l, r, op, on, None, &out, &ctx);
     if index {
@@ -267,7 +267,7 @@ fn the_index_join_never_materializes_the_keyed_side() -> Result<()> {
         let ctx = QueryContext::new();
         let mut j = Join::new(
             Box::new(Values::new(&rows, &ps)),
-            Box::new(Scan::new(&node, &db.catalog)?),
+            Box::new(Scan::new(&node, &db.catalog, &ctx)?),
             JoinOp::Inner,
             ON,
             None,
@@ -391,7 +391,7 @@ fn a_key_that_has_no_lane_falls_back_rather_than_dropping_rows() -> Result<()> {
     let ctx = QueryContext::new();
     let mut j = Join::new(
         Box::new(Values::new(&rows, &ps)),
-        Box::new(Scan::new(&node, &db.catalog)?),
+        Box::new(Scan::new(&node, &db.catalog, &ctx)?),
         JoinOp::Left,
         ON,
         None,

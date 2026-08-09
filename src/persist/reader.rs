@@ -769,7 +769,10 @@ pub fn table_parts_from_bytes(bytes: &[u8]) -> Result<(TableDef, Vec<String>, u6
     Ok((def, parts, wal_committed))
 }
 
-pub fn catalog_from_bytes(bytes: &[u8]) -> Result<Vec<(String, Vec<TableDef>)>> {
+/// The roster, and the directory's instance id -- 0 for a `CATALOG` written
+/// before the id existed, which is the one value the id never takes and so
+/// reads unambiguously as "unstamped".
+pub fn catalog_from_bytes(bytes: &[u8]) -> Result<(Vec<(String, Vec<TableDef>)>, u64)> {
     let body = doc_body(bytes)?;
     let mut r = Reader::new(body);
     let ndbs = count(r.varint()?, "database count")?;
@@ -786,10 +789,21 @@ pub fn catalog_from_bytes(bytes: &[u8]) -> Result<Vec<(String, Vec<TableDef>)>> 
         }
         out.push((db, defs));
     }
+    let instance = if r.is_empty() { 0 } else { r.u64()? };
     if !r.is_empty() {
-        return Err(bad(format!("{} trailing bytes in the catalog", r.remaining())));
+        // Named, because the overwhelmingly likely cause is not damage: this
+        // is what a *newer* build's CATALOG looks like to an older one, and an
+        // operator who has just rolled a binary back should be told that
+        // before they conclude their database is corrupt.
+        return Err(bad(format!(
+            "{} trailing bytes in the catalog. If this directory was last opened by a \
+             newer build of granular, that is the cause and the data is intact -- its \
+             catalog carries fields this build does not know about. Re-open it with the \
+             newer build",
+            r.remaining()
+        )));
     }
-    Ok(out)
+    Ok((out, instance))
 }
 
 fn get_table_def(r: &mut Reader) -> Result<TableDef> {
@@ -1798,17 +1812,27 @@ mod tests {
             ("default".to_string(), vec![table_def("a"), table_def("b")]),
             ("analytics".to_string(), vec![]),
         ];
-        let bytes = writer::catalog_doc(&roster);
-        let back = catalog_from_bytes(&bytes).unwrap();
+        let bytes = writer::catalog_doc(&roster, 0xDEAD_BEEF_F00D);
+        let (back, instance) = catalog_from_bytes(&bytes).unwrap();
         assert_eq!(back.len(), 2);
         assert_eq!(back[0].0, "default");
         assert_eq!(back[0].1, roster[0].1);
         assert!(back[1].1.is_empty());
+        assert_eq!(instance, 0xDEAD_BEEF_F00D, "the instance id round-trips");
+
+        // A `CATALOG` from a build with no instance id: the field is the last
+        // thing in the body, so dropping it is exactly what an older writer
+        // produced -- and it has to read as "unstamped", not as damage.
+        let mut w = format::Writer::new();
+        w.varint(0);
+        let (back, instance) = catalog_from_bytes(&writer::doc(&w.finish())).unwrap();
+        assert!(back.is_empty());
+        assert_eq!(instance, 0, "an unstamped catalog reads as 0, not an error");
     }
 
     #[test]
     fn a_document_whose_footer_points_elsewhere_is_rejected() {
-        let mut bytes = writer::catalog_doc(&[]);
+        let mut bytes = writer::catalog_doc(&[], 0);
         let start = bytes.len() - format::FOOTER_LEN;
         bytes[start..start + 8].copy_from_slice(&(format::HEADER_LEN as u64 + 1).to_le_bytes());
         let ck = format::checksum(&bytes[start..start + 12]);

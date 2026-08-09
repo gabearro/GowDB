@@ -74,6 +74,24 @@ pub trait Accumulator: Any + Send {
     fn as_any(&self) -> &dyn Any;
     /// A fresh accumulator of the same kind and configuration.
     fn boxed_clone(&self) -> Box<dyn Accumulator>;
+
+    /// Heap this accumulator owns beyond its own struct, for the memory
+    /// budget. Zero for the ones whose whole state is inline
+    /// (`sum`/`count`/`min`/`max`), which is why that is the default.
+    ///
+    /// Read **once per query, off a prototype** -- see `Groups::bytes` --
+    /// never per row and never per group, because there is one of these per
+    /// group per aggregate and walking them would put a virtual call per group
+    /// into the per-block accounting. That placement is what decides which
+    /// accumulators are worth overriding it on: a sketch whose size is fixed
+    /// at construction (`uniq`'s 16 KiB HLL) reports its true size for every
+    /// group it will ever have, while a set that grows with the data
+    /// (`uniqExact`, `quantileExact`, `groupArray`) is empty in the prototype
+    /// and correctly reports 0 there. The growing ones stay undercounted, as
+    /// they were before this existed; the fixed ones were undercounted by 341x.
+    fn heap_bytes(&self) -> usize {
+        0
+    }
 }
 
 /// An aggregate function definition.

@@ -851,3 +851,62 @@ fn show_create_table_emits_defaults_that_parse_back() -> Result<()> {
     assert_eq!(s.query("SELECT n FROM t")?.scalar(), Some(Value::Int(-1)));
     Ok(())
 }
+
+/// A date that does not exist is refused, rather than rolled over into one that
+/// does.
+///
+/// `toDate('2021-02-30')` returned `2021-03-02`, `toDate('2023-11-31')` returned
+/// `2023-12-01`, and `toDateTime('2021-02-30 25:99:99')` obliged with
+/// `2021-03-03 02:40:39`. Time components were unbounded in *both* directions,
+/// so `-5:00:00` walked the instant back into the previous day. Every one of
+/// them reported success, through the scalar functions and through both write
+/// paths, which is how a typo becomes a row nobody queries for.
+#[test]
+fn an_impossible_date_is_refused_rather_than_rolled_over() {
+    let mut s = db();
+    // NULL is how a failed cast reports itself here; the point is that the
+    // result is never a different, valid date.
+    for bad in [
+        "2021-02-30", "2023-11-31", "2021-04-31", "2021-06-31", "2021-09-31", "2021-01-32",
+        "2100-02-29", // a century that is not a leap year
+        "2021-02-29", // an ordinary year
+    ] {
+        assert_eq!(
+            scalar(&mut s, &format!("SELECT toDate('{bad}')")),
+            Value::Null,
+            "toDate('{bad}') must not roll over"
+        );
+    }
+    // ...and every real day still parses, leap rules included.
+    for good in ["2020-02-29", "2000-02-29", "2400-02-29", "2021-02-28", "2021-04-30", "2021-12-31"]
+    {
+        assert_eq!(
+            scalar(&mut s, &format!("SELECT toString(toDate('{good}'))")),
+            Value::str(good),
+            "toDate('{good}') must still parse"
+        );
+    }
+
+    // Time components are bounded at both ends.
+    for bad in ["25:00:00", "00:60:00", "00:00:60", "-5:00:00", "00:00:-3600", "00:00:99999"] {
+        assert_eq!(
+            scalar(&mut s, &format!("SELECT toDateTime('2020-03-01 {bad}')")),
+            Value::Null,
+            "toDateTime with time `{bad}` must not carry into another day"
+        );
+    }
+    assert_eq!(
+        scalar(&mut s, "SELECT toString(toDateTime('2020-03-01 23:59:59'))"),
+        Value::str("2020-03-01 23:59:59")
+    );
+
+    // And it reaches the write path: the literal is refused, so no row lands.
+    s.execute("CREATE TABLE d (v Date) ENGINE = MergeTree ORDER BY v").unwrap();
+    assert!(
+        s.execute("INSERT INTO d VALUES ('2021-02-30')").is_err(),
+        "an impossible date must fail the INSERT, not become 2021-03-02"
+    );
+    assert_eq!(scalar(&mut s, "SELECT count() FROM d"), Value::UInt(0));
+    s.execute("INSERT INTO d VALUES ('2021-02-28')").unwrap();
+    assert_eq!(scalar(&mut s, "SELECT count() FROM d"), Value::UInt(1));
+}

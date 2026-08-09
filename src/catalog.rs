@@ -59,6 +59,14 @@ pub struct Catalog {
     /// unchanged (open 86.9 ms against 86.2 ms, scan 9.2 ms against 8.7 ms,
     /// best of 16 interleaved runs per side, per-side spread ±12%).
     damaged: FastMap<String, Vec<DamagedPart>>,
+
+    /// This data directory's identity, minted once and then never changed --
+    /// 0 until the first checkpoint stamps it (and for a directory written by
+    /// a build that predates it). A backup carries the id of the directory it
+    /// was taken from, which is the only thing that distinguishes *this*
+    /// database's archived log from an unrelated one whose LSNs happen to
+    /// start at the same place. See `store::mint_instance`.
+    instance: u64,
 }
 
 impl Catalog {
@@ -71,7 +79,16 @@ impl Catalog {
             dir: None,
             delta_limit: DEFAULT_DELTA_LIMIT,
             damaged: FastMap::default(),
+            instance: 0,
         }
+    }
+
+    pub fn instance(&self) -> u64 {
+        self.instance
+    }
+
+    pub fn set_instance(&mut self, id: u64) {
+        self.instance = id;
     }
 
     /// A catalog backed by `dir`. The directory is created if absent; existing
@@ -139,6 +156,20 @@ impl Catalog {
         let mut v: Vec<String> = self.databases.keys().cloned().collect();
         v.sort();
         v
+    }
+
+    /// Database names, borrowed and unordered -- for the checks that only need
+    /// to look. [`Catalog::database_names`] clones and sorts every name; a
+    /// name check wants neither.
+    pub fn db_names(&self) -> impl Iterator<Item = &str> {
+        self.databases.keys().map(String::as_str)
+    }
+
+    /// Table names in `db`, borrowed and unordered. Empty for a database that
+    /// does not exist -- the caller is about to report that better than this
+    /// could.
+    pub fn table_names_in(&self, db: &str) -> impl Iterator<Item = &str> {
+        self.databases.get(db).into_iter().flat_map(|d| d.tables.keys().map(String::as_str))
     }
 
     pub fn create_database(&mut self, name: &str, if_not_exists: bool) -> Result<()> {
@@ -294,11 +325,17 @@ impl Catalog {
     /// `store::load_catalog` has nowhere to put it, and this is what that
     /// hand-off exists to stand in for. Passing an empty list lifts the
     /// quarantine, which only a caller that has re-read the files should do.
+    /// Additive, because damage is: a table can have a part file that will not
+    /// decode *and* a log that will not replay, and the loader finds them at
+    /// two different moments -- the parts through the reader's hand-off on its
+    /// resolve, the log and the `TABLE` file afterwards. Replacing would drop
+    /// whichever was found first, and the refusal message is a list of files
+    /// to restore, so a short list is a wrong instruction.
     pub fn quarantine(&mut self, path: &str, parts: Vec<DamagedPart>) {
         if parts.is_empty() {
             self.damaged.remove(path);
         } else {
-            self.damaged.insert(path.to_string(), parts);
+            self.damaged.entry(path.to_string()).or_default().extend(parts);
         }
     }
 
@@ -495,7 +532,7 @@ fn refuse_if_damaged(
     // needs the list, and a table with more than a handful of bad files has a
     // dead disk rather than a bad block.
     let mut msg = format!(
-        "table `{path}` is quarantined: {} of its part files could not be read when this \
+        "table `{path}` is quarantined: {} of its files could not be read when this \
          database was opened",
         parts.len()
     );
@@ -507,7 +544,7 @@ fn refuse_if_damaged(
         msg.push_str(&format!(". ...and {} more", parts.len() - 3));
     }
     msg.push_str(
-        ". Answering from the parts that did load would silently drop the rows in the ones \
+        ". Answering from the files that did load would silently drop the rows in the ones \
          that did not, so every read and write of this table is refused. Restore the file \
          from a backup and reopen, or DROP the table. No other table is affected.",
     );

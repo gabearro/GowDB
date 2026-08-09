@@ -396,6 +396,21 @@ A table's durable state is `parts + log`.
   stops cleanly and `open` truncates back to the last intact record so appends
   resume correctly. Damage *behind* a record that the log already accepted is
   something no append can do, so we report that as corruption.
+* **The log folds itself.** `wal_fold_bytes` (64 MiB, `0` disables) is the size
+  at which the next statement boundary writes that one table's parts and
+  truncates its log. Without it nothing auto-checkpointed: a process that only
+  ran `INSERT`s grew `wal.log` without bound and wrote no part file at all, so
+  disk-full arrived far ahead of the data volume. The number is large on
+  purpose -- a fold costs a whole-table rewrite, which is O(table) and not
+  O(log) -- and `system.wal` shows how close each table is to it.
+* **A damaged file quarantines its table, not the database.** A part file, a
+  `wal.log` or a `TABLE` that will not decode refuses that one table by name
+  and names the file to restore; every other table keeps answering, keeps
+  taking writes, and keeps checkpointing, and the quarantined table holds its
+  place in the roster so no later checkpoint collects its directory. The
+  exceptions are deliberate: the root `CATALOG` *is* the roster the fallback
+  reads, and `_granular_ddl` holds the constraints the write path enforces, so
+  neither degrades -- both refuse to open.
 
 `Session::set_wal_enabled(false)` turns the log off for bulk loading, where an
 `fsync` per statement dominates and you'd re-run the load after a crash anyway.
@@ -447,8 +462,15 @@ granular                          in-memory REPL
 granular --data ./db              persistent REPL
 granular -q "SELECT 1"            one shot
 granular --data ./db -f setup.sql run a script
+granular --read-only --data ./db  queries only, shared lock, no checkpoint
 echo "SELECT 1" | granular        piped input
 ```
+
+`--read-only` takes a *shared* directory lock, so several of them can hold one
+data directory at once and none of them excludes a writer for longer than a
+statement. It refuses every mutation by name, never opens a write-ahead log,
+and skips the checkpoint the other modes run at exit -- which is what lets it
+open a forensic copy on read-only media.
 
 REPL dot-commands: `.tables`, `.schema TABLE`, `.stats TABLE` (compression and
 index footprint), `.help`, `.quit`.
@@ -469,6 +491,18 @@ println!("{rs}");
 `Session::open(dir)` gives the same API backed by disk; call `checkpoint()` to
 persist.
 
+`Db` is the concurrent facade: `Db::reader()` hands out a `Send + Sync + Clone`
+read handle that takes no lock to construct, and `Db::writer()` takes the one
+exclusive guard. **A `Db` clone is a connection.** Cloning mints a new identity,
+and `COMMIT`, `ROLLBACK`, `BEGIN` and any ordinary statement are refused when
+the open transaction belongs to a different clone -- otherwise a second
+connection's `COMMIT` durably publishes work it never authored, and its
+`ROLLBACK` discards a write it was told had landed. So: one clone per
+connection, and share a clone only where you would share a connection.
+Dropping a clone closes that connection and rolls back its open transaction,
+the way a database does when a client hangs up -- without that, an abandoned
+handle would leave a transaction no other connection could ever end.
+
 ---
 
 ## Benchmark knobs
@@ -483,7 +517,7 @@ ONLY=sql      cargo bench      # just one section: scan | oltp | sql
 
 ## Testing
 
-38 test files, 1958 tests, 30k lines of test code against 87k of source. The
+41 test files, 2014 tests, 30k lines of test code against 87k of source. The
 part that earns its keep is the differential oracle.
 
 `tests/differential.rs` generates a random schema, random rows and a random
@@ -538,7 +572,7 @@ aspirational. Every "yes" below has a test in `tests/sql.rs`.
 
 | area | coverage |
 |---|---|
-| **DDL** | `CREATE TABLE [IF NOT EXISTS] … ENGINE = … ORDER BY … [PRIMARY KEY] [PARTITION BY]`, `CREATE TABLE … AS SELECT`, `CREATE DATABASE`, `DROP TABLE/DATABASE [IF EXISTS]`, `TRUNCATE`, `ALTER TABLE … ADD/DROP COLUMN`, `USE`; column `DEFAULT`, `NOT NULL`, and named `CONSTRAINT … CHECK (…)`, all enforced on insert |
+| **DDL** | `CREATE TABLE [IF NOT EXISTS] … ENGINE = … ORDER BY … [PRIMARY KEY]`, `CREATE TABLE … AS SELECT`, `CREATE DATABASE`, `DROP TABLE/DATABASE [IF EXISTS]`, `TRUNCATE`, `ALTER TABLE … ADD/DROP COLUMN`, `USE`; column `DEFAULT`, `NOT NULL`, and named `CONSTRAINT … CHECK (…)`, all enforced on insert |
 | **Transactions** | `BEGIN`, `COMMIT`, `ROLLBACK` (single-writer, snapshot isolation) |
 | **Settings and IO** | `SET`, `SHOW SETTINGS`, query-level `SETTINGS`, `INSERT … FROM INFILE`, `… INTO OUTFILE` (streaming CSV/TSV) |
 | **DML** | `UPDATE … SET … WHERE`, `DELETE FROM … WHERE`, `INSERT … VALUES` (multi-row, explicit column list), `INSERT … SELECT`, `ALTER TABLE … DELETE WHERE`, `ALTER TABLE … UPDATE … WHERE`, `OPTIMIZE TABLE [FINAL]` |
@@ -554,7 +588,7 @@ aspirational. Every "yes" below has a test in `tests/sql.rs`.
 | **Window** | `<fn> OVER (PARTITION BY … ORDER BY … <frame>)`, named windows, `ROWS`/`RANGE` frames; `row_number`, `rank`, `dense_rank`, `lag`, `lead`, `first_value`, `last_value`, `nth_value`, plus the aggregates below as window functions |
 | **Aggregates** | `count`, `sum`, `avg`, `min`, `max`, `any`, `anyLast`, `argMin`, `argMax`, `uniq` (HyperLogLog), `uniqExact`, `quantile`/`quantileExact`/`median`, `varPop`, `varSamp`, `stddevPop`, `stddevSamp`, `groupArray`, plus every `-If` combinator (`sumIf`, `countIf`, …) and `count(DISTINCT …)` |
 | **Backup and recovery** | `BACKUP TO '<archive>' [INCREMENTAL FROM '<base>']`, `VERIFY BACKUP '<archive>'`, `RESTORE FROM '<archive>' TO '<dir>' [UNTIL LSN <n> \| UNTIL TIMESTAMP '<ts>' \| UNTIL LATEST]` |
-| **Introspection** | `SHOW TABLES`, `SHOW DATABASES`, `SHOW CREATE TABLE`, `DESCRIBE`, `EXPLAIN [PLAN\|PIPELINE\|AST]`, `EXPLAIN ANALYZE`, `SHOW SETTINGS`, and the `system.parts` / `system.tables` / `system.columns` / `system.settings` tables |
+| **Introspection** | `SHOW TABLES`, `SHOW DATABASES`, `SHOW CREATE TABLE`, `DESCRIBE`, `EXPLAIN [PLAN\|PIPELINE\|AST]`, `EXPLAIN ANALYZE`, `SHOW SETTINGS`, and the `system.parts` / `system.tables` / `system.columns` / `system.settings` / `system.query_log` / `system.wal` tables. `system.wal` is the durability view: log bytes and the recovery watermark per table, what a crash would replay, the last checkpoint, and the archive's segment count, span and horizon |
 
 ### Not supported
 
@@ -568,7 +602,7 @@ feature. None of them silently do something else.
 | `GROUP BY … WITH TOTALS` | parses and is rejected. `ROLLUP`, `CUBE` and `GROUPING SETS` all work; `WITH TOTALS` is the one spelling that does not |
 | regex (`match`, `extract`) | would need a regex engine; the crate has no dependencies |
 | `SummingMergeTree` | rejected, see the deviations below |
-| materialized views, `ARRAY JOIN`, `SAMPLE`, `TTL`, table functions, distributed/replicated engines | not implemented |
+| materialized views, `ARRAY JOIN`, `SAMPLE`, `TTL`, `PARTITION BY`, table functions, distributed/replicated engines | not implemented |
 
 ### Deliberate deviations from clickhouse
 

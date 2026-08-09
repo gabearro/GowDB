@@ -704,7 +704,6 @@ impl Parser<'_> {
             engine: Engine::default(),
             order_by: Vec::new(),
             primary_key: Vec::new(),
-            partition_by: None,
             checks,
             as_query: None,
         };
@@ -753,9 +752,12 @@ impl Parser<'_> {
                 self.expect_kw("KEY")?;
                 ct.primary_key = self.key_list()?;
             } else if self.at_kw("PARTITION") {
-                self.bump();
-                self.expect_kw("BY")?;
-                ct.partition_by = Some(self.expr()?);
+                // Parsed, persisted and echoed back by `SHOW CREATE TABLE`, and
+                // it never reached storage: three rows spanning three years
+                // landed in one part, with no partition directories and no
+                // pruning. The same refusal as its two siblings below, for the
+                // same reason.
+                return Err(unimplemented_clause("PARTITION BY"));
             } else if self.at_kw("SAMPLE") {
                 // Both of these used to be parsed and thrown away, and the
                 // README already listed them as "not implemented" with the
@@ -3548,7 +3550,6 @@ mod tests {
                  note Nullable(String),
                  n Int32 NULL
              ) ENGINE = ReplacingMergeTree
-             PARTITION BY toYYYYMM(ts)
              ORDER BY (id, url)
              PRIMARY KEY id
              SETTINGS index_granularity = 1024",
@@ -3568,10 +3569,6 @@ mod tests {
         assert_eq!(ct.columns[4].ty, DataType::Nullable(Box::new(DataType::Int32)));
         assert_eq!(ct.order_by, vec![Expr::col("id"), Expr::col("url")]);
         assert_eq!(ct.primary_key, vec![Expr::col("id")]);
-        assert_eq!(
-            ct.partition_by,
-            Some(Expr::func("toYYYYMM", vec![Expr::col("ts")]))
-        );
         assert!(ct.as_query.is_none());
     }
 
