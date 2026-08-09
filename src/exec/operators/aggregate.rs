@@ -130,6 +130,15 @@
 //! fleet's floor is 14 x 8192 groups whatever the budget says. Both of those
 //! are the exchange's accounting, not this file's.
 //!
+//! ## Grouping sets
+//!
+//! `GROUPING SETS`, `ROLLUP` and `CUBE` are answered in the **same pass**:
+//! the key tuple grows a set id, each block is probed once per set with the
+//! keys that set drops read as NULL, and the whole of pass 2 and pass 3 is the
+//! code an ordinary `GROUP BY` already runs. [`GROUPING_SETS`] carries the
+//! design, the reason the binder hides the keys in an aggregate, and the
+//! measurements -- including the shape where a `UNION ALL` still wins.
+//!
 //! ## Three separable steps
 //!
 //! [`accumulate`] folds an input into a [`Groups`], [`Groups::absorb`] combines
@@ -143,9 +152,9 @@
 
 use std::mem::size_of;
 
-use crate::common::{BitSet, FastSet, Result, BLOCK_SIZE};
+use crate::common::{BitSet, Error, FastSet, Result, BLOCK_SIZE};
 use crate::exec::expr;
-use crate::exec::functions::Accumulator;
+use crate::exec::functions::{Accumulator, AggFn};
 use crate::planner::logical::{BoundAgg, BoundExpr};
 use crate::types::{Block, Column, ColumnBuilder, DataType, Schema, Value};
 
@@ -156,6 +165,10 @@ pub struct Aggregate<'a> {
     input: Box<dyn Operator + 'a>,
     group: &'a [BoundExpr],
     aggs: &'a [BoundAgg],
+    /// Key columns in the group table: `group.len()`, or -- under grouping
+    /// sets, where the keys ride in the marker and `group` is empty -- the
+    /// marker's keys plus the set id. Computed once; see [`Sets`].
+    nkeys: usize,
     schema: &'a Schema,
     ctx: &'a QueryContext,
     /// One empty accumulator per aggregate, cloned per group.
@@ -179,6 +192,7 @@ impl<'a> Aggregate<'a> {
             input,
             group,
             aggs,
+            nkeys: nkeys_of(group, aggs)?,
             schema,
             // Construct the prototypes now so a bad argument type is a
             // plan-time error rather than something discovered halfway
@@ -193,13 +207,13 @@ impl<'a> Aggregate<'a> {
 
     fn materialize(&mut self) -> Result<()> {
         self.ready = true;
-        let mut guard = MemGuard::new(self.ctx, guard_name(self.group.len()));
+        let mut guard = MemGuard::new(self.ctx, guard_name(self.nkeys));
         let mut parts = Partitions::new(0, 0);
         // A bare aggregate is one group that exists before the first row and
         // has no key to partition by, so it is the one shape that still fails
         // rather than spills -- and the one shape that cannot grow by
         // grouping in the first place.
-        let spill = (!self.group.is_empty()).then_some(&mut parts);
+        let spill = (self.nkeys > 0).then_some(&mut parts);
         let groups = accumulate_into(
             &mut self.input,
             self.group,
@@ -225,12 +239,228 @@ impl<'a> Aggregate<'a> {
 /// Fallible because an aggregate validates its argument types here: `avg` over
 /// a `String` has to fail before a single row is read.
 pub(crate) fn protos(aggs: &[BoundAgg]) -> Result<Vec<Box<dyn Accumulator>>> {
-    aggs.iter()
+    real_aggs(aggs)
+        .iter()
         .map(|a| {
             let tys: Vec<DataType> = a.args.iter().map(|e| e.ty()).collect();
             (a.func.new)(&tys, &a.params)
         })
         .collect()
+}
+
+// -------------------------------------------------------------- grouping sets
+
+/// `GROUP BY GROUPING SETS ((a,b), (a), ())`, and the `ROLLUP`/`CUBE` spellings
+/// that desugar to it: **one** pass over the input answering every set at once.
+///
+/// The group table is keyed by `[k0..kK-1, set id]` and each input row is
+/// probed once per set, with the keys that set drops read as NULL. Eight sets
+/// therefore cost eight probes and *one* scan, where the honest desugaring --
+/// a `UNION ALL` of eight aggregates -- costs eight of each.
+///
+/// ## What that is worth, and where it is not
+///
+/// Against the hand-written `UNION ALL` that means the same thing, 2M rows,
+/// alternating the two queries in one loop, best-of-9 rounds x 3 runs, min:
+///
+/// ```text
+///                                          single pass   union         ms
+///   ROLLUP(country, city)         14 threads     18.7     111.4    5.95x
+///   CUBE(country, city)           14 threads     29.7     167.2    5.63x
+///   CUBE(country, city, user_id)  14 threads   2073      1303      0.63x
+///   ROLLUP(country, city)             serial    118       121      1.02x
+///   ROLLUP over a filtered scan       serial    111       110      0.99x
+///   CUBE(country, city, user_id)      serial   2114      1269      0.60x
+/// ```
+///
+/// **The parallel figure is the one users get**, and it is not about the scan
+/// at all: `exchange::analyze` admits `Scan -> (Filter|Project)* -> Aggregate`
+/// and a `Union All` at the top of a plan is not that shape, so the
+/// desugaring runs on one thread whatever the machine has. A single
+/// `Aggregate` is exactly the admissible shape, so grouping sets go wide.
+///
+/// The serial figures say the rest. A set costs a probe, and the union's
+/// branches each get their *own* fast path -- a one-key `GROUP BY user_id`
+/// takes the integer lane loop, which is 1.7-2.5x the general `Value` path
+/// (see the table in the module header) -- where a single pass sends every
+/// set down one table and can only take the paths that table allows. Two of
+/// them it does take: the grand total is one group per block rather than one
+/// probe per row, and a set with a single surviving *string* key still uses
+/// the address memo. Adding those two took `ROLLUP(country, city)` from
+/// 211 ms to 118 ms serial. The one still missing is the integer lane loop
+/// for a set with a single surviving integer key, and `CUBE(country, city,
+/// user_id)` is what it costs: 100k distinct `user_id`s, four of the eight
+/// sets keeping it, all four on the general path. Recovering it means a lane
+/// probe that stores a *tuple* rather than a lane, and the hash it computes
+/// has to stay the one [`replay_group`]'s spilled rows will compute later --
+/// which is the whole difficulty, not the loop.
+///
+/// So: a win by a factor of six where the engine is allowed to parallelize, a
+/// wash serially, and a loss on the one shape where a union branch would have
+/// hit the integer fast path -- a loss the exchange cannot make up, because
+/// that shape barely parallelizes on either side (2114 -> 2073 ms). Recorded
+/// rather than hidden, because the shape that loses is a real query.
+///
+/// ## Where the sets live, and why it is not `group`
+///
+/// The binder hands this over as a **pseudo-aggregate appended to `aggs`**,
+/// leaving `LogicalPlan::Aggregate::group` empty, and that placement is a
+/// correctness requirement rather than a convenience. The optimizer's
+/// filter-pushdown rule sinks a conjunct below an aggregate when every column
+/// it reads is a group key, substituting `group[i]` for output column `i` --
+/// which is exactly wrong here, because output column `i` is *not* `group[i]`:
+/// it is `group[i]` for the sets that keep the key and NULL for the ones that
+/// drop it. `GROUP BY ROLLUP(a) HAVING a = 5` would keep the grand-total row
+/// (its `a` is NULL, so the filter above would have removed it) while
+/// pre-filtering the rows it sums. With `group` empty the rule's
+/// `group.get(i)` is `None` for every column and nothing sinks -- the same
+/// answer it already gives for a conjunct over an aggregate result.
+///
+/// The pseudo-aggregate is inert everywhere else by construction: `meta_path`
+/// refuses any aggregate it does not recognize, so `count()` under a grouping
+/// set never becomes a metadata fold, and every reader here strips it with
+/// [`real_aggs`] before it can be mistaken for one.
+///
+/// ## What a query with no grouping sets pays
+///
+/// Nothing measurable. The set loop runs once, `sets` is `None`, the fast
+/// paths and the general probe take the loops they always took, and the whole
+/// addition to the block loop is a slice-length compare. A/B against a build
+/// of the whole tree at the previous commit, alternating binaries per round,
+/// 2M rows, serial, best-of-13 rounds x 15 reps, ratio old/new:
+///
+/// ```text
+///   GROUP BY country (8 groups)                  0.997x
+///   GROUP BY user_id (100k groups)               1.003x
+///   GROUP BY country, city (2 keys, general)     0.987x
+///   sum(bytes)          (no GROUP BY)            0.739x  <- see below
+///   uniq(user_id)       (no GROUP BY)            0.892x  <- see below
+///   top-k by sort       (control)                0.967x
+/// ```
+///
+/// The two bare aggregates are noise, not a regression, and this machine is
+/// why the check had to be made explicitly: the **same binary against itself**
+/// on those two queries reads 0.950x and 0.941x, and `sum(bytes)` read 1.084x
+/// on a longer run of the identical pair. Its own old-side minimum wandered
+/// 5.6 -> 7.9 ms across runs of unchanged code. The three grouped shapes,
+/// whose numbers are ten times larger and land within 1.3% of each other, are
+/// the readable part of the table.
+pub static GROUPING_SETS: AggFn = AggFn {
+    name: "__grouping_sets",
+    // A bitmap literal, then one argument per key.
+    arity: (1, usize::MAX),
+    ret: |_, _| Ok(DataType::UInt64),
+    new: |_, _| {
+        Err(Error::exec(
+            "__grouping_sets is a planner marker and has no accumulator",
+        ))
+    },
+    supports_distinct: false,
+};
+
+/// The key expressions and the sets, decoded from the marker.
+struct Sets<'a> {
+    keys: &'a [BoundExpr],
+    /// One bitmask per set, bit `k` set when key `k` survives it. The set's
+    /// **index** here is its id, so two identical sets stay two sets:
+    /// `GROUPING SETS ((a), (a))` must answer twice, not once.
+    masks: Vec<u64>,
+    /// `masks[s]`'s key slots, precomputed once per query rather than tested
+    /// per row -- the probe loop walks these directly.
+    present: Vec<Vec<usize>>,
+}
+
+impl Sets<'_> {
+    /// Where the set id sits in the key tuple: after every key, so the emitted
+    /// tuple is `[keys..., id]` and lines up with the plan's schema.
+    fn id_slot(&self) -> usize {
+        self.keys.len()
+    }
+}
+
+/// The marker, if this aggregate has one. Always last: the binder appends it
+/// after the real aggregates so their output positions do not move.
+fn marker(aggs: &[BoundAgg]) -> Option<&BoundAgg> {
+    aggs.last().filter(|a| std::ptr::eq(a.func, &GROUPING_SETS))
+}
+
+/// The aggregates that actually accumulate. One pointer compare per call, and
+/// the call sites are per query or per merged partial, never per row.
+fn real_aggs(aggs: &[BoundAgg]) -> &[BoundAgg] {
+    match marker(aggs) {
+        Some(_) => &aggs[..aggs.len() - 1],
+        None => aggs,
+    }
+}
+
+/// Decode the marker's bitmap literal: one `1`/`0` per key, sets separated by
+/// commas, key 0 leftmost. A string rather than a mask per argument because it
+/// is what `EXPLAIN` prints -- `__grouping_sets('11,10,00', a, b)` says which
+/// groupings the plan will produce, which a list of decimal masks does not.
+fn sets_of(aggs: &[BoundAgg]) -> Result<Option<Sets<'_>>> {
+    let Some(m) = marker(aggs) else { return Ok(None) };
+    let bad = || Error::exec("malformed __grouping_sets marker");
+    let (bitmap, keys) = m.args.split_first().ok_or_else(bad)?;
+    let Some(Value::Str(bitmap)) = bitmap.as_literal() else { return Err(bad()) };
+    let mut masks = Vec::new();
+    for set in bitmap.split(',') {
+        if set.len() != keys.len() {
+            return Err(bad());
+        }
+        masks.push(set.bytes().enumerate().fold(0u64, |m, (k, c)| m | u64::from(c == b'1') << k));
+    }
+    if masks.is_empty() {
+        return Err(bad());
+    }
+    let present =
+        masks.iter().map(|m| (0..keys.len()).filter(|k| m >> k & 1 == 1).collect()).collect();
+    Ok(Some(Sets { keys, masks, present }))
+}
+
+/// How many key columns the group table has, marker included.
+fn nkeys_of(group: &[BoundExpr], aggs: &[BoundAgg]) -> Result<usize> {
+    Ok(match sets_of(aggs)? {
+        Some(s) => s.keys.len() + 1,
+        None => group.len(),
+    })
+}
+
+/// Read spilled rows back with the grouping already applied.
+///
+/// A frozen table spills the raw input row plus **one** column: the id of the
+/// set it was probing when it missed. That is the minimum that makes the
+/// partitions behave: each spilled record belongs to exactly one group, so it
+/// is partitioned by that group's hash and the invariant the whole spill rests
+/// on -- one group lives entirely in memory or entirely in one partition --
+/// survives the fan-out. Replaying it must therefore *not* re-expand: the
+/// keys this set drops are read as NULL by the `CASE`, and the set id comes
+/// straight out of the appended column.
+fn replay_group(sets: &Sets<'_>, id_col: usize) -> Vec<BoundExpr> {
+    let id = || BoundExpr::Column {
+        index: id_col,
+        ty: DataType::UInt64,
+        name: "__grouping_id".into(),
+    };
+    let mut out: Vec<BoundExpr> = Vec::with_capacity(sets.keys.len() + 1);
+    for (k, key) in sets.keys.iter().enumerate() {
+        let kept: Vec<Value> =
+            (0..sets.masks.len()).filter(|&s| sets.masks[s] >> k & 1 == 1).map(|s| Value::UInt(s as u64)).collect();
+        out.push(if kept.len() == sets.masks.len() {
+            // Every set keeps this key, so there is nothing to mask.
+            key.clone()
+        } else {
+            BoundExpr::Case {
+                when_then: vec![(
+                    BoundExpr::InList { expr: Box::new(id()), list: kept, negated: false },
+                    key.clone(),
+                )],
+                else_result: None,
+                ty: key.ty().to_nullable(),
+            }
+        });
+    }
+    out.push(id());
+    out
 }
 
 /// Force every group key down the general per-row `Value` path.
@@ -291,7 +521,7 @@ pub(crate) fn accumulate(
     let mut parts = Partitions::new(0, worker_ceiling(ctx));
     // Same exception the serial path makes: a bare aggregate's one group exists
     // before the first row and has no key to partition by.
-    let spill = (!group.is_empty()).then_some(&mut parts);
+    let spill = (nkeys_of(group, aggs)? > 0).then_some(&mut parts);
     let mut groups = accumulate_into(input, group, aggs, protos, ctx, guard, spill)?;
     let pending = parts.finish()?;
     if !pending.is_empty() {
@@ -436,8 +666,19 @@ pub(crate) fn accumulate_into(
     guard: &mut MemGuard,
     mut spill: Option<&mut Partitions>,
 ) -> Result<Groups> {
+    // Under grouping sets the key expressions ride in the marker and `group`
+    // is empty; see [`GROUPING_SETS`] for why the binder puts them there.
+    let sets = sets_of(aggs)?;
+    let aggs = real_aggs(aggs);
+    let group: &[BoundExpr] = match &sets {
+        Some(s) => s.keys,
+        None => group,
+    };
     let nagg = aggs.len();
-    let ngroup = group.len();
+    // The key tuple, and therefore what `probe` and the emitted row are: the
+    // keys, plus the set id when there is more than one grouping.
+    let ngroup = group.len() + sets.is_some() as usize;
+    let nsets = sets.as_ref().map_or(1, |s| s.masks.len());
     let mut groups = Groups::new(ngroup, aggs);
 
     // No GROUP BY: exactly one group, and it has to exist even if no row
@@ -486,6 +727,9 @@ pub(crate) fn accumulate_into(
         })
         .collect();
     let mut owned: Vec<Vec<Column>> = vec![Vec::new(); nowned];
+    // `0..group.len()`, once, so the ordinary path's probe loops read the same
+    // slice shape the grouping-set ones do without building it per block.
+    let all_keys: Vec<usize> = (0..group.len()).collect();
     let mut frozen = false;
     let forced = if spill.is_some() { super::sort::forced_spill_rows() } else { 0 };
     // Hoisted out of the block loop: `0` for every serial aggregate and for
@@ -497,6 +741,10 @@ pub(crate) fn accumulate_into(
         // bound here, and a block adds at most BLOCK_SIZE groups to it, so
         // charging after the block bounds the overshoot at one block's
         // worth of groups while keeping the atomic out of the row loop.
+        // (Under grouping sets, `nsets` blocks' worth -- the freeze is checked
+        // once per block and not once per set, so that every set of one block
+        // sees the same table state and a spilled row is spilled for the set
+        // it was actually probing.)
         ctx.check()?;
         let Some(b) = input.next()? else { break };
         let rows = b.rows();
@@ -529,246 +777,348 @@ pub(crate) fn accumulate_into(
             }
         }
 
-        // Pass 1: resolve each row's group. The only per-row hashing, and
-        // it probes the table through `probe` without allocating.
-        //
-        // `None` on the in-memory path, where a row's id *is* its index into
-        // `row_group`; `Some(hits)` once frozen, where the rows that missed
-        // have been left out. One branch per block, in pass 2.
-        let mut ids: Option<&[u32]> = None;
-        if frozen {
-            row_group.clear();
-            // The frozen path skips the string fast path: it is the slow half
-            // of a query that has already lost, and the general loop is the
-            // one that has a `find` without an insert.
-            hits.clear();
-            miss.clear();
-            mpart.clear();
-            for i in 0..rows {
-                for (k, c) in gcols.iter().enumerate() {
-                    probe[k] = c.as_ref().value(i);
-                }
-                let h = super::hash_values(&probe);
-                match groups.find(&probe, h) {
-                    Some(g) => {
-                        row_group.push(g as u32);
-                        hits.push(i as u32);
+        // One iteration for an ordinary GROUP BY. With grouping sets this is
+        // where the single pass happens: the block is read once and probed
+        // once per set, with `probe` carrying the set's own NULLs and its id
+        // between iterations. Everything below -- the fast paths, the counting
+        // sort, the vectorized fold, the freeze -- is the code an ordinary
+        // GROUP BY already ran, unchanged.
+        for set in 0..nsets {
+            // The key slots this pass reads. Every one of them for an ordinary
+            // GROUP BY, where the probe loops below take the shape they always
+            // took and this costs a slice compare per block.
+            let keep: &[usize] = match &sets {
+                Some(s) => {
+                    // Once per (block, set): the dropped keys read NULL for
+                    // every row of this pass and the id is constant, so neither
+                    // belongs in the row loop below.
+                    probe[s.id_slot()] = Value::UInt(set as u64);
+                    for (k, slot) in probe[..s.keys.len()].iter_mut().enumerate() {
+                        if s.masks[set] >> k & 1 == 0 {
+                            *slot = Value::Null;
+                        }
                     }
-                    None => {
-                        miss.push(i as u32);
-                        mpart.push(spill.as_deref().expect("frozen").part_of(h));
-                    }
+                    &s.present[set]
                 }
-            }
-            if !miss.is_empty() {
-                let p = spill.as_deref_mut().expect("frozen only with a spill target");
-                p.push(&b, &miss, &mpart, ctx)?;
-            }
-            if row_group.is_empty() {
-                continue;
-            }
-            ids = Some(&hits);
-        } else {
-            // Not `clear() + resize`: every one of these slots is written by
-            // the loops below, so zeroing them first was a 32 KiB memset per
-            // block. `resize` alone writes only what a *shorter* previous
-            // block left uncovered, which in steady state is nothing.
-            row_group.resize(rows, 0);
-            // A single key column gets its own loop per physical shape. Both
-            // are the same algorithm as the general path with the per-row
-            // `Value` taken out: it is the `Value` -- and the hashing and
-            // comparing that follow from it -- that costs, not the probing.
+                None => &all_keys,
+            };
+            // Pass 1: resolve each row's group. The only per-row hashing, and
+            // it probes the table through `probe` without allocating.
             //
-            // What that is worth, measured interleaved against `GENERAL_KEYS`
-            // (which forces this whole `match` down its last arm), alternating
-            // sides in one loop, best-of-7 per side, 2M rows, serial, three
-            // runs per cell, medians:
-            //
-            // ```text
-            //   groups        8        1k      100k
-            //   Int64      2.5x      1.85x     1.7x
-            //   Int64 NULL 1.7x      1.6x      1.6x      <- nullable, per row
-            //   String     2.4x      1.20x     1.2x
-            // ```
-            //
-            // The integer column keeps its factor as the table leaves cache
-            // because what it removed -- an `as_f64`, a `fract()`, three
-            // 128-bit folds and a `Vec<Value>` compare -- is work, not a miss.
-            // The string column's collapses because the memo can only spare
-            // the *hash*: past a few hundred distinct values per block the
-            // probe is a cache miss either way, and the memo's own lookup is a
-            // second one. Parallel (14 threads) reads 1.76x / 1.98x / 1.11x on
-            // the same three integer cells, which is the same story with this
-            // machine's noise on top.
-            let single = (ngroup == 1 && !general_keys()).then(|| gcols[0].as_ref());
-            let lane = single.and_then(lane_col);
-            match (lane, single) {
-                // Integer key: hash and compare the lane itself.
-                (Some(lc), Some(col)) => {
-                    let (kind, mask, guard) = (lc.kind, lc.mask, lc.guard);
-                    let nm = col.nulls.as_ref();
-                    let (rg, gs) = (&mut row_group[..], &mut groups);
-                    match (lc.lanes, nm.is_some()) {
-                        (Lanes::U(v), false) => {
-                            lane_pass::<_, false>(v, nm, mask, guard, kind, rg, gs, protos, aggs)
+            // `None` on the in-memory path, where a row's id *is* its index into
+            // `row_group`; `Some(hits)` once frozen, where the rows that missed
+            // have been left out. One branch per block, in pass 2.
+            let mut ids: Option<&[u32]> = None;
+            if frozen {
+                row_group.clear();
+                // The frozen path skips the string fast path: it is the slow half
+                // of a query that has already lost, and the general loop is the
+                // one that has a `find` without an insert.
+                hits.clear();
+                miss.clear();
+                mpart.clear();
+                for i in 0..rows {
+                    for &k in keep {
+                        probe[k] = gcols[k].as_ref().value(i);
+                    }
+                    let h = super::hash_values(&probe);
+                    match groups.find(&probe, h) {
+                        Some(g) => {
+                            row_group.push(g as u32);
+                            hits.push(i as u32);
                         }
-                        (Lanes::U(v), true) => {
-                            lane_pass::<_, true>(v, nm, mask, guard, kind, rg, gs, protos, aggs)
-                        }
-                        (Lanes::I(v), false) => {
-                            lane_pass::<_, false>(v, nm, mask, guard, kind, rg, gs, protos, aggs)
-                        }
-                        (Lanes::I(v), true) => {
-                            lane_pass::<_, true>(v, nm, mask, guard, kind, rg, gs, protos, aggs)
+                        None => {
+                            miss.push(i as u32);
+                            mpart.push(spill.as_deref().expect("frozen").part_of(h));
                         }
                     }
                 }
-                // String key. The owned `Value` (and its `Arc` bump) is built
-                // only for a genuinely new group, and the memo usually spares
-                // even the hash.
-                (None, Some(col)) if matches!(col.data, crate::types::ColumnData::Str(_)) => {
-                    let vals = col.as_str()?;
-                    let null_h = super::hash_null_key();
-                    let nulls = col.has_nulls();
-                    memo.reset(rows);
-                    for (i, slot) in row_group.iter_mut().enumerate() {
-                        if nulls && col.is_null(i) {
-                            *slot = groups.find_or_insert(&[Value::Null], null_h, protos, aggs)
-                                as u32;
-                            continue;
-                        }
-                        let s = &vals[i];
-                        *slot = match memo.get(s) {
-                            Some(g) => g,
-                            None => {
-                                let h = super::hash_str_key(s);
-                                let g = groups.find_or_insert_str(s, h, protos, aggs) as u32;
-                                memo.put(s, g);
-                                g
+                if !miss.is_empty() {
+                    let p = spill.as_deref_mut().expect("frozen only with a spill target");
+                    // The set id rides along, one constant column: a spilled
+                    // record has to name the single group it belongs to or the
+                    // partitions stop being disjoint. See [`replay_group`].
+                    p.push(&b, &miss, &mpart, sets.as_ref().map(|_| set as u64), ctx)?;
+                }
+                if row_group.is_empty() {
+                    continue;
+                }
+                ids = Some(&hits);
+            } else {
+                // Not `clear() + resize`: every one of these slots is written by
+                // the loops below, so zeroing them first was a 32 KiB memset per
+                // block. `resize` alone writes only what a *shorter* previous
+                // block left uncovered, which in steady state is nothing.
+                row_group.resize(rows, 0);
+                // A single key column gets its own loop per physical shape. Both
+                // are the same algorithm as the general path with the per-row
+                // `Value` taken out: it is the `Value` -- and the hashing and
+                // comparing that follow from it -- that costs, not the probing.
+                //
+                // What that is worth, measured interleaved against `GENERAL_KEYS`
+                // (which forces this whole `match` down its last arm), alternating
+                // sides in one loop, best-of-7 per side, 2M rows, serial, three
+                // runs per cell, medians:
+                //
+                // ```text
+                //   groups        8        1k      100k
+                //   Int64      2.5x      1.85x     1.7x
+                //   Int64 NULL 1.7x      1.6x      1.6x      <- nullable, per row
+                //   String     2.4x      1.20x     1.2x
+                // ```
+                //
+                // The integer column keeps its factor as the table leaves cache
+                // because what it removed -- an `as_f64`, a `fract()`, three
+                // 128-bit folds and a `Vec<Value>` compare -- is work, not a miss.
+                // The string column's collapses because the memo can only spare
+                // the *hash*: past a few hundred distinct values per block the
+                // probe is a cache miss either way, and the memo's own lookup is a
+                // second one. Parallel (14 threads) reads 1.76x / 1.98x / 1.11x on
+                // the same three integer cells, which is the same story with this
+                // machine's noise on top.
+                // `gcols.len() == 1` as well as `ngroup == 1`, because the two
+                // part company under grouping sets: `ROLLUP(a)` has one key
+                // column and two key *slots*, and `GROUPING SETS (())` has one
+                // slot and no column at all.
+                let single =
+                    (ngroup == 1 && gcols.len() == 1 && !general_keys()).then(|| gcols[0].as_ref());
+                let lane = single.and_then(lane_col);
+                match (lane, single) {
+                    // Integer key: hash and compare the lane itself.
+                    (Some(lc), Some(col)) => {
+                        let (kind, mask, guard) = (lc.kind, lc.mask, lc.guard);
+                        let nm = col.nulls.as_ref();
+                        let (rg, gs) = (&mut row_group[..], &mut groups);
+                        match (lc.lanes, nm.is_some()) {
+                            (Lanes::U(v), false) => {
+                                lane_pass::<_, false>(v, nm, mask, guard, kind, rg, gs, protos, aggs)
                             }
-                        };
-                    }
-                }
-                _ if ngroup > 0 => {
-                    for (i, slot) in row_group.iter_mut().enumerate() {
-                        for (k, c) in gcols.iter().enumerate() {
-                            probe[k] = c.as_ref().value(i);
+                            (Lanes::U(v), true) => {
+                                lane_pass::<_, true>(v, nm, mask, guard, kind, rg, gs, protos, aggs)
+                            }
+                            (Lanes::I(v), false) => {
+                                lane_pass::<_, false>(v, nm, mask, guard, kind, rg, gs, protos, aggs)
+                            }
+                            (Lanes::I(v), true) => {
+                                lane_pass::<_, true>(v, nm, mask, guard, kind, rg, gs, protos, aggs)
+                            }
                         }
-                        let h = super::hash_values(&probe);
-                        *slot = groups.find_or_insert(&probe, h, protos, aggs) as u32;
+                    }
+                    // String key. The owned `Value` (and its `Arc` bump) is built
+                    // only for a genuinely new group, and the memo usually spares
+                    // even the hash.
+                    (None, Some(col)) if matches!(col.data, crate::types::ColumnData::Str(_)) => {
+                        let vals = col.as_str()?;
+                        let null_h = super::hash_null_key();
+                        let nulls = col.has_nulls();
+                        memo.reset(rows);
+                        for (i, slot) in row_group.iter_mut().enumerate() {
+                            if nulls && col.is_null(i) {
+                                *slot = groups.find_or_insert(&[Value::Null], null_h, protos, aggs)
+                                    as u32;
+                                continue;
+                            }
+                            let s = &vals[i];
+                            *slot = match memo.get(s) {
+                                Some(g) => g,
+                                None => {
+                                    let h = super::hash_str_key(s);
+                                    let g = groups.find_or_insert_str(s, h, protos, aggs) as u32;
+                                    memo.put(s, g);
+                                    g
+                                }
+                            };
+                        }
+                    }
+                    // A grouping set that drops a key. The slots it keeps are
+                    // the only ones a row loop writes, because the rest were
+                    // set to NULL once, above. Ordered ahead of the general arm
+                    // rather than folded into it so that an ordinary GROUP BY
+                    // keeps the loop it has always run.
+                    //
+                    // The two shapes below are not micro-optimizations: they
+                    // are what stops a grouping *set* costing more than the
+                    // `UNION ALL` it replaces. Each branch of that union gets
+                    // its own fast path -- a one-key `GROUP BY country` takes
+                    // the string memo, `SELECT sum(v)` takes no key path at all
+                    // -- and a single pass that sent every set down the general
+                    // `Value` loop would hand all of that back. Measured on
+                    // `ROLLUP(country, city)` over 2M rows, serial, best-of-9
+                    // rounds: **211 ms without these two arms, 118 ms with**,
+                    // against 121 ms for the hand-written union. The rest of
+                    // the accounting is on [`GROUPING_SETS`].
+                    _ if keep.len() != gcols.len() => match keep {
+                        // The grand total. One group for the whole block, so
+                        // it is resolved once per block and not once per row.
+                        [] => {
+                            let h = super::hash_values(&probe);
+                            let g = groups.find_or_insert(&probe, h, protos, aggs) as u32;
+                            row_group.fill(g);
+                        }
+                        // One surviving string key. The address memo works
+                        // unchanged: within one (block, set) pass every other
+                        // slot of `probe` is constant, so an address still
+                        // determines the group. It is reset per pass, which is
+                        // what keeps that true.
+                        &[k]
+                            if matches!(
+                                gcols[k].as_ref().data,
+                                crate::types::ColumnData::Str(_)
+                            ) =>
+                        {
+                            let col = gcols[k].as_ref();
+                            let vals = col.as_str()?;
+                            let nulls = col.has_nulls();
+                            memo.reset(rows);
+                            for (i, slot) in row_group.iter_mut().enumerate() {
+                                // A NULL row's `vals[i]` is a placeholder whose
+                                // address means nothing, so it never memoizes.
+                                if !(nulls && col.is_null(i)) {
+                                    if let Some(g) = memo.get(&vals[i]) {
+                                        *slot = g;
+                                        continue;
+                                    }
+                                }
+                                probe[k] = col.value(i);
+                                let h = super::hash_values(&probe);
+                                let g = groups.find_or_insert(&probe, h, protos, aggs) as u32;
+                                if !(nulls && col.is_null(i)) {
+                                    memo.put(&vals[i], g);
+                                }
+                                *slot = g;
+                            }
+                        }
+                        _ => {
+                            for (i, slot) in row_group.iter_mut().enumerate() {
+                                for &k in keep {
+                                    probe[k] = gcols[k].as_ref().value(i);
+                                }
+                                let h = super::hash_values(&probe);
+                                *slot = groups.find_or_insert(&probe, h, protos, aggs) as u32;
+                            }
+                        }
+                    },
+                    _ if ngroup > 0 => {
+                        for (i, slot) in row_group.iter_mut().enumerate() {
+                            for (k, c) in gcols.iter().enumerate() {
+                                probe[k] = c.as_ref().value(i);
+                            }
+                            let h = super::hash_values(&probe);
+                            *slot = groups.find_or_insert(&probe, h, protos, aggs) as u32;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
+            // Pass 2: bucket row ids by group with a counting sort into one
+            // flat buffer. The obvious `vec![Vec::new(); ngroups]` allocates a
+            // vector per group *per block*, which on a high-cardinality
+            // grouping is millions of allocations.
+            //
+            // Everything here is indexed by group id but sized by *block*. The
+            // earlier version cleared, prefix-summed and scanned all `ngroups`
+            // slots on every block, and cloned an `ngroups`-long cursor to
+            // scatter with -- four O(total groups) passes to process at most
+            // 8192 rows. On a 4M-group aggregate that is ~15 billion slot
+            // visits and 1200 multi-megabyte allocations to do 10M rows of
+            // work, which is where the quadratic came from. `counts` now stays
+            // zeroed between blocks (each block resets exactly the slots it
+            // dirtied), so it is grown once and never re-cleared.
+            //
+            // Measured interleaved, 100k groups over 2M rows: 284ms -> 140ms,
+            // 2.02x, with an 8-group aggregate unchanged at 46ms. The gap
+            // widens with group count, because the term removed was
+            // O(blocks x groups) against O(blocks x block).
+            let ngroups = groups.len;
+            if counts.len() < ngroups {
+                counts.resize(ngroups, 0);
+            }
+            touched.clear();
+            for &g in &row_group {
+                let c = &mut counts[g as usize];
+                if *c == 0 {
+                    touched.push(g);
+                }
+                *c += 1;
+            }
+            // Hand each touched group a contiguous span of `order`, in
+            // first-touch order. `counts[g]` becomes the write cursor.
+            let mut base = 0u32;
+            for &g in &touched {
+                let n = std::mem::replace(&mut counts[g as usize], base);
+                base += n;
+            }
+            // Grown, never cleared, for the same reason `counts` is: the scatter
+            // below writes every one of the first `row_group.len()` slots exactly
+            // once (a counting sort is a permutation), so `clear() + resize(n, 0)`
+            // was a 32 KiB memset per block whose every byte was then overwritten.
+            // A *bare* aggregate paid it too -- one group, 8192 zeroes, every
+            // block -- which is most of why `sum`, `uniq` and `quantile` moved in
+            // the module header's table without their key path changing at all.
+            if order.len() < row_group.len() {
+                order.resize(row_group.len(), 0);
+            }
+            // Two scatters rather than one indirection: `order` has to hold *block*
+            // row ids either way, and paying an `ids[j]` load per row on the path
+            // that does not need it would tax every aggregate that fits in memory.
+            match ids {
+                None => {
+                    for (i, &g) in row_group.iter().enumerate() {
+                        let at = &mut counts[g as usize];
+                        order[*at as usize] = i as u32;
+                        *at += 1;
                     }
                 }
-                _ => {}
-            }
-        }
-
-        // Pass 2: bucket row ids by group with a counting sort into one
-        // flat buffer. The obvious `vec![Vec::new(); ngroups]` allocates a
-        // vector per group *per block*, which on a high-cardinality
-        // grouping is millions of allocations.
-        //
-        // Everything here is indexed by group id but sized by *block*. The
-        // earlier version cleared, prefix-summed and scanned all `ngroups`
-        // slots on every block, and cloned an `ngroups`-long cursor to
-        // scatter with -- four O(total groups) passes to process at most
-        // 8192 rows. On a 4M-group aggregate that is ~15 billion slot
-        // visits and 1200 multi-megabyte allocations to do 10M rows of
-        // work, which is where the quadratic came from. `counts` now stays
-        // zeroed between blocks (each block resets exactly the slots it
-        // dirtied), so it is grown once and never re-cleared.
-        //
-        // Measured interleaved, 100k groups over 2M rows: 284ms -> 140ms,
-        // 2.02x, with an 8-group aggregate unchanged at 46ms. The gap
-        // widens with group count, because the term removed was
-        // O(blocks x groups) against O(blocks x block).
-        let ngroups = groups.len;
-        if counts.len() < ngroups {
-            counts.resize(ngroups, 0);
-        }
-        touched.clear();
-        for &g in &row_group {
-            let c = &mut counts[g as usize];
-            if *c == 0 {
-                touched.push(g);
-            }
-            *c += 1;
-        }
-        // Hand each touched group a contiguous span of `order`, in
-        // first-touch order. `counts[g]` becomes the write cursor.
-        let mut base = 0u32;
-        for &g in &touched {
-            let n = std::mem::replace(&mut counts[g as usize], base);
-            base += n;
-        }
-        // Grown, never cleared, for the same reason `counts` is: the scatter
-        // below writes every one of the first `row_group.len()` slots exactly
-        // once (a counting sort is a permutation), so `clear() + resize(n, 0)`
-        // was a 32 KiB memset per block whose every byte was then overwritten.
-        // A *bare* aggregate paid it too -- one group, 8192 zeroes, every
-        // block -- which is most of why `sum`, `uniq` and `quantile` moved in
-        // the module header's table without their key path changing at all.
-        if order.len() < row_group.len() {
-            order.resize(row_group.len(), 0);
-        }
-        // Two scatters rather than one indirection: `order` has to hold *block*
-        // row ids either way, and paying an `ids[j]` load per row on the path
-        // that does not need it would tax every aggregate that fits in memory.
-        match ids {
-            None => {
-                for (i, &g) in row_group.iter().enumerate() {
-                    let at = &mut counts[g as usize];
-                    order[*at as usize] = i as u32;
-                    *at += 1;
+                Some(ids) => {
+                    for (j, &g) in row_group.iter().enumerate() {
+                        let at = &mut counts[g as usize];
+                        order[*at as usize] = ids[j];
+                        *at += 1;
+                    }
                 }
             }
-            Some(ids) => {
-                for (j, &g) in row_group.iter().enumerate() {
-                    let at = &mut counts[g as usize];
-                    order[*at as usize] = ids[j];
-                    *at += 1;
-                }
-            }
-        }
 
-        // Pass 3: one vectorized fold per (group, aggregate). After the
-        // scatter `counts[g]` sits at the end of g's span, and the spans
-        // were laid out in `touched` order -- so walking `touched` yields
-        // each (lo, hi) with a running low-water mark, and the same walk
-        // restores the slot to zero for the next block.
-        let mut lo = 0usize;
-        for &gid in &touched {
-            let g = gid as usize;
-            let hi = std::mem::replace(&mut counts[g], 0) as usize;
-            let s = &order[lo..hi];
-            lo = hi;
-            let base = g * nagg;
-            // The DISTINCT test is hoisted to the whole operator: without
-            // a DISTINCT aggregate the `seen` arena is not even allocated,
-            // so this is one predictable branch per (group, block) rather
-            // than an `Option` probe per aggregate.
-            if !groups.has_distinct {
+            // Pass 3: one vectorized fold per (group, aggregate). After the
+            // scatter `counts[g]` sits at the end of g's span, and the spans
+            // were laid out in `touched` order -- so walking `touched` yields
+            // each (lo, hi) with a running low-water mark, and the same walk
+            // restores the slot to zero for the next block.
+            let mut lo = 0usize;
+            for &gid in &touched {
+                let g = gid as usize;
+                let hi = std::mem::replace(&mut counts[g], 0) as usize;
+                let s = &order[lo..hi];
+                lo = hi;
+                let base = g * nagg;
+                // The DISTINCT test is hoisted to the whole operator: without
+                // a DISTINCT aggregate the `seen` arena is not even allocated,
+                // so this is one predictable branch per (group, block) rather
+                // than an `Option` probe per aggregate.
+                if !groups.has_distinct {
+                    for (ai, src) in arg_src.iter().enumerate() {
+                        groups.accs[base + ai].update(src.cols(&b, &owned), s)?;
+                    }
+                    continue;
+                }
                 for (ai, src) in arg_src.iter().enumerate() {
-                    groups.accs[base + ai].update(src.cols(&b, &owned), s)?;
-                }
-                continue;
-            }
-            for (ai, src) in arg_src.iter().enumerate() {
-                let args = src.cols(&b, &owned);
-                match groups.seen[base + ai].as_mut() {
-                    Some(set) => {
-                        fresh.clear();
-                        for &r in s {
-                            let t =
-                                GroupKey(args.iter().map(|c| c.value(r as usize)).collect());
-                            if set.insert(t) {
-                                fresh.push(r);
+                    let args = src.cols(&b, &owned);
+                    match groups.seen[base + ai].as_mut() {
+                        Some(set) => {
+                            fresh.clear();
+                            for &r in s {
+                                let t =
+                                    GroupKey(args.iter().map(|c| c.value(r as usize)).collect());
+                                if set.insert(t) {
+                                    fresh.push(r);
+                                }
+                            }
+                            if !fresh.is_empty() {
+                                groups.accs[base + ai].update(args, &fresh)?;
                             }
                         }
-                        if !fresh.is_empty() {
-                            groups.accs[base + ai].update(args, &fresh)?;
-                        }
+                        None => groups.accs[base + ai].update(args, s)?,
                     }
-                    None => groups.accs[base + ai].update(args, s)?,
                 }
             }
         }
@@ -819,7 +1169,11 @@ pub(crate) fn emit(
     if groups.over.is_some() {
         return emit_spilled(groups, group, aggs, schema);
     }
-    let (nagg, ngroup) = (aggs.len(), group.len());
+    // `groups.nkeys`, not `group.len()`: under grouping sets the keys ride in
+    // the marker and carry a set id the plan's schema has a column for, so the
+    // table is the authority on how wide a key tuple is.
+    let aggs = real_aggs(aggs);
+    let (nagg, ngroup) = (aggs.len(), groups.nkeys);
     let width = ngroup + nagg;
     if width == 0 {
         return Ok(if groups.len == 0 {
@@ -828,7 +1182,7 @@ pub(crate) fn emit(
             vec![Block::rows_only(groups.len)]
         });
     }
-    let tys = out_types(group, aggs, schema);
+    let tys = out_types(group, ngroup, aggs, schema);
 
     let total = groups.len;
     let mut out = Vec::with_capacity(total.div_ceil(BLOCK_SIZE));
@@ -861,14 +1215,22 @@ pub(crate) fn emit(
 ///
 /// The plan's schema wins where it has an opinion; the expressions' own types
 /// are the fallback for a caller that built a narrower schema.
-fn out_types(group: &[BoundExpr], aggs: &[BoundAgg], schema: &Schema) -> Vec<DataType> {
-    let ngroup = group.len();
+fn out_types(
+    group: &[BoundExpr],
+    ngroup: usize,
+    aggs: &[BoundAgg],
+    schema: &Schema,
+) -> Vec<DataType> {
     (0..ngroup + aggs.len())
         .map(|i| {
             if i < schema.len() {
                 schema.ty(i).clone()
             } else if i < ngroup {
-                group[i].ty()
+                // Only a hand-built caller gets here, and only for a key the
+                // marker holds rather than `group` -- which the binder always
+                // gives a schema column, so the NULL fallback is unreachable
+                // from SQL.
+                group.get(i).map_or(DataType::Nullable(Box::new(DataType::String)), BoundExpr::ty)
             } else {
                 aggs[i - ngroup].ty.clone()
             }
@@ -943,8 +1305,16 @@ fn emit_spilled(
     let ov = base.over.as_ref().expect("checked by the caller");
     let ctx = &ov.ctx;
     let protos = protos(aggs)?;
+    // The spilled rows already carry the set they missed under, so the replay
+    // reads the grouping off the block instead of re-expanding it.
+    let sets = sets_of(aggs)?;
+    let replayed = sets.as_ref().map(|s| {
+        replay_group(s, ov.pending.first().map_or(0, |p| p.schema.len().saturating_sub(1)))
+    });
+    let aggs = real_aggs(aggs);
+    let group: &[BoundExpr] = replayed.as_deref().unwrap_or(group);
     let (nagg, nkeys) = (aggs.len(), base.nkeys);
-    let mut sink = Rows::new(out_types(group, aggs, schema));
+    let mut sink = Rows::new(out_types(group, nkeys, aggs, schema));
     // Base groups a bucket has already emitted, merged with its own rows. One
     // bit per group of a table that has just proved it is as large as the
     // budget allows, so a bitset and not a `Vec<bool>`.
@@ -1680,6 +2050,7 @@ impl Groups {
     /// occupies exactly `nagg` contiguous entries of each arena, and the
     /// adopted ones are handed the next `gid`s in the order pass one saw them.
     pub(crate) fn absorb(&mut self, other: Groups, aggs: &[BoundAgg]) -> Result<()> {
+        let aggs = real_aggs(aggs);
         let nagg = aggs.len();
         let Groups { nkeys, keys, hashes, len, accs, mut seen, has_distinct, over, .. } = other;
         debug_assert_eq!(nkeys, self.nkeys);
@@ -2104,12 +2475,30 @@ impl Partitions {
     }
 
     /// Spill `rows` of `b`, each already assigned a partition in `parts`.
-    fn push(&mut self, b: &Block, rows: &[u32], parts: &[u32], ctx: &QueryContext) -> Result<()> {
+    ///
+    /// `set` is the grouping set the miss happened under, appended as one
+    /// constant column so the replay knows which of a row's several groups it
+    /// owes. `None` -- every aggregate but a grouping-set one -- writes the
+    /// block's own columns and nothing else.
+    fn push(
+        &mut self,
+        b: &Block,
+        rows: &[u32],
+        parts: &[u32],
+        set: Option<u64>,
+        ctx: &QueryContext,
+    ) -> Result<()> {
         // A cancelled query that keeps writing gigabytes to disk is worse than
         // one that keeps burning CPU.
         ctx.check()?;
         if self.schema.is_none() {
-            self.schema = Some(spill::schema_of(b));
+            let mut s = spill::schema_of(b);
+            if set.is_some() {
+                let mut fields = s.fields().to_vec();
+                fields.push(crate::types::Field::new("__grouping_id", DataType::UInt64));
+                s = Schema::new_unchecked(fields);
+            }
+            self.schema = Some(s);
         }
         // Counting sort into one buffer, the same shape pass 2 above uses and
         // for the same reason: a `Vec` per partition per block would allocate
@@ -2137,7 +2526,11 @@ impl Partitions {
             if lo == hi {
                 continue;
             }
-            let sub = b.take(&self.sel[lo..hi]);
+            let mut sub = b.take(&self.sel[lo..hi]);
+            if let Some(s) = set {
+                let n = sub.rows();
+                sub.columns.push(Column::constant(&DataType::UInt64, &Value::UInt(s), n)?);
+            }
             self.writer(p)?.push(&sub)?;
         }
         Ok(())
@@ -2232,20 +2625,27 @@ impl Aggregate<'_> {
     fn next_partition(&mut self) -> Result<bool> {
         let Some(p) = self.pending.pop() else { return Ok(false) };
         self.ctx.check()?;
-        let mut guard = MemGuard::new(self.ctx, guard_name(self.group.len()));
+        let mut guard = MemGuard::new(self.ctx, guard_name(self.nkeys));
         let mut input: Box<dyn Operator> =
             Box::new(SpillScan::open(p.schema.clone(), std::slice::from_ref(&p.path)));
         let mut parts = Partitions::new(p.level, 0);
+        // A spilled row already names the grouping set it missed under, so the
+        // replay reads its keys straight off the block; re-expanding it here
+        // would fold it into every *other* set as well. See [`replay_group`].
+        let sets = sets_of(self.aggs)?;
+        let replayed = sets.as_ref().map(|s| replay_group(s, p.schema.len() - 1));
+        let group: &[BoundExpr] = replayed.as_deref().unwrap_or(self.group);
+        let aggs = real_aggs(self.aggs);
         let groups = accumulate_into(
             &mut input,
-            self.group,
-            self.aggs,
+            group,
+            aggs,
             &self.protos,
             self.ctx,
             &mut guard,
             Some(&mut parts),
         )?;
-        self.out = emit(&groups, self.group, self.aggs, self.schema)?;
+        self.out = emit(&groups, group, aggs, self.schema)?;
         self.out.reverse();
         drop(groups);
         drop(guard);
@@ -2930,6 +3330,133 @@ mod tests {
         drop(a);
         assert_eq!(ctx.mem.used(), 0);
         assert_no_temp_files_left();
+    }
+
+    /// The marker the binder builds, from this side: keys, sets, and the
+    /// bitmap spelling the two have to agree on.
+    fn gs(keys: Vec<BoundExpr>, sets: &[&str]) -> BoundAgg {
+        let mut args = vec![BoundExpr::lit(Value::Str(sets.join(",").into()))];
+        args.extend(keys);
+        BoundAgg {
+            func: &GROUPING_SETS,
+            args,
+            params: vec![],
+            distinct: false,
+            ty: DataType::UInt64,
+            name: "__grouping_id".into(),
+        }
+    }
+
+    /// One pass, three groupings, and the key tuple carries the set id so the
+    /// grand total does not collide with a group whose key is NULL.
+    #[test]
+    fn one_pass_answers_every_grouping_set() {
+        let (s, rows) = src();
+        let key = col(0, DataType::Int64);
+        let aggs = vec![agg("sum", vec![col(1, DataType::Int64)], false), gs(vec![key], &["1", "0"])];
+        let out = out_schema(vec![
+            ("k", DataType::Nullable(Box::new(DataType::Int64))),
+            ("__grouping_id", DataType::UInt64),
+            ("s", aggs[0].ty.clone()),
+        ]);
+        assert_eq!(
+            run(&rows, &s, &[], &aggs, &out),
+            vec![
+                vec![Value::Null, Value::UInt(1), Value::Int(90)],
+                vec![Value::Int(1), Value::UInt(0), Value::Int(50)],
+                vec![Value::Int(2), Value::UInt(0), Value::Int(40)],
+            ]
+        );
+    }
+
+    /// Two identical sets are two groupings. The set id is the only thing
+    /// keeping them apart, which is why it is in the key tuple and not derived
+    /// from the mask.
+    #[test]
+    fn a_repeated_set_is_not_folded_into_one() {
+        let (s, rows) = src();
+        let key = col(0, DataType::Int64);
+        let aggs =
+            vec![agg("count", vec![], false), gs(vec![key], &["1", "1"])];
+        let out = out_schema(vec![
+            ("k", DataType::Int64),
+            ("__grouping_id", DataType::UInt64),
+            ("n", aggs[0].ty.clone()),
+        ]);
+        let got = run(&rows, &s, &[], &aggs, &out);
+        assert_eq!(got.len(), 4, "{got:?}");
+        assert_eq!(got[0], vec![Value::Int(1), Value::UInt(0), Value::UInt(3)]);
+        assert_eq!(got[1], vec![Value::Int(1), Value::UInt(1), Value::UInt(3)]);
+    }
+
+    /// A marker with no keys at all: `GROUP BY GROUPING SETS (())`, which is
+    /// one group and no key columns -- the shape that used to index `gcols[0]`
+    /// on the single-key fast path.
+    #[test]
+    fn a_grouping_set_list_of_only_the_empty_set_is_the_grand_total() {
+        let (s, rows) = src();
+        let aggs = vec![agg("sum", vec![col(1, DataType::Int64)], false), gs(vec![], &[""])];
+        let out = out_schema(vec![("__grouping_id", DataType::UInt64), ("s", aggs[0].ty.clone())]);
+        assert_eq!(run(&rows, &s, &[], &aggs, &out), vec![vec![Value::UInt(0), Value::Int(90)]]);
+    }
+
+    /// A grouping-set aggregate that spills answers what a resident one does,
+    /// including for the sets a spilled row was *not* probing when it missed.
+    #[test]
+    fn a_spilled_grouping_set_folds_each_row_into_one_group_per_set() {
+        let s = Schema::new(vec![
+            Field::new("k", DataType::Int64),
+            Field::new("j", DataType::Int64),
+            Field::new("v", DataType::Int64),
+        ])
+        .unwrap();
+        let rows: Vec<Vec<Value>> = (0..4000i64)
+            .map(|i| vec![Value::Int(i % 97), Value::Int(i % 13), Value::Int(i)])
+            .collect();
+        let keys = vec![col(0, DataType::Int64), col(1, DataType::Int64)];
+        let aggs = vec![
+            agg("sum", vec![col(2, DataType::Int64)], false),
+            gs(keys, &["11", "10", "00"]),
+        ];
+        let nullable = DataType::Nullable(Box::new(DataType::Int64));
+        let out = out_schema(vec![
+            ("k", nullable.clone()),
+            ("j", nullable),
+            ("__grouping_id", DataType::UInt64),
+            ("s", aggs[0].ty.clone()),
+        ]);
+        let want = run(&rows, &s, &[], &aggs, &out);
+        // Every set's total is the same total, which is the invariant a
+        // mis-replayed spill breaks first.
+        let all: i64 = (0..4000).sum();
+        for set in 0..3u64 {
+            let n: i64 = want
+                .iter()
+                .filter(|r| r[2] == Value::UInt(set))
+                .map(|r| match r[3] {
+                    Value::Int(x) => x,
+                    _ => panic!("{r:?}"),
+                })
+                .sum();
+            assert_eq!(n, all, "set {set}");
+        }
+        let ctx = QueryContext::with_budget(64 << 10);
+        let mut a = Aggregate::new(
+            Box::new(Values::new(&rows, &s)),
+            &[],
+            &aggs,
+            &out,
+            &ctx,
+        )
+        .unwrap();
+        let mut got = Vec::new();
+        while let Some(b) = a.next().unwrap() {
+            for i in 0..b.rows() {
+                got.push((0..b.width()).map(|c| b.column(c).value(i)).collect::<Vec<_>>());
+            }
+        }
+        got.sort();
+        assert_eq!(got, want);
     }
 
     #[test]

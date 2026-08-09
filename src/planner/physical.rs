@@ -317,7 +317,7 @@
 
 use crate::catalog::Catalog;
 use crate::common::{lane_to_f64, lane_to_i64, Error, Result};
-use crate::sql::ast::{BinaryOp, JoinOp};
+use crate::sql::ast::{BinaryOp, JoinOp, SetOp};
 use crate::types::{DataType, PhysicalType, Schema, Value};
 
 use crate::exec::exchange;
@@ -491,13 +491,17 @@ pub enum PhysicalPlan<'a> {
         branches: Vec<PhysicalPlan<'a>>,
         /// The same branches, unlowered.
         ///
-        /// `union::build_union` takes `&[LogicalPlan]` and constructs a `Union`
+        /// `union::build_set` takes `&[LogicalPlan]` and constructs an operator
         /// whose fields are private to that module, so the physical planner
         /// cannot hand it pre-built branch operators. It therefore lowers each
         /// branch a second time, inside `build`. That is one extra tree walk
-        /// per `UNION` branch at plan time and nothing per row; the fix is a
-        /// signature change in `union.rs`, which this task does not own.
+        /// per branch at plan time and nothing per row -- planning is under 1%
+        /// of every query measured (see `exec::operators`), so this stays a
+        /// wart rather than a cost. Removing it means teaching `build_set` to
+        /// accept built operators, which is a wider change than any task that
+        /// has touched this node has needed.
         logical: &'a [LogicalPlan],
+        op: SetOp,
         all: bool,
         schema: &'a Schema,
     },
@@ -610,12 +614,13 @@ fn lower_at<'a>(
             residual: residual.as_ref(),
             schema,
         },
-        LogicalPlan::Union { inputs, all, schema } => PhysicalPlan::Union {
+        LogicalPlan::Union { inputs, op, all, schema } => PhysicalPlan::Union {
             branches: inputs
                 .iter()
                 .map(|p| lower_at(p, catalog, d, false))
                 .collect::<Result<_>>()?,
             logical: inputs,
+            op: *op,
             all: *all,
             schema,
         },
@@ -1432,8 +1437,8 @@ impl PhysicalPlan<'_> {
                 }
                 s
             }
-            PhysicalPlan::Union { all, .. } => {
-                format!("Union{}", if *all { " All" } else { " Distinct" })
+            PhysicalPlan::Union { op, all, .. } => {
+                format!("{}{}", op.label(), if *all { " All" } else { " Distinct" })
             }
             PhysicalPlan::Values { rows, .. } => format!("Values {} rows", rows.len()),
             PhysicalPlan::Empty { .. } => "Empty".into(),

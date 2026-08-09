@@ -1689,9 +1689,9 @@ impl Parser<'_> {
         if self.at_kw("GROUP") {
             self.bump();
             self.expect_kw("BY")?;
-            group_by.push(self.expr()?);
+            group_by.push(self.group_item()?);
             while self.eat(&Token::Comma) {
-                group_by.push(self.expr()?);
+                group_by.push(self.group_item()?);
             }
             with_totals = self.eat_kws(&["WITH", "TOTALS"]);
         }
@@ -1721,6 +1721,45 @@ impl Parser<'_> {
             with_totals,
             having,
         })
+    }
+
+    /// One `GROUP BY` item.
+    ///
+    /// Only `GROUPING SETS` needs grammar. `ROLLUP(a, b)` and `CUBE(a, b)` are
+    /// function-call syntax and `expr` already reads them as one call, which
+    /// [`GroupSpec::of`] recognizes later; `GROUPING SETS` cannot go the same
+    /// way because its argument list is a list of *tuples* and one of them is
+    /// `()`, the grand total, which is not an expression anywhere else.
+    fn group_item(&mut self) -> Result<Expr> {
+        if !(self.at_kw("GROUPING") && self.at_kw_at(1, "SETS")) {
+            return self.expr();
+        }
+        self.i += 2;
+        self.expect(&Token::LParen)?;
+        let mut sets = vec![self.grouping_set()?];
+        while self.eat(&Token::Comma) {
+            sets.push(self.grouping_set()?);
+        }
+        self.expect(&Token::RParen)?;
+        Ok(Expr::func(crate::sql::ast::GROUPING_SETS, sets))
+    }
+
+    /// One member of a `GROUPING SETS` list: `(a, b)`, `()`, or a bare `a`
+    /// standing for the one-column set. Always yields a tuple, so the binder
+    /// reads every member the same way.
+    fn grouping_set(&mut self) -> Result<Expr> {
+        if !self.eat(&Token::LParen) {
+            return Ok(Expr::Tuple(vec![self.expr()?]));
+        }
+        if self.eat(&Token::RParen) {
+            return Ok(Expr::Tuple(Vec::new()));
+        }
+        let mut items = vec![self.expr()?];
+        while self.eat(&Token::Comma) {
+            items.push(self.expr()?);
+        }
+        self.expect(&Token::RParen)?;
+        Ok(Expr::Tuple(items))
     }
 
     fn select_item(&mut self) -> Result<SelectItem> {
@@ -2711,7 +2750,7 @@ fn negate_literal(v: &Value) -> Option<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sql::ast::SelectItem;
+    use crate::sql::ast::{GroupSpec, SelectItem};
 
     // ---------------------------------------------------------- test helpers
 
@@ -3070,6 +3109,75 @@ mod tests {
         }
     }
 
+    /// `ROLLUP` and `CUBE` need no grammar at all -- they are function-call
+    /// syntax -- so what this pins is that they are *not* given any, and that
+    /// they stay recognizable as multi-grouping items afterwards.
+    #[test]
+    fn rollup_and_cube_parse_as_the_calls_they_look_like() {
+        for (sql, kw, n) in [
+            ("SELECT a FROM t GROUP BY ROLLUP(a, b)", "ROLLUP", 2),
+            ("SELECT a FROM t GROUP BY cube(a)", "CUBE", 1),
+        ] {
+            let s = select_of(sql);
+            assert_eq!(s.group_by.len(), 1, "{sql}");
+            let spec = GroupSpec::of(&s.group_by[0]).unwrap_or_else(|| panic!("{sql}"));
+            assert_eq!(spec.keyword(), kw);
+            match spec {
+                GroupSpec::Rollup(es) | GroupSpec::Cube(es) => assert_eq!(es.len(), n),
+                GroupSpec::Sets(_) => panic!("{sql}"),
+            }
+        }
+        // Outside GROUP BY they are the ordinary unknown functions they were.
+        assert!(GroupSpec::of(&select_of("SELECT a FROM t GROUP BY f(a)").group_by[0]).is_none());
+    }
+
+    /// Every member becomes a tuple, including `()` -- which is the one shape
+    /// the expression grammar cannot produce and the whole reason this clause
+    /// is parsed by hand.
+    #[test]
+    fn grouping_sets_reads_tuples_including_the_empty_one() {
+        let s = select_of("SELECT a FROM t GROUP BY GROUPING SETS ((a, b), (a), (), c)");
+        assert_eq!(s.group_by.len(), 1);
+        let Some(GroupSpec::Sets(sets)) = GroupSpec::of(&s.group_by[0]) else {
+            panic!("{:?}", s.group_by[0])
+        };
+        let widths: Vec<usize> = sets
+            .iter()
+            .map(|e| match e {
+                Expr::Tuple(t) => t.len(),
+                other => panic!("not a tuple: {other:?}"),
+            })
+            .collect();
+        assert_eq!(widths, vec![2, 1, 0, 1]);
+        // And it round-trips through Display, which is what EXPLAIN prints.
+        assert_eq!(
+            s.group_by[0].to_string(),
+            "GROUPING SETS((a, b), (a), (), (c))"
+        );
+    }
+
+    /// Items compose: a plain key, a `ROLLUP` and a set list in one clause.
+    #[test]
+    fn group_by_items_mix() {
+        let s = select_of("SELECT a FROM t GROUP BY a, ROLLUP(b), GROUPING SETS ((c), ())");
+        assert_eq!(s.group_by.len(), 3);
+        assert!(GroupSpec::of(&s.group_by[0]).is_none());
+        assert_eq!(GroupSpec::of(&s.group_by[1]).unwrap().keyword(), "ROLLUP");
+        assert_eq!(GroupSpec::of(&s.group_by[2]).unwrap().keyword(), "GROUPING SETS");
+    }
+
+    #[test]
+    fn a_malformed_grouping_sets_clause_is_reported() {
+        for (sql, want) in [
+            ("SELECT a FROM t GROUP BY GROUPING SETS", "`(`"),
+            ("SELECT a FROM t GROUP BY GROUPING SETS ((a)", "`)`"),
+            ("SELECT a FROM t GROUP BY GROUPING SETS ((a,)", "expression"),
+        ] {
+            let (msg, _) = err_of(sql);
+            assert!(msg.contains(want), "`{sql}` said `{msg}`, wanted `{want}`");
+        }
+    }
+
     #[test]
     fn order_by_directions_and_null_placement() {
         let q = query_of("SELECT a FROM t ORDER BY a, b DESC, c ASC NULLS LAST, d DESC NULLS FIRST");
@@ -3329,6 +3437,48 @@ mod tests {
         // ORDER BY after a union belongs to the whole query
         let q = query_of("SELECT 1 UNION ALL SELECT 2 ORDER BY 1");
         assert_eq!(q.order_by.len(), 1);
+    }
+
+    /// `ALL` and `DISTINCT` are a different *operation*, not a hint: without
+    /// this the two multiplicity rules could never be told apart downstream.
+    #[test]
+    fn intersect_and_except_carry_their_all_flag() {
+        for (sql, op, all) in [
+            ("SELECT 1 INTERSECT SELECT 2", SetOp::Intersect, false),
+            ("SELECT 1 INTERSECT ALL SELECT 2", SetOp::Intersect, true),
+            ("SELECT 1 INTERSECT DISTINCT SELECT 2", SetOp::Intersect, false),
+            ("SELECT 1 EXCEPT SELECT 2", SetOp::Except, false),
+            ("SELECT 1 EXCEPT ALL SELECT 2", SetOp::Except, true),
+            ("SELECT 1 EXCEPT DISTINCT SELECT 2", SetOp::Except, false),
+        ] {
+            match query_of(sql).body {
+                SetExpr::SetOperation { op: o, all: a, .. } => {
+                    assert_eq!((o, a), (op, all), "{sql}")
+                }
+                other => panic!("{sql}: {other:?}"),
+            }
+        }
+    }
+
+    /// EXCEPT and UNION share a precedence level and are left-associative, so
+    /// `a EXCEPT b EXCEPT c` is `(a EXCEPT b) EXCEPT c`. A right-leaning parse
+    /// would mean `a - (b - c)`, which is a different relation.
+    #[test]
+    fn except_is_left_associative_and_parenthesising_changes_the_tree() {
+        match &query_of("SELECT 1 EXCEPT SELECT 2 EXCEPT SELECT 3").body {
+            SetExpr::SetOperation { op: SetOp::Except, left, right, .. } => {
+                assert!(matches!(**left, SetExpr::SetOperation { op: SetOp::Except, .. }));
+                assert!(matches!(**right, SetExpr::Select(_)));
+            }
+            other => panic!("{other:?}"),
+        }
+        match &query_of("SELECT 1 EXCEPT (SELECT 2 EXCEPT SELECT 3)").body {
+            SetExpr::SetOperation { op: SetOp::Except, left, right, .. } => {
+                assert!(matches!(**left, SetExpr::Select(_)));
+                assert!(matches!(**right, SetExpr::Query(_)));
+            }
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]

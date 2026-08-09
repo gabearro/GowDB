@@ -297,7 +297,7 @@ existing — so the exclusion gets re-argued or deleted instead of rotting.
 | 4 | `CAST(1.0 AS <text>)` | `'1'` | `'1.0'` |
 | 5 | `sum` over reals | compensated | compensated since 3.44 — **no divergence** |
 | 6 | `CAST((1=1) AS <text>)` | `'true'` (real Bool type) | `'1'` (no Bool type) |
-| 7 | `EXCEPT` / `INTERSECT` | not implemented (says so) | works |
+| 7 | `INTERSECT ALL` / `EXCEPT ALL` | works | not parsed (3.54) — **direction inverted**; the plain forms are now generated |
 | 8 | `round(2.5)` | `2` (half to even) | `3.0` (half away from zero) |
 | 9 | `concat(NULL,'b')` | `NULL` (propagates) | `'b'` (skips NULLs) |
 

@@ -170,9 +170,11 @@ const SENTINEL: &str = "<<granular-diff-boundary>>";
 //     Bool arithmetic itself agrees now that BUG 4 is fixed, mixed with an
 //     integer or with another Bool. Bool->Text casts are not generated.
 //
-//  7. `EXCEPT` / `INTERSECT`.  granular parses them and says, clearly, that
-//     only UNION is implemented. A capability gap, not a wrong answer; the
-//     set-operation menu is UNION and UNION ALL.
+//  7. `INTERSECT ALL` / `EXCEPT ALL`.  INVERTED: `INTERSECT` and `EXCEPT`
+//     landed and are generated. The residue points the other way -- sqlite
+//     3.54 has no `ALL` form of either and rejects it at parse time, so the
+//     two multiplicity rules (`min(m,n)` and `max(m-n,0)`) have no oracle
+//     here and are checked in `tests/set_operations.rs` instead.
 //
 //  8. `round`.  granular rounds half to even (ClickHouse's rule): `round(2.5)`
 //     is 2. SQLite rounds half away from zero: 3.0. Not in `gen_call`.
@@ -290,8 +292,9 @@ const SENTINEL: &str = "<<granular-diff-boundary>>";
 //  R8. A join is only generated when both tables are under `JOINABLE_ROWS`
 //      (64), so the big-table shapes and the join shapes never meet. Cost: a
 //      cross join of two 8000-row tables is 64M rows. STILL HOLDS.
-//  R9. Only `UNION`/`UNION ALL`; `EXCEPT`/`INTERSECT` are a stated capability
-//      gap (KNOWN DIVERGENCE #7). Pinned; delete when they land.
+//  R9. `UNION`, `UNION ALL`, `INTERSECT` and `EXCEPT`, but not the `ALL` form
+//      of the last two: sqlite cannot parse those (KNOWN DIVERGENCE #7), so
+//      there is no oracle to diff them against. STILL HOLDS.
 // R10. A set-operation branch is a *clone* of the first with a different
 //      `WHERE`, so the two branches always have identical arity, types and
 //      expressions. Branches that differ structurally (different tables,
@@ -2137,11 +2140,13 @@ fn gen_query(rng: &mut Rng, tables: &[TableDef]) -> Query {
         } else {
             None
         };
-        // EXCEPT and INTERSECT parse but are not implemented in granular -- it
-        // says so, clearly, at bind time. That is a capability gap, not a wrong
-        // answer, so the generator stays on the two set operations both engines
-        // actually evaluate. Pinned by `known_divergences_still_reproduce`.
-        let op = *rng.pick(&["UNION ALL", "UNION"]);
+        // All four set operations both engines evaluate. `INTERSECT ALL` and
+        // `EXCEPT ALL` are absent because *sqlite* has no such syntax (3.54
+        // rejects them at parse time), not because granular lacks them --
+        // which is the direction KNOWN DIVERGENCE #7 now records. The
+        // multiplicity rules those two forms carry are covered instead by
+        // `tests/set_operations.rs`, against a bag computed in Rust.
+        let op = *rng.pick(&["UNION ALL", "UNION", "INTERSECT", "EXCEPT"]);
         q.set_tail = Some((op, Box::new(tail)));
     }
     q
@@ -3268,6 +3273,10 @@ struct Coverage {
     distinct: usize,
     limit: usize,
     set_ops: usize,
+    /// Of those, the two that are not a `UNION`. Broken out because the menu
+    /// is a `pick` over four strings: a change that dropped one would leave
+    /// `set_ops` looking healthy while half the semantics went untested.
+    set_ops_matching: usize,
     calls: usize,
     multi_insert: usize,
     optimized: usize,
@@ -3304,6 +3313,12 @@ impl Coverage {
         self.distinct += c.query.distinct as usize;
         self.limit += c.query.limit.is_some() as usize;
         self.set_ops += c.query.set_tail.is_some() as usize;
+        self.set_ops_matching += c
+            .query
+            .set_tail
+            .as_ref()
+            .is_some_and(|(op, _)| *op == "INTERSECT" || *op == "EXCEPT")
+            as usize;
         let mut called = false;
         c.query.for_each_expr(&mut |e| {
             e.walk(&mut |x| {
@@ -3440,7 +3455,7 @@ fn differential_against_sqlite() {
     eprintln!(
         "differential: {checked} cases against sqlite3, {both_refused} rejected by both engines, \
          {} mismatches\n  coverage: {} joins ({} USING), {} SELECT *, {} aggregate, {} DISTINCT, \
-         {} LIMIT, {} UNION, {} with scalar calls\n  window:   {} OVER clauses \
+         {} LIMIT, {} set ops ({} INTERSECT/EXCEPT), {} with scalar calls\n  window:   {} OVER clauses \
          ({} with an explicit frame, {} over a tied ORDER BY)\n  mutation: {} DELETE, {} UPDATE\
          \n  storage:  {} rows loaded, widest table {}, \
          {} tables past GRANULE_SIZE, {} past BLOCK_SIZE, {} multi-INSERT, {} OPTIMIZEd",
@@ -3452,6 +3467,7 @@ fn differential_against_sqlite() {
         cov.distinct,
         cov.limit,
         cov.set_ops,
+        cov.set_ops_matching,
         cov.calls,
         cov.windows,
         cov.window_frames,
@@ -3753,19 +3769,23 @@ fn known_divergences_still_reproduce() {
     let (g, s) = probe("SELECT CAST((1=1) AS String)", "SELECT CAST((1=1) AS TEXT)");
     assert_ne!(g, s, "bool->text rendering now agrees ({g} vs {s}); drop KNOWN DIVERGENCE #6");
 
-    // #7 -- EXCEPT and INTERSECT: a stated capability gap, not a wrong answer.
-    // When they land, put them back in `gen_query`'s set-operation menu.
-    let mut sess = Session::in_memory();
+    // #7 -- INVERTED, and it changed direction. `EXCEPT` and `INTERSECT` used
+    // to be granular's gap; they landed and are in `gen_query`'s menu. What is
+    // left is sqlite's gap: it has no `ALL` form of either, so the
+    // multiplicity rules cannot be diffed and are pinned in
+    // `tests/set_operations.rs` instead.
     for op in ["EXCEPT", "INTERSECT"] {
-        let e = sess
-            .query(&format!("SELECT 1 {op} SELECT 1"))
-            .err()
-            .map(|e| e.to_string())
-            .unwrap_or_default();
+        let (g, s) = probe(&format!("SELECT 1 {op} SELECT 1"), &format!("SELECT 1 {op} SELECT 1"));
+        assert_eq!(g, s, "{op} disagrees ({g} vs {s}) -- it is in the generator's menu");
+        let (g, s) = probe(
+            &format!("SELECT 1 {op} ALL SELECT 1"),
+            &format!("SELECT 1 {op} ALL SELECT 1"),
+        );
+        assert!(!g.starts_with("ERROR"), "granular lost {op} ALL: {g}");
         assert!(
-            e.contains("not implemented") || e.contains("only UNION"),
-            "{op} now runs (or fails differently: {e:?}) -- add it back to \
-             gen_query's set-operation menu"
+            s.starts_with("ERROR"),
+            "sqlite parses `{op} ALL` now ({s}) -- add both ALL forms to \
+             gen_query's set-operation menu and delete this pin"
         );
     }
 

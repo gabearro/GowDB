@@ -48,6 +48,21 @@
 //! group key become `Column { i }`, and any *surviving* plain column reference
 //! is exactly the error case "column is neither grouped nor aggregated".
 //!
+//! ## Grouping sets
+//!
+//! `GROUPING SETS`, `ROLLUP` and `CUBE` are desugared here into one list of
+//! bitmasks over one deduplicated key list ([`Binder::group_sets`]), and the
+//! executor answers all of them in a single pass. The plan they produce is
+//! deliberately odd -- `Aggregate`'s `group` is left **empty** and the keys
+//! ride in a pseudo-aggregate -- and the reason is a correctness one about
+//! filter pushdown that `exec::operators::aggregate::GROUPING_SETS` sets out
+//! in full.
+//!
+//! `GROUPING(k)` hoists like an aggregate call, to `Column { GS_MARK + p }`,
+//! because the column it reads (the set id) does not exist until the
+//! `Aggregate` node is built. [`resolve_grouping`] turns it into a lookup on
+//! that column, or into a literal where every set answers the same.
+//!
 //! ## Where ORDER BY sits
 //!
 //! `SELECT a FROM t ORDER BY b` is legal and common, so `Sort` is placed
@@ -74,9 +89,15 @@
 //!
 //! A scalar subquery needs a query *result* at bind time and the binder has no
 //! executor to get one from, so it returns `Error::unsupported` instead of a
-//! plan that silently means something else. `EXCEPT`/`INTERSECT` and
-//! `GROUP BY ... WITH TOTALS` have no corresponding `LogicalPlan` node and are
-//! refused for the same reason.
+//! plan that silently means something else. `GROUP BY ... WITH TOTALS` has no
+//! corresponding `LogicalPlan` node and is refused for the same reason.
+//!
+//! `EXCEPT`/`INTERSECT` used to be on that list and are not any more: they are
+//! [`LogicalPlan::Union`] carrying a [`SetOp`], because a set operation over
+//! branch schemas is the same node whichever of the three it is. What that
+//! costs here is one extra rule -- `flatten_set` will splice a nested
+//! `EXCEPT` into its parent only from the *left*, since `A - (B - C)` is not
+//! `(A - B) - C`.
 //!
 //! `x IN (SELECT ...)` and `EXISTS (SELECT ...)` need no result: as a whole
 //! `WHERE` conjunct they are a semi-join or an anti-join over the subquery's
@@ -95,8 +116,8 @@ use crate::common::{Error, Result};
 use crate::exec::functions::{aggregate, scalar, AggFn};
 use crate::exec::operators::window::{self, BoundWindow};
 use crate::sql::ast::{
-    BinaryOp, Expr, IntervalUnit, JoinConstraint, JoinOp, ObjectName, OrderByExpr, Query, Select,
-    SelectItem, SetExpr, SetOp, TableRef, UnaryOp, WindowSpec,
+    BinaryOp, Expr, GroupSpec, IntervalUnit, JoinConstraint, JoinOp, ObjectName, OrderByExpr,
+    Query, Select, SelectItem, SetExpr, SetOp, TableRef, UnaryOp, WindowSpec,
 };
 use crate::types::{parse_date, parse_datetime, DataType, Field, Schema, Value};
 
@@ -135,6 +156,17 @@ const CORR_MARK: usize = 1 << 38;
 /// octave up. `attach_scalars` resolves these to the column its left join put
 /// the value in, before anything else looks at the tree.
 const SUB_MARK: usize = 1 << 39;
+
+/// Marker base for a `GROUPING(...)` call, one octave *below* every other
+/// marker so the correlation and subquery rewrites -- which subtract their own
+/// base and index a list -- cannot mistake one for theirs.
+///
+/// `GROUPING(a)` answers a property of the grouping set a row came from, and
+/// the column holding that set's id does not exist until the `Aggregate` node
+/// is built, several hundred lines below where the call is bound. So it is
+/// hoisted exactly as an aggregate call is, and `resolve_grouping` turns it
+/// into an expression over that column once there is one.
+const GS_MARK: usize = 1 << 37;
 
 /// Guards against an alias cycle that the `expanding` stack cannot see (it
 /// only catches direct self-reference).
@@ -501,6 +533,13 @@ struct Ctx<'c> {
     /// `ALTER ... UPDATE` assignment -- the hoist would leave a marker nobody
     /// resolves, so the refusal stays.
     allow_sub: bool,
+    /// The rendered GROUP BY keys, when the block groups by more than one set.
+    /// Empty otherwise, which is what makes `GROUPING()` refuse itself outside
+    /// a `GROUPING SETS` / `ROLLUP` / `CUBE` query.
+    gs_keys: &'c [String],
+    /// `GROUPING(...)` calls hoisted out, in marker order: entry `p` is the
+    /// key slots that call named, and is `Column { index: GS_MARK + p }`.
+    groupings: Vec<Vec<usize>>,
 }
 
 /// A window call bound but not yet placed: the function, plus the keys of the
@@ -537,11 +576,19 @@ impl<'c> Ctx<'c> {
             subs: Vec::new(),
             ctes: &[],
             allow_sub: false,
+            gs_keys: &[],
+            groupings: Vec::new(),
         }
     }
 
     fn plain(scope: &'c Scope) -> Ctx<'c> {
         Ctx::new(scope, &[], false)
+    }
+
+    /// Let `GROUPING(k)` bind, against the keys this block groups by.
+    fn grouping(mut self, keys: &'c [String]) -> Ctx<'c> {
+        self.gs_keys = keys;
+        self
     }
 
     /// Let this context reach outwards, and hoist a scalar subquery instead of
@@ -922,31 +969,25 @@ impl<'a> Binder<'a> {
             SetExpr::Query(q) => self.query_in(q, ctes, enclosing, Want::Rows),
             SetExpr::Values(rows) => Ok(Bound::rows(self.values(rows)?)),
             SetExpr::SetOperation { op, all, left, right } => {
-                if !matches!(op, SetOp::Union) {
-                    let name = if matches!(op, SetOp::Except) { "EXCEPT" } else { "INTERSECT" };
-                    return Err(Error::unsupported(format!(
-                        "{name}: only UNION is implemented; rewrite it as a join or an \
-                         anti-join predicate"
-                    )));
-                }
                 // A branch may still *name* an enclosing column -- refusing the
                 // chain outright would report "unknown column" and send the
                 // reader looking for a typo. Decorrelating it is what is not
                 // implemented: each branch would need the correlation key in
-                // its own output and the union would have to key on it.
+                // its own output and the operation would have to key on it.
                 let l = self.set_expr(left, ctes, enclosing)?;
                 let r = self.set_expr(right, ctes, enclosing)?;
                 if !l.corr.is_empty() || !r.corr.is_empty() {
-                    return Err(Error::unsupported(
-                        "a correlated reference inside UNION: the correlation would have to be \
+                    return Err(Error::unsupported(format!(
+                        "a correlated reference inside {}: the correlation would have to be \
                          a key of every branch",
-                    ));
+                        op.keyword()
+                    )));
                 }
                 let mut inputs = Vec::new();
-                flatten_union(l.plan, *all, &mut inputs);
-                flatten_union(r.plan, *all, &mut inputs);
-                let schema = union_schema(&inputs)?;
-                Ok(Bound::rows(LogicalPlan::Union { inputs, all: *all, schema }))
+                flatten_set(l.plan, *op, *all, true, &mut inputs);
+                flatten_set(r.plan, *op, *all, false, &mut inputs);
+                let schema = set_schema(&inputs, *op)?;
+                Ok(Bound::rows(LogicalPlan::Union { inputs, op: *op, all: *all, schema }))
             }
         }
     }
@@ -1072,6 +1113,147 @@ impl<'a> Binder<'a> {
         }
     }
 
+    // -------------------------------------------------------- grouping sets
+
+    /// Bind a `GROUP BY` that asks for several groupings at once, and return
+    /// one bitmask per set over the deduplicated key list it filled.
+    ///
+    /// `ROLLUP` and `CUBE` are desugared here rather than in the parser, so
+    /// that `EXPLAIN` and an error message can still say which one was written.
+    /// Items **cross-multiply**, which is what ANSI says `GROUP BY a, CUBE(b)`
+    /// means: each item contributes a list of sets and the result is every
+    /// combination, last item varying fastest. A plain key is the one-set list
+    /// `[{k}]`, so the ordinary path falls out of the same loop -- it is just
+    /// never taken, because the caller checks first and keeps its own.
+    ///
+    /// Keys are deduplicated by rendering, so `CUBE(a, a)` and
+    /// `GROUP BY a, ROLLUP(a)` name one column and produce sets over it. The
+    /// *sets* are deliberately **not** deduplicated: `GROUPING SETS ((a), (a))`
+    /// is two groupings and must answer twice, which is why the executor keys
+    /// on a set id and not on the mask.
+    fn group_sets(
+        &self,
+        sel: &Select,
+        ctx: &mut Ctx<'_>,
+        group: &mut Vec<BoundExpr>,
+        fields: &mut Vec<Field>,
+    ) -> Result<Vec<u64>> {
+        // One empty set, crossed with each item in turn.
+        let mut sets: Vec<u64> = vec![0];
+        for item in &sel.group_by {
+            let spec = GroupSpec::of(item);
+            let members: &[Expr] = match &spec {
+                None => std::slice::from_ref(item),
+                Some(GroupSpec::Rollup(es) | GroupSpec::Cube(es) | GroupSpec::Sets(es)) => es,
+            };
+            if members.is_empty() {
+                return Err(Error::bind(format!(
+                    "{} needs at least one column",
+                    spec.as_ref().map_or("GROUP BY", GroupSpec::keyword)
+                )));
+            }
+            // Bind every column this item mentions once, and record its slot.
+            // `GROUPING SETS` members are tuples; everything else is a column.
+            let mut slots: Vec<Vec<usize>> = Vec::with_capacity(members.len());
+            for m in members {
+                let cols: &[Expr] = match (&spec, m) {
+                    (Some(GroupSpec::Sets(_)), Expr::Tuple(t)) => t,
+                    (Some(GroupSpec::Sets(_)), _) => std::slice::from_ref(m),
+                    _ => std::slice::from_ref(m),
+                };
+                let mut here = Vec::with_capacity(cols.len());
+                for c in cols {
+                    here.push(self.group_slot(sel, c, ctx, group, fields)?);
+                }
+                slots.push(here);
+            }
+            let bits = |ks: &[usize]| ks.iter().fold(0u64, |m, &k| m | 1 << k);
+            // What this item contributes, in the order SQL prints it: the
+            // finest grouping first, the grand total last.
+            let mine: Vec<u64> = match spec {
+                None => vec![bits(&slots[0])],
+                // The prefixes, longest first: `(a,b,c), (a,b), (a), ()`.
+                Some(GroupSpec::Rollup(_)) => (0..=slots.len())
+                    .rev()
+                    .map(|n| slots[..n].iter().fold(0, |m, k| m | bits(k)))
+                    .collect(),
+                // Every subset. Counting up with bit `n-1-j` meaning "drop
+                // column j" walks them full-first: `(a,b), (a), (b), ()`.
+                Some(GroupSpec::Cube(_)) => {
+                    let n = slots.len();
+                    if n >= 16 {
+                        return Err(Error::unsupported(format!(
+                            "CUBE over {n} columns is {} grouping sets",
+                            1u64 << n
+                        )));
+                    }
+                    (0..1u32 << n)
+                        .map(|d| {
+                            (0..n)
+                                .filter(|j| d >> (n - 1 - j) & 1 == 0)
+                                .fold(0, |m, j| m | bits(&slots[j]))
+                        })
+                        .collect()
+                }
+                Some(GroupSpec::Sets(_)) => slots.iter().map(|k| bits(k)).collect(),
+            };
+            sets = sets.iter().flat_map(|s| mine.iter().map(move |m| s | m)).collect();
+            // The executor keys every group on `[keys..., set id]`, and the id
+            // is a `Value::UInt`; what actually bounds this is the group table,
+            // one entry per (set, key tuple). 4096 is far past any query a
+            // person writes and short of anything that allocates surprisingly.
+            if sets.len() > 4096 {
+                return Err(Error::unsupported(format!(
+                    "{} grouping sets; the limit is 4096",
+                    sets.len()
+                )));
+            }
+        }
+        // A key some set drops comes back NULL, so its column is nullable even
+        // where the input's is not. This is the whole reason `GROUPING()`
+        // exists, and getting it wrong would put a NULL under a mask-free type.
+        let every = sets.iter().fold(u64::MAX, |a, s| a & s);
+        for (k, f) in fields.iter_mut().enumerate() {
+            if every >> k & 1 == 0 {
+                f.ty = f.ty.clone().to_nullable();
+            }
+        }
+        Ok(sets)
+    }
+
+    /// Bind one grouping column and return its slot, reusing a key already
+    /// bound. Deduplicated by rendering rather than by AST equality, because
+    /// `GROUP BY 1` and `GROUP BY a` reach here as different trees and must
+    /// still land in one column.
+    fn group_slot(
+        &self,
+        sel: &Select,
+        g: &Expr,
+        ctx: &mut Ctx<'_>,
+        group: &mut Vec<BoundExpr>,
+        fields: &mut Vec<Field>,
+    ) -> Result<usize> {
+        let (g, g_alias) = match ordinal(g, "GROUP BY")? {
+            Some(n) => select_item_at(sel, n)?,
+            None => (g, None),
+        };
+        let b = self.bind_defining(g, g_alias, ctx)?;
+        let rendered = b.to_string();
+        if let Some(i) = group.iter().position(|k| k.to_string() == rendered) {
+            return Ok(i);
+        }
+        // Checked here rather than at the end, because the caller shifts by
+        // the slot the moment it has one and `1 << 64` is not a mask.
+        if group.len() == 64 {
+            return Err(Error::unsupported(
+                "more than 64 grouping columns; a grouping set is a 64-bit mask over them",
+            ));
+        }
+        fields.push(Field::new(g.display_name(), b.ty()));
+        group.push(b);
+        Ok(group.len() - 1)
+    }
+
     // -------------------------------------------------------- select block
 
     fn select_block<'q>(
@@ -1190,26 +1372,39 @@ impl<'a> Binder<'a> {
         // `GROUP BY sum(x)` is meaningless.
         let mut group = Vec::with_capacity(sel.group_by.len());
         let mut group_fields = Vec::with_capacity(sel.group_by.len());
+        // One bitmask per grouping set over `group`, or empty for the ordinary
+        // one-grouping case -- which must stay byte-for-byte the plan it was.
+        let mut sets: Vec<u64> = Vec::new();
         {
             let mut ctx = Ctx::new(&scope, &aliases, false).reaching(enclosing);
-            for g in &sel.group_by {
-                // `GROUP BY 1` has to bind the select item exactly the way the
-                // projection did, alias shadowing included, or the two trees
-                // will not match in `rewrite_over_agg`.
-                let (g, g_alias) = match ordinal(g, "GROUP BY")? {
-                    Some(n) => select_item_at(sel, n)?,
-                    None => (g, None),
-                };
-                let b = self.bind_defining(g, g_alias, &mut ctx)?;
-                group_fields.push(Field::new(g.display_name(), b.ty()));
-                group.push(b);
+            if sel.group_by.iter().any(|g| GroupSpec::of(g).is_some()) {
+                sets = self.group_sets(sel, &mut ctx, &mut group, &mut group_fields)?;
+            } else {
+                for g in &sel.group_by {
+                    // `GROUP BY 1` has to bind the select item exactly the way
+                    // the projection did, alias shadowing included, or the two
+                    // trees will not match in `rewrite_over_agg`.
+                    let (g, g_alias) = match ordinal(g, "GROUP BY")? {
+                        Some(n) => select_item_at(sel, n)?,
+                        None => (g, None),
+                    };
+                    let b = self.bind_defining(g, g_alias, &mut ctx)?;
+                    group_fields.push(Field::new(g.display_name(), b.ty()));
+                    group.push(b);
+                }
             }
             no_correlation(&ctx, "GROUP BY")?;
         }
+        // `GROUPING(k)` names a key by the same rendering `rewrite_over_agg`
+        // matches select items against, so the strings are taken here, before
+        // the decorrelation keys are appended and before anything is moved.
+        let gs_keys: Vec<String> =
+            if sets.is_empty() { Vec::new() } else { group.iter().map(|g| g.to_string()).collect() };
 
         // One context for the select list, HAVING, ORDER BY and LIMIT BY, so
         // that `sum(v)` mentioned in two of them shares one accumulator.
-        let mut ctx = Ctx::new(&scope, &aliases, true).joinable(enclosing, ctes);
+        let mut ctx =
+            Ctx::new(&scope, &aliases, true).joinable(enclosing, ctes).grouping(&gs_keys);
 
         let mut proj: Vec<BoundExpr> = Vec::new();
         let mut proj_names: Vec<String> = Vec::new();
@@ -1320,6 +1515,19 @@ impl<'a> Binder<'a> {
             for (j, (_, _, inner)) in exported.iter().enumerate() {
                 group_fields.push(Field::new(format!("__corr{j}"), inner.ty()));
                 group.push(inner.clone());
+                // A decorrelation key is what makes the subquery one row per
+                // outer row; every grouping set has to keep it or the outer
+                // row would match several. Refused rather than shifted off the
+                // end of the mask, which would silently drop the key.
+                let bit = n_user_group + j;
+                if !sets.is_empty() && bit >= 64 {
+                    return Err(Error::unsupported(
+                        "more than 64 grouping columns; a grouping set is a 64-bit mask over them",
+                    ));
+                }
+                for s in sets.iter_mut() {
+                    *s |= 1 << bit;
+                }
             }
         }
         if want == Want::Scalar {
@@ -1328,8 +1536,11 @@ impl<'a> Binder<'a> {
 
         let mut empty_aggs: Vec<(usize, Value)> = Vec::new();
         if aggregating {
-            let aggs = std::mem::take(&mut ctx.aggs);
-            let n_group = group.len();
+            let mut aggs = std::mem::take(&mut ctx.aggs);
+            // The set id is a group column of its own -- it is what keeps two
+            // sets that produce the same key tuple apart -- so it sits between
+            // the keys and the aggregates and shifts every aggregate marker.
+            let n_group = group.len() + !sets.is_empty() as usize;
             if want == Want::Scalar {
                 empty_aggs = aggs
                     .iter()
@@ -1339,9 +1550,24 @@ impl<'a> Binder<'a> {
             }
             let group_keys: Vec<String> = group.iter().map(|g| g.to_string()).collect();
             let mut fields = group_fields.clone();
+            if !sets.is_empty() {
+                fields.push(Field::new("__grouping_id", DataType::UInt64));
+            }
             fields.extend(aggs.iter().map(|a| Field::new(a.name.clone(), a.ty.clone())));
             let schema = Schema::new_unchecked(fields);
 
+            // Under grouping sets the keys move into a pseudo-aggregate and
+            // `group` is left empty. That is not tidiness: it is what stops the
+            // optimizer sinking a filter over a key below this node, where the
+            // key is not yet NULL for the sets that drop it. The argument is in
+            // `exec::operators::aggregate::GROUPING_SETS`, and
+            // `tests/grouping_sets.rs` pins the answer it protects.
+            let group = if sets.is_empty() {
+                group
+            } else {
+                aggs.push(grouping_sets_marker(group, &sets));
+                Vec::new()
+            };
             plan = LogicalPlan::Aggregate {
                 input: Box::new(plan),
                 group,
@@ -1388,6 +1614,23 @@ impl<'a> Binder<'a> {
                 }
                 for k in w.order.iter_mut() {
                     rewrite_in_place(&mut k.expr, &group_keys, gf, n_group)?;
+                }
+            }
+            // Every `GROUPING(...)` marker becomes an expression over the set
+            // id column, which is `n_group - 1` -- the last group column, now
+            // that there is a node to read it from.
+            if !sets.is_empty() {
+                let g = Grouping { id: n_group - 1, sets: &sets, calls: &ctx.groupings };
+                for e in proj.iter_mut().chain(having.iter_mut()) {
+                    replace(e, |x| resolve_grouping(x, &g));
+                }
+                for k in sort_keys.iter_mut() {
+                    replace(&mut k.expr, |x| resolve_grouping(x, &g));
+                }
+                if let Some((_, keys)) = limit_by.as_mut() {
+                    for k in keys.iter_mut() {
+                        replace(k, |x| resolve_grouping(x, &g));
+                    }
                 }
             }
         }
@@ -2403,6 +2646,9 @@ impl<'a> Binder<'a> {
         whole: &Expr,
         ctx: &mut Ctx<'_>,
     ) -> Result<BoundExpr> {
+        if name.eq_ignore_ascii_case("grouping") {
+            return self.bind_grouping(args, params, distinct, ctx);
+        }
         // Scalar first: the two registries share no names, and the aggregate
         // lookup has a `-If` suffix rule that should not get first refusal.
         if let Some(f) = scalar(name) {
@@ -2505,6 +2751,69 @@ impl<'a> Binder<'a> {
         };
         Ok(BoundExpr::Column { index: AGG_MARK + idx, ty, name: display })
     }
+
+    /// `GROUPING(a)` -- 1 when the row's grouping set aggregated `a` away, 0
+    /// when it did not.
+    ///
+    /// Not optional sugar. An aggregated-away column comes back NULL and so
+    /// does a NULL in the data, so without this the two are indistinguishable
+    /// and a `ROLLUP` over a nullable column is ambiguous by construction.
+    ///
+    /// The multi-argument form is ANSI's: `GROUPING(a, b)` is the two bits
+    /// packed left to right, so `2` means "a was dropped, b was kept". Both
+    /// forms are a function of the set id alone, so both hoist to one marker
+    /// and `resolve_grouping` builds whatever expression the sets require --
+    /// often a literal, when every set answers the same.
+    fn bind_grouping(
+        &self,
+        args: &[Expr],
+        params: &[Expr],
+        distinct: bool,
+        ctx: &mut Ctx<'_>,
+    ) -> Result<BoundExpr> {
+        if !params.is_empty() || distinct {
+            return Err(Error::bind("GROUPING takes neither parameters nor DISTINCT"));
+        }
+        if args.is_empty() {
+            return Err(Error::bind("GROUPING needs at least one grouping column"));
+        }
+        if ctx.gs_keys.is_empty() {
+            return Err(Error::bind(
+                "GROUPING() only means something under GROUP BY GROUPING SETS, ROLLUP or CUBE: \
+                 with one grouping, no column is ever aggregated away",
+            ));
+        }
+        // Bound with aggregates banned, exactly as the GROUP BY clause was:
+        // `GROUPING(sum(v))` is not a grouping column, and letting it bind
+        // would hoist an accumulator nothing reads.
+        let allow = std::mem::replace(&mut ctx.allow_agg, false);
+        let mut slots = Vec::with_capacity(args.len());
+        for a in args {
+            let b = self.bind(a, ctx);
+            let rendered = match b {
+                Ok(b) => b.to_string(),
+                Err(e) => {
+                    ctx.allow_agg = allow;
+                    return Err(e);
+                }
+            };
+            match ctx.gs_keys.iter().position(|k| *k == rendered) {
+                Some(i) => slots.push(i),
+                None => {
+                    ctx.allow_agg = allow;
+                    return Err(Error::bind(format!(
+                        "GROUPING({a}) names a column that is not one of this query's grouping \
+                         columns: {}",
+                        ctx.gs_keys.join(", ")
+                    )));
+                }
+            }
+        }
+        ctx.allow_agg = allow;
+        let p = ctx.groupings.len();
+        ctx.groupings.push(slots);
+        Ok(BoundExpr::Column { index: GS_MARK + p, ty: DataType::UInt8, name: "GROUPING".into() })
+    }
 }
 
 // ============================================================ post-aggregate
@@ -2535,6 +2844,12 @@ fn rewrite_over_agg(
                 ty: ty.clone(),
                 name: name.clone(),
             });
+        }
+        // A `GROUPING(...)` marker is resolved a moment later, by
+        // `resolve_grouping`, and reaching the arm below would report it as a
+        // column missing from GROUP BY -- which is exactly what it is not.
+        if (GS_MARK..CORR_MARK).contains(index) {
+            return Ok(e);
         }
     }
     let rendered = e.to_string();
@@ -2971,6 +3286,108 @@ fn resolve_subs(e: BoundExpr, values: &[BoundExpr]) -> BoundExpr {
     substitute(e, &|i| i.checked_sub(SUB_MARK).and_then(|p| values.get(p).cloned()))
 }
 
+/// The pseudo-aggregate that carries a grouping-set plan to the executor: the
+/// sets as a bitmap literal, then the key expressions themselves.
+///
+/// The bitmap is a string -- one `1`/`0` per key, key 0 leftmost, sets
+/// separated by commas -- because it is what `EXPLAIN` prints. A reader of
+/// `__grouping_sets('11,10,00', country, city)` can see exactly which three
+/// groupings the plan will produce, which a list of decimal masks cannot say.
+fn grouping_sets_marker(keys: Vec<BoundExpr>, sets: &[u64]) -> BoundAgg {
+    let mut bitmap = String::with_capacity(sets.len() * (keys.len() + 1));
+    for (i, s) in sets.iter().enumerate() {
+        if i > 0 {
+            bitmap.push(',');
+        }
+        bitmap.extend((0..keys.len()).map(|k| if s >> k & 1 == 1 { '1' } else { '0' }));
+    }
+    let mut args = Vec::with_capacity(keys.len() + 1);
+    args.push(BoundExpr::lit(Value::Str(bitmap.into())));
+    args.extend(keys);
+    BoundAgg {
+        func: &crate::exec::operators::aggregate::GROUPING_SETS,
+        args,
+        params: Vec::new(),
+        distinct: false,
+        ty: DataType::UInt64,
+        name: "__grouping_id".into(),
+    }
+}
+
+/// What a `GROUPING(...)` marker needs to become an expression.
+struct Grouping<'a> {
+    /// Output column of the set id.
+    id: usize,
+    sets: &'a [u64],
+    /// The key slots each hoisted call named, in marker order.
+    calls: &'a [Vec<usize>],
+}
+
+/// Turn every `GROUPING(...)` marker into a lookup on the set id column.
+///
+/// A call's answer depends on nothing but which set the row came from, so it
+/// is a table with one entry per set -- and usually far fewer distinct values
+/// than sets. Written as a `CASE` over `id IN (...)`, one arm per distinct
+/// answer and the commonest left as the `ELSE`; a call that answers the same
+/// for every set (`GROUPING(a)` under `GROUP BY GROUPING SETS ((a), (a, b))`)
+/// collapses to a literal and costs nothing at all.
+fn resolve_grouping(e: BoundExpr, g: &Grouping<'_>) -> BoundExpr {
+    substitute(e, &|i| {
+        let call = g.calls.get(i.checked_sub(GS_MARK)?)?;
+        // ANSI packs several columns left to right: `GROUPING(a, b)` is 2 when
+        // only `a` was aggregated away.
+        let value = |s: u64| {
+            call.iter().fold(0u64, |acc, &k| acc << 1 | u64::from(s >> k & 1 == 0))
+        };
+        let lit = |v: u64| BoundExpr::Literal {
+            value: Value::UInt(v),
+            ty: DataType::UInt8,
+        };
+        let mut arms: Vec<(u64, Vec<Value>)> = Vec::new();
+        for (s, mask) in g.sets.iter().enumerate() {
+            let v = value(*mask);
+            match arms.iter_mut().find(|(w, _)| *w == v) {
+                Some((_, ids)) => ids.push(Value::UInt(s as u64)),
+                None => arms.push((v, vec![Value::UInt(s as u64)])),
+            }
+        }
+        // The widest arm becomes the ELSE, so the common answer is never tested.
+        let fallback = arms
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, (_, ids))| ids.len())
+            .map(|(i, _)| i)
+            .unwrap_or(0);
+        if arms.len() == 1 {
+            return Some(lit(arms[0].0));
+        }
+        let id = BoundExpr::Column {
+            index: g.id,
+            ty: DataType::UInt64,
+            name: "__grouping_id".into(),
+        };
+        Some(BoundExpr::Case {
+            when_then: arms
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| *i != fallback)
+                .map(|(_, (v, ids))| {
+                    (
+                        BoundExpr::InList {
+                            expr: Box::new(id.clone()),
+                            list: ids.clone(),
+                            negated: false,
+                        },
+                        lit(*v),
+                    )
+                })
+                .collect(),
+            else_result: Some(Box::new(lit(arms[fallback].0))),
+            ty: DataType::UInt8,
+        })
+    })
+}
+
 /// `f(e)` applied through a `&mut`. The hole left while the subtree is out is a
 /// fieldless literal, so it costs a discriminant store and no allocation.
 fn replace(e: &mut BoundExpr, f: impl FnOnce(BoundExpr) -> BoundExpr) {
@@ -3134,14 +3551,37 @@ fn split_join_predicate(
     (on, BoundExpr::join_conjuncts(residual))
 }
 
-fn flatten_union(plan: LogicalPlan, all: bool, out: &mut Vec<LogicalPlan>) {
+/// Splice a nested set operation of the *same* kind into its parent's branch
+/// list, so `a UNION b UNION c` is one three-way node rather than two.
+///
+/// `is_left` is not decoration. All three operations are left-associative, so
+/// the left child is always safe to splice -- `(A op B) op C` and `A op B op C`
+/// are the same expression. The right child is only reachable through explicit
+/// parentheses, and there the three differ:
+///
+/// * `A UNION (B UNION C)` and `A INTERSECT (B INTERSECT C)` splice, because
+///   both operations are associative (`min` is, over multiplicities).
+/// * `A EXCEPT (B EXCEPT C)` **must not**: `A - (B - C)` keeps the rows of
+///   `A ∩ C` that `B` would have removed, and `(A - B) - C` does not. Merging
+///   them would silently answer a different query, which is precisely the
+///   failure mode this function is otherwise here to avoid.
+fn flatten_set(plan: LogicalPlan, op: SetOp, all: bool, is_left: bool, out: &mut Vec<LogicalPlan>) {
     match plan {
-        LogicalPlan::Union { inputs, all: a, .. } if a == all => out.extend(inputs),
+        LogicalPlan::Union { inputs, op: o, all: a, .. }
+            if o == op && a == all && (is_left || op != SetOp::Except) =>
+        {
+            out.extend(inputs)
+        }
         other => out.push(other),
     }
 }
 
-fn union_schema(inputs: &[LogicalPlan]) -> Result<Schema> {
+/// The output schema of a set operation: same width in every branch, and the
+/// column types promoted across them. The rule is the same for all three --
+/// `INTERSECT` and `EXCEPT` compare tuples that `UNION` would have stacked, so
+/// a pair of branches compatible for one is compatible for the others.
+fn set_schema(inputs: &[LogicalPlan], op: SetOp) -> Result<Schema> {
+    let kw = op.keyword();
     let first = inputs[0].schema();
     let width = first.len();
     let mut tys: Vec<DataType> = first.fields().iter().map(|f| f.ty.clone()).collect();
@@ -3149,7 +3589,7 @@ fn union_schema(inputs: &[LogicalPlan]) -> Result<Schema> {
         let s = p.schema();
         if s.len() != width {
             return Err(Error::bind(format!(
-                "UNION branches disagree on width: branch 1 has {width} columns, \
+                "{kw} branches disagree on width: branch 1 has {width} columns, \
                  branch {} has {}",
                 i + 1,
                 s.len()
@@ -3158,7 +3598,7 @@ fn union_schema(inputs: &[LogicalPlan]) -> Result<Schema> {
         for (c, f) in s.fields().iter().enumerate() {
             tys[c] = DataType::promote(&tys[c], &f.ty).map_err(|_| {
                 Error::bind(format!(
-                    "UNION branches disagree on column {}: {} vs {}",
+                    "{kw} branches disagree on column {}: {} vs {}",
                     c + 1,
                     tys[c],
                     f.ty
@@ -3727,6 +4167,65 @@ mod tests {
         );
     }
 
+    /// The whole grouping-set plan, so the shape is readable in one place:
+    /// `group` is empty on purpose, the keys and the sets ride in a marker
+    /// aggregate, and `__grouping_id` is a real output column between the keys
+    /// and the aggregates. See `exec::operators::aggregate::GROUPING_SETS`.
+    #[test]
+    fn a_rollup_puts_its_keys_and_sets_in_a_marker_and_leaves_group_empty() {
+        let e = explain("SELECT url, sum(ms) FROM events GROUP BY ROLLUP(url)");
+        assert_eq!(
+            e,
+            "Project [url#0 AS url, sum(ms)#2 AS sum(ms)]\n  \
+             Aggregate group=[] aggs=[sum(ms#1), __grouping_sets('1,0', url#0)]\n    \
+             Scan default.events [url, ms]\n"
+        );
+    }
+
+    /// The bitmap is one column per key and one entry per set, in the order
+    /// SQL prints them: finest first, grand total last.
+    #[test]
+    fn the_marker_spells_out_which_groupings_the_plan_will_produce() {
+        for (sql, bitmap) in [
+            ("GROUP BY ROLLUP(url, ms)", "11,10,00"),
+            ("GROUP BY CUBE(url, ms)", "11,10,01,00"),
+            // Key slots follow first appearance, so here bit 0 is `ms`.
+            ("GROUP BY GROUPING SETS ((ms, url), (url), ())", "11,01,00"),
+            // Items cross-multiply, and a key written twice is one column.
+            ("GROUP BY url, ROLLUP(ms)", "11,10"),
+            ("GROUP BY GROUPING SETS ((url), (url))", "1,1"),
+        ] {
+            let e = explain(&format!("SELECT count() FROM events {sql}"));
+            assert!(e.contains(&format!("__grouping_sets('{bitmap}'")), "{sql}\n{e}");
+        }
+    }
+
+    /// A key some set drops comes back NULL, so its column has to be nullable
+    /// even where the table's is not -- otherwise the aggregated-away row puts
+    /// a NULL under a mask-free type.
+    #[test]
+    fn a_key_some_set_drops_is_nullable_in_the_output() {
+        let e = explain("SELECT url, sum(ms) FROM events GROUP BY ROLLUP(url)");
+        assert!(e.starts_with("Project [url#0"), "{e}");
+        let plan = plan_of("SELECT url, sum(ms) FROM events GROUP BY ROLLUP(url)");
+        let LogicalPlan::Project { input, .. } = &plan else { panic!("{e}") };
+        assert_eq!(input.schema().ty(0).to_string(), "Nullable(String)");
+        assert_eq!(input.schema().field(1).name, "__grouping_id");
+    }
+
+    /// `GROUPING()` is a lookup on the set id, and folds to a literal when
+    /// every set answers the same.
+    #[test]
+    fn grouping_resolves_against_the_set_id_column() {
+        let e = explain("SELECT GROUPING(url) FROM events GROUP BY ROLLUP(url)");
+        assert!(e.contains("CASE WHEN"), "{e}");
+        assert!(e.contains("__grouping_id#1"), "{e}");
+        // Every set of `GROUP BY url, ROLLUP(ms)` keeps `url`, so there is
+        // nothing to look up.
+        let e = explain("SELECT GROUPING(url) FROM events GROUP BY url, ROLLUP(ms)");
+        assert!(!e.contains("CASE WHEN"), "a constant GROUPING() was not folded:\n{e}");
+    }
+
     #[test]
     fn implicit_global_group_needs_no_group_by() {
         let e = explain("SELECT count(*), max(ms) FROM events");
@@ -4174,11 +4673,57 @@ mod tests {
     }
 
     #[test]
-    fn except_and_intersect_are_explicitly_unimplemented() {
-        let m = err("SELECT ms FROM events EXCEPT SELECT age FROM users");
-        assert!(m.contains("not implemented") && m.contains("EXCEPT"), "{m}");
-        let m = err("SELECT ms FROM events INTERSECT SELECT age FROM users");
-        assert!(m.contains("INTERSECT"), "{m}");
+    fn except_and_intersect_are_plan_nodes() {
+        // INVERTED. This used to assert that both were refused with "only
+        // UNION is implemented; rewrite it as a join or an anti-join
+        // predicate". They are now the same N-ary node `UNION` lowers to,
+        // carrying a `SetOp`, and the refusal is gone.
+        let e = explain("SELECT ms FROM events EXCEPT SELECT age FROM users");
+        assert!(e.starts_with("Except Distinct\n"), "{e}");
+        let e = explain("SELECT ms FROM events INTERSECT ALL SELECT age FROM users");
+        assert!(e.starts_with("Intersect All\n"), "{e}");
+    }
+
+    #[test]
+    fn intersect_binds_tighter_than_union_and_except() {
+        // `a UNION b INTERSECT c` is `a UNION (b INTERSECT c)`: two nodes, the
+        // inner one indented under the outer. Getting this wrong changes the
+        // answer without changing the text of the query.
+        let e = explain(
+            "SELECT ms FROM events UNION ALL SELECT age FROM users \
+             INTERSECT ALL SELECT id FROM events",
+        );
+        assert!(e.starts_with("Union All\n"), "{e}");
+        assert!(e.contains("\n  Intersect All\n"), "{e}");
+        assert_eq!(e.matches("Intersect All").count(), 1, "{e}");
+    }
+
+    #[test]
+    fn same_kind_set_operations_flatten_but_nested_except_does_not() {
+        // Left-associative chains of one kind collapse to one node...
+        let e = explain(
+            "SELECT ms FROM events EXCEPT ALL SELECT age FROM users \
+             EXCEPT ALL SELECT id FROM events",
+        );
+        assert!(e.starts_with("Except All\n"), "{e}");
+        assert_eq!(e.matches("Except All").count(), 1, "{e}");
+        assert_eq!(e.lines().filter(|l| l.starts_with("  Project")).count(), 3, "{e}");
+
+        // ...but a parenthesised right operand of EXCEPT stays its own node,
+        // because `A - (B - C)` is not `(A - B) - C`.
+        let e = explain(
+            "SELECT ms FROM events EXCEPT ALL \
+             (SELECT age FROM users EXCEPT ALL SELECT id FROM events)",
+        );
+        assert_eq!(e.matches("Except All").count(), 2, "{e}");
+    }
+
+    #[test]
+    fn set_operation_arity_and_type_mismatches_name_the_operation() {
+        let m = err("SELECT id, ms FROM events INTERSECT SELECT age FROM users");
+        assert!(m.contains("INTERSECT branches disagree on width"), "{m}");
+        let m = err("SELECT url FROM events EXCEPT SELECT age FROM users");
+        assert!(m.contains("EXCEPT branches disagree on column 1"), "{m}");
     }
 
     // ---------------------------------------------------- unsupported bits

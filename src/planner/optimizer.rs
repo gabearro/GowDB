@@ -1153,13 +1153,13 @@ fn sink_filter(plan: LogicalPlan, depth: usize) -> Result<LogicalPlan> {
                 // 0.75-0.83 ms -> 0.015 ms, 51-52x. Outside a DISTINCT over
                 // the same data it is 17.5-19.2 ms -> 0.035 ms, 495-540x --
                 // the dedup is what made that one expensive.
-                LogicalPlan::Union { inputs, all, schema } => {
+                LogicalPlan::Union { inputs, op, all, schema } => {
                     let (down, keep) = movable(conjuncts);
                     let mut branches = Vec::with_capacity(inputs.len());
                     for b in inputs {
                         branches.push(below(b, down.clone(), depth)?);
                     }
-                    above(LogicalPlan::Union { inputs: branches, all, schema }, keep)
+                    above(LogicalPlan::Union { inputs: branches, op, all, schema }, keep)
                 }
 
                 // Through DISTINCT unchanged: filtering before dedup and after
@@ -2224,12 +2224,12 @@ fn map_children_res(
             residual,
             schema,
         },
-        LogicalPlan::Union { inputs, all, schema } => {
+        LogicalPlan::Union { inputs, op, all, schema } => {
             let mut v = Vec::with_capacity(inputs.len());
             for i in inputs {
                 v.push(f(i)?);
             }
-            LogicalPlan::Union { inputs: v, all, schema }
+            LogicalPlan::Union { inputs: v, op, all, schema }
         }
         leaf => leaf,
     })

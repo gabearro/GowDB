@@ -939,15 +939,18 @@ impl Wal {
         }
         // One directory read for the whole of what follows: where this segment
         // starts, and whether retention has anything to do.
+        //
+        // The position is where the newest *sealed* segment ends, derived from
+        // the archive rather than carried in the log, so wiping the live log
+        // cannot renumber the stream. Unsealed links do not count -- see below.
         let segs = sealed(&dir)?;
         let origin = segs
             .last()
             .map_or(0, |&(o, len)| o + len.saturating_sub(format::HEADER_LEN as u64));
         let seg = dir.join(seg_name(origin, SEG_EXT));
         // A link with no seal beside it is debris from an archive a crash
-        // interrupted, and it can only ever be here: `next_origin` counts
-        // sealed segments only, so this position is one no sealed segment
-        // occupies. The log still holds every record it held -- the
+        // interrupted, and it can only ever be here: `origin` counts sealed
+        // segments only, so this position is one no sealed segment occupies. The log still holds every record it held -- the
         // replacement never happened either -- so the honest repair is to
         // discard it and archive the log as it stands now, which is a superset.
         if !dir.join(seg_name(origin, SEAL_EXT)).exists() {
@@ -1477,20 +1480,6 @@ fn newest_seal(dir: &Path) -> Option<Span> {
     read_seal(dir, origin).ok()?.map(|(span, _)| span)
 }
 
-/// The stream position the next segment starts at: where the newest sealed one
-/// ends.
-///
-/// Derived from the archive rather than carried in the log, so wiping the live
-/// log cannot renumber the stream. Unsealed links do not count: one is the
-/// debris of an interrupted archive whose records the log still holds, so the
-/// retry has to land on the *same* position and supersede it -- counting it
-/// would put those records in the stream twice.
-fn next_origin(dir: &Path) -> Result<u64> {
-    Ok(sealed(dir)?
-        .last()
-        .map_or(0, |&(o, len)| o + len.saturating_sub(format::HEADER_LEN as u64)))
-}
-
 /// The highest recovery LSN this table's archive no longer holds.
 fn horizon(dir: &Path) -> Result<u64> {
     let path = dir.join(HORIZON_FILE);
@@ -1522,9 +1511,10 @@ fn drop_through(dir: &Path, seq: u64) -> Result<()> {
 
 /// Drop whole segments, oldest first, until the archive fits `budget`.
 ///
-/// Never the newest one, whatever the budget: it is what [`next_origin`] reads
-/// to keep the stream numbering monotone, and losing it would let a later
-/// segment reuse a stream position an older backup still refers to.
+/// Never the newest one, whatever the budget: it is what `archive` reads to
+/// place the next segment and keep the stream numbering monotone, and losing it
+/// would let a later segment reuse a stream position an older backup still
+/// refers to.
 fn prune(dir: &Path, budget: u64, segs: &[(u64, u64)]) -> Result<()> {
     let mut total: u64 = segs.iter().map(|&(_, len)| len).sum();
     // The early exit is the whole point of taking `segs` from the caller: on

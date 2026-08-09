@@ -90,7 +90,7 @@
 //! of `Vec`s per *query*, never per row and never per granule.
 
 use crate::catalog::Catalog;
-use crate::sql::ast::{BinaryOp, JoinOp};
+use crate::sql::ast::{BinaryOp, JoinOp, SetOp};
 use crate::types::{DataType, PhysicalType, Value};
 
 use crate::planner::logical::{BoundExpr, LogicalPlan, ScanNode};
@@ -362,8 +362,19 @@ impl<'c> Estimator<'c> {
                     JoinOp::Inner => inner,
                 }
             }
-            LogicalPlan::Union { inputs, all, .. } => {
-                let n: f64 = inputs.iter().map(|i| self.rows_at(i, d)).sum();
+            // The three set operations have three different ceilings, and
+            // using `UNION`'s for all of them would have told the join
+            // reorderer that `big EXCEPT small` is bigger than `big`.
+            //   UNION      -- at most the sum of the branches
+            //   INTERSECT  -- at most the smallest branch
+            //   EXCEPT     -- at most branch 0, which is the one that streams
+            LogicalPlan::Union { inputs, op, all, .. } => {
+                let mut it = inputs.iter().map(|i| self.rows_at(i, d));
+                let n = match op {
+                    SetOp::Union => it.sum(),
+                    SetOp::Intersect => it.fold(f64::INFINITY, f64::min),
+                    SetOp::Except => it.next().unwrap_or(0.0),
+                };
                 if *all {
                     n
                 } else {

@@ -692,16 +692,97 @@ pub struct Select {
     /// into the scan ahead of reading other columns.
     pub prewhere: Option<Expr>,
     pub selection: Option<Expr>,
+    /// One entry per `GROUP BY` item. A multi-grouping item -- `ROLLUP(a, b)`,
+    /// `CUBE(a, b)`, `GROUPING SETS ((a, b), (a), ())` -- rides here as an
+    /// ordinary [`Expr::Function`] and is recognized by [`GroupSpec::of`].
     pub group_by: Vec<Expr>,
     pub with_totals: bool,
     pub having: Option<Expr>,
 }
 
+/// The spelling of a `GROUP BY` item that asks for more than one grouping.
+///
+/// These live in [`Select::group_by`] as `Expr::Function` calls rather than in
+/// a variant of their own, and that is a deliberate cheat with two payoffs.
+/// `ROLLUP(a, b)` and `CUBE(a, b)` *are* function-call syntax, so the
+/// expression parser reads them with no grammar at all; and every generic walk
+/// over a group key -- view qualification, subquery detection, the depth guard
+/// -- keeps working with no arm added, where a new `Expr` variant or a change
+/// to `group_by`'s type would have made each of them a place to forget.
+///
+/// The names are reserved only *here*: nothing else in the engine defines a
+/// function called `rollup` or `cube`, so `SELECT cube(x)` is the same unknown
+/// function it always was.
+pub enum GroupSpec<'a> {
+    /// `ROLLUP(a, b, c)`: the four prefixes, longest first.
+    Rollup(&'a [Expr]),
+    /// `CUBE(a, b, c)`: all eight subsets.
+    Cube(&'a [Expr]),
+    /// `GROUPING SETS (...)`: each element is one set, always an
+    /// [`Expr::Tuple`] -- including the empty one, which is the grand total.
+    Sets(&'a [Expr]),
+}
+
+/// The name the parser gives a `GROUPING SETS` item. Not writable as a call:
+/// the space is what keeps a user's `SELECT "GROUPING SETS"(x)` out.
+pub const GROUPING_SETS: &str = "GROUPING SETS";
+
+impl GroupSpec<'_> {
+    pub fn of(e: &Expr) -> Option<GroupSpec<'_>> {
+        let Expr::Function { name, args, params, distinct } = e else { return None };
+        if !params.is_empty() || *distinct {
+            return None;
+        }
+        if name == GROUPING_SETS {
+            return Some(GroupSpec::Sets(args));
+        }
+        if name.eq_ignore_ascii_case("rollup") {
+            return Some(GroupSpec::Rollup(args));
+        }
+        if name.eq_ignore_ascii_case("cube") {
+            return Some(GroupSpec::Cube(args));
+        }
+        None
+    }
+
+    pub fn keyword(&self) -> &'static str {
+        match self {
+            GroupSpec::Rollup(_) => "ROLLUP",
+            GroupSpec::Cube(_) => "CUBE",
+            GroupSpec::Sets(_) => GROUPING_SETS,
+        }
+    }
+}
+
+/// The three ANSI set operations. `INTERSECT` binds tighter than the other
+/// two, which is a parser rule (see `set_term`) rather than anything this enum
+/// records.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SetOp {
     Union,
     Except,
     Intersect,
+}
+
+impl SetOp {
+    /// The keyword, for diagnostics and `EXPLAIN`. Uppercase because every
+    /// message that names an operation in this engine spells it as SQL does.
+    pub fn keyword(self) -> &'static str {
+        match self {
+            SetOp::Union => "UNION",
+            SetOp::Except => "EXCEPT",
+            SetOp::Intersect => "INTERSECT",
+        }
+    }
+
+    /// Title case, for plan labels: `Union All`, `Except Distinct`.
+    pub fn label(self) -> &'static str {
+        match self {
+            SetOp::Union => "Union",
+            SetOp::Except => "Except",
+            SetOp::Intersect => "Intersect",
+        }
+    }
 }
 
 #[derive(Clone, PartialEq, Debug)]

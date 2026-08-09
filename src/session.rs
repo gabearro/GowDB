@@ -112,7 +112,7 @@
 //! of the transaction is still the rename's.
 
 use std::fs::File;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock, RwLockWriteGuard};
 use std::time::{Duration, Instant};
@@ -519,13 +519,18 @@ impl TxnStmt {
 ///
 /// ```text
 ///   BACKUP TO '<archive>' [INCREMENTAL FROM '<base archive>']
-///   RESTORE FROM '<archive>' [TO '<directory>']
+///   RESTORE FROM '<archive>' [TO '<directory>'] [UNTIL <recovery target>]
 ///   VERIFY BACKUP '<archive>'
 /// ```
+///
+/// The recovery target is spelled `LSN <n>`, `TIMESTAMP '<ts>'` or `LATEST`,
+/// and it is turned into a [`crate::backup::Target`] here at parse time --
+/// before a directory is created -- so `UNTIL LSN yesterday` costs nothing but
+/// the sentence that says why.
 #[derive(Debug)]
 enum Admin {
     Backup { to: String, base: Option<String> },
-    Restore { from: String, to: Option<String> },
+    Restore { from: String, to: Option<String>, until: Option<crate::backup::Target> },
     Verify { archive: String },
 }
 
@@ -1073,7 +1078,7 @@ impl Session {
     fn run_admin(&mut self, a: &Admin) -> Result<ResultSet> {
         match a {
             Admin::Backup { to, base } => self.run_backup(to, base.as_deref()),
-            Admin::Restore { from, to } => self.run_restore(from, to.as_deref()),
+            Admin::Restore { from, to, until } => self.run_restore(from, to.as_deref(), *until),
             Admin::Verify { archive } => {
                 let r = crate::backup::verify(Path::new(archive))?;
                 report(
@@ -1144,15 +1149,34 @@ impl Session {
         )
     }
 
-    /// `RESTORE FROM '<archive>' TO '<directory>'`.
+    /// `RESTORE FROM '<archive>' TO '<directory>' [UNTIL <recovery target>]`.
     ///
-    /// The target is mandatory, and it may not be the directory this session
-    /// has open. Both refusals are the same rule: a restore that wrote into a
-    /// live database would interleave its part sequence numbers and commit
-    /// records with the ones already there, and the result would be neither
-    /// database. Restore beside it and swap the directories -- `rename` is
-    /// atomic and the old copy survives the mistake.
-    fn run_restore(&mut self, from: &str, to: Option<&str>) -> Result<ResultSet> {
+    /// The target directory is mandatory, and it may not be the directory this
+    /// session has open. Both refusals are the same rule: a restore that wrote
+    /// into a live database would interleave its part sequence numbers and
+    /// commit records with the ones already there, and the result would be
+    /// neither database. Restore beside it and swap the directories --
+    /// `rename` is atomic and the old copy survives the mistake.
+    ///
+    /// `UNTIL` rolls the unpacked copy forward through the *open* database's
+    /// WAL archive, which it reads and never writes -- that is what makes a
+    /// point-in-time recovery legal while the source is serving. Which is also
+    /// why the two directories being distinct is checked once, above, before
+    /// either branch: an `UNTIL` that reached its own copy of the check would
+    /// be a second place for it to be wrong, and the failure it guards against
+    /// is unrecoverable by construction.
+    ///
+    /// Deliberately *not* checkpointed first. A recovery statement that wrote
+    /// to the database it is recovering from would be refused on a read-only
+    /// session and would change the source's archive under an operator who is
+    /// mid-incident; when the tail really is needed, `check_target` says so and
+    /// names the table still holding it.
+    fn run_restore(
+        &mut self,
+        from: &str,
+        to: Option<&str>,
+        until: Option<crate::backup::Target>,
+    ) -> Result<ResultSet> {
         let Some(to) = to else {
             return Err(Error::unsupported(
                 "RESTORE needs a target: `RESTORE FROM '<archive>' TO '<directory>'`. It is \
@@ -1160,17 +1184,47 @@ impl Session {
             ));
         };
         let target = Path::new(to);
-        if self.catalog.dir().is_some_and(|d| same_dir(d, target)) {
-            return Err(Error::storage(format!(
-                "refusing to restore into {to}: this session has that database open. \
-                 Restore to a new directory and swap.",
-            )));
+        if let Some(root) = self.catalog.dir() {
+            if let Some(exact) = overlaps(root, target) {
+                return Err(Error::storage(format!(
+                    "refusing to restore into {to}: this session has that database open{}. \
+                     Restore to a new directory and swap.",
+                    if exact {
+                        String::new()
+                    } else {
+                        format!(
+                            " at {}, and one of the two directories is inside the other -- \
+                             which would leave a second CATALOG and a second set of part \
+                             directories inside the tree the loader walks",
+                            root.display()
+                        )
+                    }
+                )));
+            }
         }
-        let r = crate::backup::restore(Path::new(from), target)?;
+        let r = match until {
+            None => crate::backup::restore(Path::new(from), target)?,
+            Some(t) => {
+                let Some(root) = self.catalog.dir() else {
+                    return Err(Error::unsupported(
+                        "RESTORE ... UNTIL rolls forward through the archived write-ahead \
+                         log of the open database, and this session has none -- it is \
+                         in memory. Open the data directory whose archive holds the log \
+                         and run it there; `RESTORE FROM ... TO ...` without `UNTIL` \
+                         unpacks the archive's own instant anywhere.",
+                    ));
+                };
+                crate::backup::restore_until(Path::new(from), root, target, t)?
+            }
+        };
+        // `replayed` is reported whether or not `UNTIL` was given, exactly as
+        // `BACKUP` reports `reused_parts` without `INCREMENTAL`: one shape per
+        // statement is one thing for a script to read, and "replayed 0" is the
+        // answer a plain restore should give rather than a missing column.
         report(
-            &["directory", "tables", "parts", "rows"],
+            &["directory", "tables", "parts", "rows", "replayed"],
             Value::str(to),
-            &[r.tables as u64, r.parts as u64, r.rows],
+            &[r.tables as u64, r.parts as u64, r.rows, r.replayed],
         )
     }
 
@@ -4512,16 +4566,49 @@ fn report(cols: &[&str], name: Value, counts: &[u64]) -> Result<ResultSet> {
     ResultSet::from_rows(schema, vec![row])
 }
 
-/// Whether two paths name the same directory.
+/// Whether two paths name the same directory, or one contains the other.
 ///
-/// Canonicalized when both exist, because `./db` and `/abs/db` are the same
-/// place and the refusal this feeds must not be dodgeable by spelling. A path
-/// that cannot be canonicalized has not been created yet, so it cannot be the
-/// open database, and the literal comparison is the right fallback.
-fn same_dir(a: &Path, b: &Path) -> bool {
-    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
-        (Ok(a), Ok(b)) => a == b,
-        _ => a == b,
+/// Containment and not just equality, because `TO '<open db>/restored'` is the
+/// same mistake spelled one level down: it leaves a second `CATALOG` and a
+/// second set of part directories inside the tree the loader walks, which is
+/// the state the "a restore never merges into a live database" rule exists to
+/// prevent. Checked on a live root: the scan in `unaccounted_table_dirs` looks
+/// one level too shallow to notice, so nothing else would have, and the
+/// operator would find out the next time somebody copied the data directory.
+///
+/// `None` when the two are disjoint. Otherwise `Some(true)` for the same
+/// directory and `Some(false)` for one inside the other -- the refusal reads
+/// differently for each, and answering here is what keeps it from resolving
+/// both paths a second time to find out.
+fn overlaps(a: &Path, b: &Path) -> Option<bool> {
+    let (a, b) = (resolved(a), resolved(b));
+    (a.starts_with(&b) || b.starts_with(&a)).then(|| a == b)
+}
+
+/// `p` with its deepest *existing* ancestor canonicalized.
+///
+/// Plain `canonicalize` is not enough here: a restore target has not been
+/// created yet, which is precisely the input it refuses -- and comparing the
+/// raw text instead would let `../db` or a symlinked parent walk straight past
+/// the refusal above.
+fn resolved(p: &Path) -> PathBuf {
+    let abs;
+    let mut p = p;
+    if p.is_relative() {
+        if let Ok(cwd) = std::env::current_dir() {
+            abs = cwd.join(p);
+            p = &abs;
+        }
+    }
+    let mut cur = p;
+    loop {
+        if let Ok(c) = std::fs::canonicalize(cur) {
+            return p.strip_prefix(cur).map_or(c.clone(), |tail| c.join(tail));
+        }
+        match cur.parent() {
+            Some(up) if up != cur => cur = up,
+            _ => return p.to_path_buf(),
+        }
     }
 }
 
@@ -4570,6 +4657,7 @@ fn mentions_infile(sql: &str) -> bool {
 /// the parser's "unexpected token" on a word it has never heard of.
 fn admin_stmt(span: &[crate::sql::lexer::Spanned]) -> Option<Result<Admin>> {
     use crate::sql::lexer::Token;
+    use std::borrow::Cow;
     let head = span[0].tok.bare_word()?;
     let text = |i: usize| match span.get(i).map(|s| &s.tok) {
         Some(Token::Str(s)) => Some(s.clone()),
@@ -4594,17 +4682,56 @@ fn admin_stmt(span: &[crate::sql::lexer::Spanned]) -> Option<Result<Admin>> {
         };
     }
     if head.eq_ignore_ascii_case("restore") {
+        const FORM: &str = "RESTORE FROM '<archive>' [TO '<directory>'] \
+                            [UNTIL LSN <n> | UNTIL TIMESTAMP '<ts>' | UNTIL LATEST]";
         let Some(from) = kw(1, "from").then(|| text(2)).flatten() else {
-            return usage("RESTORE", "RESTORE FROM '<archive>' [TO '<directory>']");
+            return usage("RESTORE", FORM);
         };
-        return match span.len() {
-            3 => Some(Ok(Admin::Restore { from, to: None })),
-            5 if kw(3, "to") => match text(4) {
-                Some(to) => Some(Ok(Admin::Restore { from, to: Some(to) })),
-                None => usage("RESTORE", "RESTORE FROM '<archive>' TO '<directory>'"),
-            },
-            _ => usage("RESTORE", "RESTORE FROM '<archive>' [TO '<directory>']"),
+        // `TO` stays optional in the grammar so that omitting it is answered by
+        // `run_restore`'s sentence about why the target is never the open
+        // database, rather than by a form line that does not say why.
+        let (to, rest) = match (kw(3, "to"), text(4)) {
+            (true, Some(to)) => (Some(to), &span[5..]),
+            (true, None) => return usage("RESTORE", FORM),
+            _ => (None, &span[3..]),
         };
+        let until = match rest {
+            [] => None,
+            [u, tail @ ..] if u.tok.is_keyword("until") => {
+                let Some(kind) = tail.first().and_then(|s| s.tok.bare_word()) else {
+                    return usage("RESTORE", FORM);
+                };
+                // The value goes to `backup::parse_target` as text rather than
+                // being decoded here: the grammar of a recovery target belongs
+                // to the module that acts on one, so the statement and the
+                // machinery cannot come to disagree about what a timestamp
+                // means. `LATEST` carries no value, hence the empty borrow.
+                //
+                // A bare word is handed over too, rather than refused as the
+                // wrong token: `UNTIL LSN soon` deserves the sentence naming
+                // where a recovery LSN comes from, not a form line -- and this
+                // clause is only ever typed by someone whose day has already
+                // gone wrong.
+                let value = match &tail[1..] {
+                    [] => Cow::Borrowed(""),
+                    [v] => match &v.tok {
+                        Token::Str(s) | Token::Word { value: s, .. } => Cow::Borrowed(s.as_str()),
+                        // `UNTIL LSN 5` lexes as a number, and `render_plain`
+                        // is the spelling that round-trips it -- `Display`
+                        // would quote a string, which this arm never sees.
+                        Token::Number(n) => Cow::Owned(n.render_plain()),
+                        _ => return usage("RESTORE", FORM),
+                    },
+                    _ => return usage("RESTORE", FORM),
+                };
+                match crate::backup::parse_target(kind, &value) {
+                    Ok(t) => Some(t),
+                    Err(e) => return Some(Err(e)),
+                }
+            }
+            _ => return usage("RESTORE", FORM),
+        };
+        return Some(Ok(Admin::Restore { from, to, until }));
     }
     if head.eq_ignore_ascii_case("verify") {
         // Only `VERIFY BACKUP`, so the word stays available for whatever a

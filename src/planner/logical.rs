@@ -9,7 +9,7 @@
 
 use crate::common::{Error, Result};
 use crate::exec::functions::{aggregate, AggFn, ScalarFn};
-use crate::sql::ast::{BinaryOp, JoinOp, UnaryOp};
+use crate::sql::ast::{BinaryOp, JoinOp, SetOp, UnaryOp};
 use crate::types::{DataType, Field, Schema, Value};
 
 // -------------------------------------------------------------- expressions
@@ -448,8 +448,24 @@ pub enum LogicalPlan {
         residual: Option<BoundExpr>,
         schema: Schema,
     },
+    /// The N-ary set operation: `UNION`, `INTERSECT` or `EXCEPT`.
+    ///
+    /// One node rather than three because every rule that has ever wanted to
+    /// look at a `UNION` wants the same thing from the other two -- a filter
+    /// pushes into the branches of all three (`σ(L ∩ R) = σ(L) ∩ σ(R)` and
+    /// `σ(L − R) = σ(L) − σ(R)`, multiplicities included, because a conjunct
+    /// over the branch schema accepts or rejects a whole tuple), and the
+    /// branches are traversed and pruned identically. A separate variant would
+    /// have made every one of those rules opt in again, silently, which is how
+    /// a set operation ends up unoptimized rather than how it ends up correct.
+    ///
+    /// `inputs` is left-to-right and the order is load-bearing for `EXCEPT`:
+    /// branch 0 is the one that streams and the rest are subtracted from it.
     Union {
         inputs: Vec<LogicalPlan>,
+        op: SetOp,
+        /// `ALL`: keep duplicates with multiplicity. Without it the result is
+        /// `DISTINCT`, which is the ANSI default for all three operations.
         all: bool,
         schema: Schema,
     },
@@ -561,8 +577,8 @@ impl LogicalPlan {
                 }
                 s
             }
-            LogicalPlan::Union { all, .. } => {
-                format!("Union{}", if *all { " All" } else { " Distinct" })
+            LogicalPlan::Union { op, all, .. } => {
+                format!("{}{}", op.label(), if *all { " All" } else { " Distinct" })
             }
             LogicalPlan::Values { rows, .. } => format!("Values {} rows", rows.len()),
             LogicalPlan::Empty { .. } => "Empty".into(),

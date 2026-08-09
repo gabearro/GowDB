@@ -24,10 +24,11 @@
 //!      process was doing, what is on disk afterwards is either whole or
 //!      visibly incomplete -- and a clean restart repairs it.
 //!
-//! The one thing not driven from SQL is the recovery target itself: `RESTORE
-//! FROM ... TO ...` has no `UNTIL` clause yet, and the statement is parsed in
-//! `session.rs`, which this wave does not own. `pin_restore_until_is_not_yet_a
-//! _statement` fails the day that lands and says what to do about it.
+//! The recovery target has a SQL spelling as of the statement wave:
+//! `RESTORE FROM ... TO ... UNTIL LSN <n>` and `UNTIL TIMESTAMP '<ts>'`,
+//! recognised in `session.rs` beside `BACKUP`. `restore_until_is_a_statement`
+//! below pins that it reaches the same instant this file's direct calls do;
+//! `tests/pitr_statement.rs` pins the statement's whole surface.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -573,32 +574,45 @@ fn a_kill_during_archiving_never_leaves_the_archive_silently_short() {
 
 // ------------------------------------------------------------------- the pins
 
-/// PIN. The recovery target has no SQL spelling yet: `admin_stmt` in
-/// `session.rs` accepts `RESTORE FROM '<archive>' TO '<dir>'` and nothing
-/// else, and that file is not this wave's to change. The exact two-hunk patch
-/// is in this wave's `outsideMyFiles`.
+/// The recovery target's SQL spelling, now that it has one.
 ///
-/// When it lands this test starts failing. Invert it: assert that the
-/// statement recovers to the LSN, which is what
-/// `a_recovery_lands_on_the_lsn_it_was_given` already does through
-/// `backup::restore_until` -- the statement is a three-line wrapper over it.
+/// The statement is a wrapper over `backup::restore_until`, so the claim worth
+/// pinning here is that it is *that* wrapper and not a second implementation:
+/// the same target, typed as SQL, must land on the same rows as the direct
+/// call in `a_recovery_lands_on_the_lsn_it_was_given` above.
+///
+/// The statement's own surface -- both target axes, every refusal, and the rule
+/// that `UNTIL` is not a way past `RESTORE`'s refusal to write into the open
+/// database -- is `tests/pitr_statement.rs`.
 #[test]
-fn pin_restore_until_is_not_yet_a_statement() {
+fn restore_until_is_a_statement() {
     let _x = exclusive();
-    let s = Scratch::new("pin");
+    let s = Scratch::new("statement");
     let (arc, marks) = staged(&s);
     let db = s.db();
-    let r = sql(
-        &db,
-        &format!("RESTORE FROM '{arc}' TO '{}' UNTIL LSN {}", s.s("out"), marks[0]),
-    );
-    assert_eq!(r.code, 1, "RESTORE ... UNTIL now parses: invert this pin");
-    assert!(
-        r.err.contains("takes the form"),
-        "RESTORE ... UNTIL reached the engine -- the session.rs patch has landed, so this \
-         pin is stale. Replace it with an assertion that the statement recovers to the LSN.\n{}",
-        r.err
-    );
+
+    for &mark in marks.iter() {
+        // The direct call, which the rest of this file already trusts.
+        let direct = s.at(&format!("direct-{mark}"));
+        backup::restore_until(Path::new(&arc), &db, &direct, Target::Lsn(mark))
+            .expect("direct recover");
+
+        // ...and the same instant asked for in SQL.
+        let typed = s.at(&format!("typed-{mark}"));
+        let r = sql(
+            &db,
+            &format!(
+                "RESTORE FROM '{arc}' TO '{}' UNTIL LSN {mark}",
+                typed.to_string_lossy()
+            ),
+        );
+        assert_eq!(r.code, 0, "RESTORE ... UNTIL LSN {mark} failed: {}", r.err);
+        assert_eq!(
+            ids(&typed),
+            ids(&direct),
+            "the statement and the direct call disagree at LSN {mark}"
+        );
+    }
 }
 
 /// The target grammar itself is this module's, so it is checked here even

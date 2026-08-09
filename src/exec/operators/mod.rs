@@ -479,11 +479,11 @@ pub fn build_physical<'a>(
             schema,
             ctx,
         )),
-        // `build_union` owns the branch construction because `Union`'s fields
-        // are private to that module, so it re-lowers each branch through
-        // `build`. See the `logical` field on `PhysicalPlan::Union`.
-        PhysicalPlan::Union { logical, all, schema, .. } => {
-            union::build_union(logical, all, schema, catalog, ctx)?
+        // `build_set` owns the branch construction because the set operators'
+        // fields are private to that module, so it re-lowers each branch
+        // through `build`. See the `logical` field on `PhysicalPlan::Union`.
+        PhysicalPlan::Union { logical, op, all, schema, .. } => {
+            union::build_set(logical, op, all, schema, catalog, ctx)?
         }
         PhysicalPlan::Values { rows, schema } => Box::new(values::Values::new(rows, schema)),
         PhysicalPlan::Empty { schema } => Box::new(values::Empty::new(schema)),
@@ -1093,6 +1093,7 @@ mod tests {
                     },
                     LogicalPlan::Empty { schema: s.clone() },
                 ],
+                op: crate::sql::ast::SetOp::Union,
                 all: false,
                 schema: s.clone(),
             };

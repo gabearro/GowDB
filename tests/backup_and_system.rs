@@ -242,36 +242,65 @@ fn a_backup_taken_mid_stream_restores_the_database_as_it_was() {
 /// A backup that raced a writer -- read one table's commit record and another
 /// table's parts, or half of a `PartSet` -- would restore with a hole, and
 /// `count() = max(id)` is what says there is none.
+///
+/// The overlap is *waited for*, not hoped for. Six backups of a 1000-row table
+/// can all finish before the writer's first batch lands, and a trial that saw
+/// no rows disproved nothing; it used to fail the run anyway. Now each backup
+/// is paced on an observed advance of the writer, and a writer that still
+/// outruns the backups is given more work rather than called a failure.
 #[test]
 fn a_backup_taken_while_a_writer_runs_is_a_consistent_prefix() {
-    let s = Scratch::new("live");
+    for batches in [40u64, 160, 640] {
+        if live_backup_race(batches) {
+            return;
+        }
+    }
+    panic!("the writer outran the backups at every size: the race never happened");
+}
+
+/// One trial of the above. Returns false if the writer finished before a single
+/// backup could overlap it -- nothing was observed, so the caller escalates.
+fn live_backup_race(batches: u64) -> bool {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    const PER: u64 = 25;
+
+    let s = Scratch::new(&format!("live-{batches}"));
     let db = Db::open(s.at("db")).expect("open");
     db.execute(DDL).expect("ddl");
 
-    const BATCHES: u64 = 40;
-    const PER: u64 = 25;
+    let landed = AtomicU64::new(0);
     let taken = std::thread::scope(|scope| {
-        let w = &db;
+        let (w, l) = (&db, &landed);
         scope.spawn(move || {
-            for k in 0..BATCHES {
+            for k in 0..batches {
                 w.execute(&insert(k * PER + 1, PER)).expect("insert");
+                l.store(k + 1, Ordering::Release);
             }
         });
-        // Backups race the writer for the same lock; each one is whatever the
-        // table was between two of its statements.
-        let mut taken = Vec::new();
-        for i in 0..6 {
-            let p = s.s(&format!("live-{i}.gbak"));
+        // One backup per observed advance of the writer: every archive is a
+        // distinct instant, and every one of them was taken with the writer
+        // still going. Backups race the writer for the same lock, so each is
+        // whatever the table was between two of its statements.
+        let (mut taken, mut at) = (Vec::new(), 0);
+        while taken.len() < 6 {
+            let now = landed.load(Ordering::Acquire);
+            if now >= batches {
+                break; // writer done: a further backup would race nothing
+            }
+            if now == at {
+                std::thread::yield_now();
+                continue;
+            }
+            at = now;
+            let p = s.s(&format!("live-{}.gbak", taken.len()));
             db.writer().query(&format!("BACKUP TO '{p}'")).expect("backup");
             taken.push(p);
-            std::thread::yield_now();
         }
         taken
     });
     drop(db);
 
-    let mut seen_growth = false;
-    let mut last = 0u64;
+    let (mut seen, mut last) = (false, 0u64);
     for (i, p) in taken.iter().enumerate() {
         sql(None, &format!("VERIFY BACKUP '{p}'")).ok();
         let out = s.s(&format!("live-out-{i}"));
@@ -285,10 +314,11 @@ fn a_backup_taken_while_a_writer_runs_is_a_consistent_prefix() {
         assert_eq!(row[2], "1", "archive {i} lost the head of the table");
         assert_eq!(n, hi, "archive {i} has {n} rows but a max id of {hi}: it has a hole");
         assert_eq!(n % PER, 0, "archive {i} caught half of an INSERT: {n} rows");
-        seen_growth |= n > last;
-        last = n;
+        // Taken in order against a table that only grows.
+        assert!(n >= last, "archive {i} went backwards: {n} rows after {last}");
+        (seen, last) = (true, n);
     }
-    assert!(seen_growth, "no backup saw any of the writer's rows; the race never happened");
+    seen
 }
 
 #[test]

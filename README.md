@@ -477,7 +477,7 @@ aspirational. Every "yes" below has a test in `tests/sql.rs`.
 | **SELECT** | `DISTINCT`, expression projections with `AS`, `*` and `t.*`, `PREWHERE`, `WHERE`, `GROUP BY`, `HAVING`, `ORDER BY` (multi-key, `ASC`/`DESC`, `NULLS FIRST/LAST`), `LIMIT`/`OFFSET`, clickhouse's reversed `LIMIT off, n`, `LIMIT n BY (…)` |
 | **FROM** | base tables, subqueries, `WITH … AS (…)` CTEs, `FINAL` |
 | **JOIN** | `INNER`, `LEFT`, `RIGHT`, `FULL`, `CROSS`, comma joins, `ON` and `USING (…)`; hash join, with NULL padding on outer sides |
-| **Set ops** | `UNION ALL`, `UNION DISTINCT` |
+| **Set ops** | `UNION`, `INTERSECT`, `EXCEPT`, each with `ALL` or `DISTINCT` (`DISTINCT` is the default). `INTERSECT` binds tighter than the other two; NULLs match each other, as ANSI requires. |
 | **Subqueries** | uncorrelated scalar `(SELECT …)`, `x [NOT] IN (SELECT …)`, `[NOT] EXISTS (…)`; evaluated once before planning and folded to literals |
 | **Types** | `UInt8/16/32/64`, `Int8/16/32/64`, `Float32/64`, `Decimal64(s)` (exact, backed by `i64`), `Bool`, `String`, `FixedString(n)`, `Date`, `DateTime`, `Nullable(T)`, `LowCardinality(T)` |
 | **Expressions** | full precedence table, `IS [NOT] NULL`, `[NOT] IN (list)`, `[NOT] BETWEEN`, `[NOT] LIKE`/`ILIKE`, `CASE`, `CAST(x AS T)` and `x::T`, `INTERVAL n UNIT`, tuples |
@@ -493,7 +493,6 @@ feature. None of them silently do something else.
 
 | feature | note |
 |---|---|
-| `EXCEPT` / `INTERSECT` | parsed, then rejected; only `UNION` is implemented |
 | correlated subqueries | rejected explicitly (uncorrelated ones work) |
 | arrays | no `Array(T)` type. `groupArray` returns a joined `String`, `splitByChar` returns the first field |
 | `GROUP BY … WITH TOTALS/ROLLUP/CUBE` | `WITH TOTALS` parses and is rejected; `ROLLUP`/`CUBE` are not parsed |

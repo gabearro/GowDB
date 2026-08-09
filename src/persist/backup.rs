@@ -882,6 +882,16 @@ fn check_target(
 /// text into one is one place that can get it wrong.
 pub fn parse_target(kind: &str, value: &str) -> Result<Target> {
     if kind.eq_ignore_ascii_case("latest") {
+        // `UNTIL LATEST 5` used to parse as `LATEST` with the 5 dropped on the
+        // floor, which is the one class of answer this module never gives: the
+        // operator named an instant, was told "ok", and got a different one.
+        if !value.trim().is_empty() {
+            return Err(Error::bind(format!(
+                "`UNTIL LATEST {value}` takes no value -- LATEST *is* the end of the \
+                 archive. To stop short of it, say `UNTIL LSN <n>` or `UNTIL TIMESTAMP \
+                 '<YYYY-MM-DD HH:MM:SS[.mmm]>'`"
+            )));
+        }
         return Ok(Target::Latest);
     }
     if kind.eq_ignore_ascii_case("lsn") {
