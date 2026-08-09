@@ -479,14 +479,30 @@ fn a_reader_never_fails_because_a_writer_is_buffering() {
 
     std::thread::scope(|scope| {
         {
-            let (db, stop) = (db.clone(), Arc::clone(&stop));
+            let (db, stop, reads) = (db.clone(), Arc::clone(&stop), Arc::clone(&reads));
             scope.spawn(move || {
                 for c in 0..200u64 {
                     // One statement, one autocommit, four rows into the delta.
                     let vals: Vec<String> =
                         (0..BATCH).map(|r| format!("({})", c * BATCH + r)).collect();
+                    let before = reads.load(Ordering::Acquire);
                     db.execute(&format!("INSERT INTO t VALUES {}", vals.join(",")))
                         .unwrap();
+                    // Pace the writer on the readers rather than racing them.
+                    // 200 inserts of four rows is a few milliseconds, and on a
+                    // loaded machine the whole loop can finish before a reader
+                    // thread is scheduled at all -- which used to fail the run
+                    // for "the readers never ran", having disproved nothing.
+                    // Waiting for one read per insert makes the interleaving a
+                    // property of the test instead of the scheduler.
+                    //
+                    // Bounded, so a reader that panics ends the run at its own
+                    // assertion instead of hanging this thread in `scope`.
+                    let mut spins = 0u32;
+                    while reads.load(Ordering::Acquire) == before && spins < 10_000_000 {
+                        spins += 1;
+                        std::thread::yield_now();
+                    }
                 }
                 stop.store(true, Ordering::Release);
             });
@@ -506,6 +522,8 @@ fn a_reader_never_fails_because_a_writer_is_buffering() {
             });
         }
     });
+    // One read per insert is guaranteed by the pacing above, so this is a
+    // floor on the pacing having worked, not a hope about scheduling.
     assert!(reads.load(Ordering::Relaxed) > 10, "the readers never ran");
     assert_eq!(
         scalar_u64(&db.reader().query("SELECT count() FROM t").unwrap()),

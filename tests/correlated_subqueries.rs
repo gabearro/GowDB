@@ -667,11 +667,24 @@ fn decorrelation_is_asymptotic() {
         times.push((bc, bj));
     }
 
-    let growth = times[1].0 / times[0].0;
+    // Growth measured against the *join's* growth, not against a constant.
+    //
+    // The absolute form (`growth < 8.0`) was a statement about the machine as
+    // much as the plan: both sizes are timed in separate passes, so a run that
+    // got busier between n and 4n inflates the ratio on its own, and this
+    // failed once under full-suite load having found nothing. Both plans are
+    // timed interleaved at each size, so dividing one growth by the other
+    // cancels whatever the machine was doing -- the same reason the per-size
+    // check below compares against `j` rather than against a number.
+    //
+    // A join grows ~4x for 4x the rows on both sides and a per-row loop ~16x,
+    // so the discriminator is 4x the join's growth and the bound sits well
+    // under it.
+    let (cg, jg) = (times[1].0 / times[0].0, times[1].1 / times[0].1);
     assert!(
-        growth < 8.0,
-        "4x the rows on both sides cost {growth:.1}x, which is a per-row loop rather than a \
-         join (a join is ~4x, a loop ~16x)"
+        cg < jg * 2.5,
+        "4x the rows cost the correlated form {cg:.1}x against the join's {jg:.1}x, which is \
+         a per-row loop rather than a join (a loop grows ~4x faster than the join)"
     );
     // And it stays within a small multiple of the join it is supposed to be.
     for ((c, j), n) in times.iter().zip(sizes) {

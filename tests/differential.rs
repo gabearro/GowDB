@@ -2033,17 +2033,32 @@ fn gen_atom_pred(rng: &mut Rng, sc: &Scope) -> E {
                 .collect();
             E::In(lhs.b(), list, rng.pct(30))
         }
-        // LIKE's operand is deliberately *not* the widened `lhs`. The generator
-        // keeps text lowercase so SQLite's case-insensitive LIKE is
-        // unobservable (KNOWN DIVERGENCES #3) -- but `upper(s)` and
-        // `replace(s,'a','X')` manufacture uppercase, and then the difference
-        // is observable again. A 60000-case soak found exactly that:
-        // `upper('ab') LIKE '%a%'` is false in granular and true in SQLite.
-        // The invariant is "nothing case-shifted ever reaches a LIKE", and the
-        // only way to hold it is to build the operand here.
+        // LIKE's operand is deliberately *not* the widened `lhs`, and it is
+        // lowercased on the way in. The generator keeps text lowercase so
+        // SQLite's case-insensitive LIKE is unobservable (KNOWN DIVERGENCES
+        // #3) -- but `upper(s)` and `replace(s,'a','X')` manufacture
+        // uppercase, and then the difference is observable again. A 60000-case
+        // soak found exactly that: `upper('ab') LIKE '%a%'` is false in
+        // granular and true in SQLite.
+        //
+        // Building the operand here was the first fix, and it was not enough.
+        // It held the invariant across *expressions* and missed the data: a
+        // generated `UPDATE t SET a1 = upper(a1)` stores the uppercase, and a
+        // later `a1 LIKE '%a%'` reads a case-shifted column having never
+        // called a case-shifting function. Found at seed 271828, 100k cases.
+        //
+        // So the operand is wrapped rather than policed. Chasing every
+        // producer that could put uppercase into a text column -- mutations
+        // today, `INSERT ... SELECT` tomorrow -- is a rule that has already
+        // been broken once by a path nobody thought of. `lower(x) LIKE
+        // '<lowercase>'` matches the same rows under either engine's folding
+        // rule whatever `x` holds, so the invariant stops depending on anyone
+        // remembering it. The operator itself is exercised the same either
+        // way: it receives a string column, and `lower` just makes a different
+        // one.
         3 if ty == Ty::Text => {
             let operand = match sc.any_of(rng, Ty::Text) {
-                Some(c) => c,
+                Some(c) => E::Call("lower", vec![c]),
                 None => E::Lit(gen_value(rng, Ty::Text, false)),
             };
             E::Like(operand.b(), (*rng.pick(&PATTERNS)).to_string(), rng.pct(30))

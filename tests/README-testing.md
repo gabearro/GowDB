@@ -325,11 +325,33 @@ SELECT CASE WHEN upper(b1) LIKE '%a%' THEN … END FROM t1;   -- b1 = 'ab'
 
 which is not an engine bug at all: `upper()` manufactures the uppercase the
 generator was carefully not producing, and `LIKE` is the one operator that
-folds case. `replace(s,'a','X')` had the same hole. The fix is not to drop
-`upper` — it is fine everywhere else, because every other text operator
-compares bytes — but to build `LIKE`'s operand from a plain column or literal
-instead of from the general text-expression generator. The rule to keep in mind
-when extending `gen_call`: **nothing case-shifted may reach a `LIKE`**.
+folds case. `replace(s,'a','X')` had the same hole. Dropping `upper` was not the
+answer. It is fine everywhere else, because every other text operator compares
+bytes. So `LIKE`'s operand was built from a plain column or literal instead of
+from the general text-expression generator, and the rule was written down:
+**nothing case-shifted may reach a `LIKE`**.
+
+That rule was right and enforcing it that way was not enough. A 100 000-case
+soak at seed 271828 found this:
+
+```sql
+UPDATE t0 SET a1 = upper(a1);                 -- a1 = 'a_'
+SELECT * FROM t0 JOIN t1 USING (id) WHERE a1 LIKE '%a%';
+-- granular: 0 rows      sqlite: 1 row
+```
+
+No case-shifting function appears anywhere near the `LIKE`. The mutation put the
+uppercase in the *column*, and the predicate read it back. Holding the invariant
+at the expression level says nothing about the data, and the set of things that
+can write uppercase into a text column is open-ended: mutations today,
+`INSERT … SELECT` whenever that gets generated.
+
+So the operand is now wrapped rather than policed: `lower(x) LIKE '<lowercase>'`
+matches the same rows under either engine's folding rule whatever `x` holds. The
+operator is exercised exactly as before, since it receives a string column
+either way and `lower` just makes a different one. The invariant no longer
+depends on anyone remembering it, which is the only version of it that survived
+contact with the generator.
 
 ---
 
