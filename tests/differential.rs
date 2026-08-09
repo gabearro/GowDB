@@ -544,11 +544,22 @@ fn cells_equal(a: &Cell, b: &Cell) -> bool {
             // digits granular's type does not carry.
             match a.scale().into_iter().chain(b.scale()).min() {
                 Some(s) => {
+                    // Half a unit at that scale, plus the error binary64 makes
+                    // just holding these two numbers. The second term is not
+                    // optional: an exact tie (`3837.7734375` at scale 6) sits
+                    // *on* the half-unit bound, and the decimal side is not
+                    // representable in binary64, so the measured difference
+                    // lands a few ULPs above it. Slack proportional to `half`
+                    // does not cover that -- ULP error grows with magnitude and
+                    // `half` does not -- which is exactly how this read as a
+                    // mismatch at 3837 having passed at 0.07.
+                    //
+                    // Four ULPs of the larger operand, so the allowance stays
+                    // ~10^5 times smaller than one unit at any scale this type
+                    // can hold. A quotient wrong by a unit is still caught.
                     let half = 0.5 * 10f64.powi(-(s as i32));
-                    // The slack is for the exact ties (`0.0703125` at scale 6),
-                    // where the difference *is* half a unit and binary64 cannot
-                    // represent either side of it exactly.
-                    (x - y).abs() <= half * (1.0 + 1e-9)
+                    let ulps = 4.0 * f64::EPSILON * x.abs().max(y.abs()).max(1.0);
+                    (x - y).abs() <= half + ulps
                 }
                 None => (x - y).abs() <= FLOAT_REL_TOL * x.abs().max(y.abs()).max(1.0),
             }

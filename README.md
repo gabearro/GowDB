@@ -120,7 +120,7 @@ A 2M-row, 3-column part:
 The third of columns that compressed well are the ones we had to decode onto the
 heap. The rest cost 32 bytes each and live in reclaimable page cache rather than
 resident memory. Open time is a wash, since the codec spends roughly what the
-mapping saves. LZ4 buys disk, the mapping buys RAM, and neither is free.
+mapping saves. LZ4 buys disk and the mapping buys RAM. Neither is free.
 
 **The SQL executor is parallel too.** An exchange operator fans the pipeline
 out across workers and merges per stateful operator. `EXPLAIN PIPELINE` shows
@@ -291,7 +291,7 @@ one packed record per minimal-perfect-hash slot:
 rec = fp6(key) << ebits | (rank - predicted - err_bias)
 ```
 
-Clustered keys predict near-exactly (0–1 error bits/row). Uniform random keys
+Clustered keys predict near-exactly (0 to 1 error bits/row). Uniform random keys
 need about 7. One record load both rejects foreign keys (1/64 false-positive
 rate) *and* yields the row. Verification against the packed key column is exact,
 so a false positive costs one extra load and never a wrong answer.
@@ -400,6 +400,26 @@ A table's durable state is `parts + log`.
 `Session::set_wal_enabled(false)` turns the log off for bulk loading, where an
 `fsync` per statement dominates and you'd re-run the load after a crash anyway.
 
+### Backup and point-in-time recovery
+
+`BACKUP TO '<archive>'` copies a pinned snapshot, not a directory walk. That
+distinction is the whole feature: two of eight `cp -r` copies of a live instance
+came out unopenable, with exit status 0.
+
+Checkpoints archive their sealed log segments beside the parts, so an archive
+carries a replayable stream and not just an instant. `RESTORE ... UNTIL LSN <n>`
+and `UNTIL TIMESTAMP '<ts>'` replay to a chosen point; `UNTIL LATEST` takes
+everything the archive holds. A target before the backup is refused rather than
+approximated, because a backup cannot roll backwards. Restore into the open
+database is refused too. Restore to a new directory and swap.
+
+`VERIFY BACKUP` checks every checksum in the archive and names the file that
+failed. A single flipped byte anywhere is reported, with a non-zero exit
+status, and restoring that archive is then refused.
+
+Checkpoints are incremental. Parts carry an origin stamp, so a checkpoint
+rewrites the parts that changed and hard-links the rest.
+
 ---
 
 ## Building and running
@@ -461,6 +481,54 @@ ONLY=sql      cargo bench      # just one section: scan | oltp | sql
 
 ---
 
+## Testing
+
+38 test files, 1958 tests, 30k lines of test code against 87k of source. The
+part that earns its keep is the differential oracle.
+
+`tests/differential.rs` generates a random schema, random rows and a random
+query, runs it here and against the `sqlite3` CLI, and compares the results as
+multisets. On a mismatch it shrinks the case to something you can paste into
+both shells and prints it. Both dialects come out of one generator, so the two
+scripts differ only where they must.
+
+```bash
+cargo test --test differential                        # 400 cases
+GRANULAR_DIFF_CASES=100000 cargo test --test differential
+GRANULAR_DIFF_SEED=<n> GRANULAR_DIFF_CASES=1 cargo test --test differential
+```
+
+The third line is what a failure report prints back at you: every mismatch names
+the seed that produced it, so a case reproduces on its own.
+
+Two lists sit at the top of that file and both are pinned by tests. **Known
+divergences** are places the two dialects genuinely differ, like sqlite's
+integer division or its case-insensitive `LIKE`. Each is asserted to *still*
+diverge, so the day one stops being true the exclusion gets re-argued instead
+of rotting. **Bugs this harness found** are real defects, each pinned by a test
+that asserts the current wrong answer, so fixing one fails the build and forces
+the pin to be inverted.
+
+The thing to watch is entries moving from the first list to the second. An
+exclusion is a claim about the engine, and claims need evidence. One "dialect
+difference" turned out to be a bug wearing a costume: `1 IN (2, NULL)` was filed
+as clickhouse compatibility on the strength of a single probe with literal
+operands, and against a *column* the same expression agreed with sqlite exactly.
+One engine, two answers. Five separate generator restrictions that each read as
+modest scoping turned out to be hiding a shipped defect. And one was simply
+false: "we only ever divide by a real literal, where both agree" survived 25,000
+cases on the luck of the literal pool and broke at 100,000, which is how the
+decimal scale rules above got written. `tests/README-testing.md` has the
+write-ups.
+
+The rest: seeded stress tests that race readers against compaction, checkpoint
+and rollback; crash tests that kill the process mid-write and assert the
+recovered state is a prefix; a corruption suite that flips single bytes; and
+property oracles for decimals built on `i128`, since sqlite has no exact decimal
+to compare against.
+
+---
+
 ## SQL coverage
 
 clickhouse-*flavoured*, not clickhouse-complete. What follows is measured, not
@@ -470,21 +538,23 @@ aspirational. Every "yes" below has a test in `tests/sql.rs`.
 
 | area | coverage |
 |---|---|
-| **DDL** | `CREATE TABLE [IF NOT EXISTS] … ENGINE = … ORDER BY … [PRIMARY KEY] [PARTITION BY]`, `CREATE TABLE … AS SELECT`, `CREATE DATABASE`, `DROP TABLE/DATABASE [IF EXISTS]`, `TRUNCATE`, `ALTER TABLE … ADD/DROP COLUMN`, `USE` |
+| **DDL** | `CREATE TABLE [IF NOT EXISTS] … ENGINE = … ORDER BY … [PRIMARY KEY] [PARTITION BY]`, `CREATE TABLE … AS SELECT`, `CREATE DATABASE`, `DROP TABLE/DATABASE [IF EXISTS]`, `TRUNCATE`, `ALTER TABLE … ADD/DROP COLUMN`, `USE`; column `DEFAULT`, `NOT NULL`, and named `CONSTRAINT … CHECK (…)`, all enforced on insert |
 | **Transactions** | `BEGIN`, `COMMIT`, `ROLLBACK` (single-writer, snapshot isolation) |
 | **Settings and IO** | `SET`, `SHOW SETTINGS`, query-level `SETTINGS`, `INSERT … FROM INFILE`, `… INTO OUTFILE` (streaming CSV/TSV) |
 | **DML** | `UPDATE … SET … WHERE`, `DELETE FROM … WHERE`, `INSERT … VALUES` (multi-row, explicit column list), `INSERT … SELECT`, `ALTER TABLE … DELETE WHERE`, `ALTER TABLE … UPDATE … WHERE`, `OPTIMIZE TABLE [FINAL]` |
 | **SELECT** | `DISTINCT`, expression projections with `AS`, `*` and `t.*`, `PREWHERE`, `WHERE`, `GROUP BY`, `HAVING`, `ORDER BY` (multi-key, `ASC`/`DESC`, `NULLS FIRST/LAST`), `LIMIT`/`OFFSET`, clickhouse's reversed `LIMIT off, n`, `LIMIT n BY (…)` |
+| **Grouping sets** | `GROUP BY ROLLUP(…)`, `CUBE(…)`, `GROUPING SETS ((…), …)`, and `GROUPING(col)` to tell an aggregated-away NULL from a real one. One pass over the input, not one scan per set |
 | **FROM** | base tables, subqueries, `WITH … AS (…)` CTEs, `FINAL` |
 | **JOIN** | `INNER`, `LEFT`, `RIGHT`, `FULL`, `CROSS`, comma joins, `ON` and `USING (…)`; hash join, with NULL padding on outer sides |
 | **Set ops** | `UNION`, `INTERSECT`, `EXCEPT`, each with `ALL` or `DISTINCT` (`DISTINCT` is the default). `INTERSECT` binds tighter than the other two; NULLs match each other, as ANSI requires. |
-| **Subqueries** | uncorrelated scalar `(SELECT …)`, `x [NOT] IN (SELECT …)`, `[NOT] EXISTS (…)`; evaluated once before planning and folded to literals |
+| **Subqueries** | scalar `(SELECT …)`, `x [NOT] IN (SELECT …)`, `[NOT] EXISTS (…)`. Uncorrelated ones are evaluated once before planning and folded to literals. Correlated ones are decorrelated into a join, which needs the correlation to be an equality on the outer column |
 | **Types** | `UInt8/16/32/64`, `Int8/16/32/64`, `Float32/64`, `Decimal64(s)` (exact, backed by `i64`), `Bool`, `String`, `FixedString(n)`, `Date`, `DateTime`, `Nullable(T)`, `LowCardinality(T)` |
 | **Expressions** | full precedence table, `IS [NOT] NULL`, `[NOT] IN (list)`, `[NOT] BETWEEN`, `[NOT] LIKE`/`ILIKE`, `CASE`, `CAST(x AS T)` and `x::T`, `INTERVAL n UNIT`, tuples |
 | **Functions** | 118 scalar (math, strings, dates, nulls, conditionals, hashing) |
 | **Window** | `<fn> OVER (PARTITION BY … ORDER BY … <frame>)`, named windows, `ROWS`/`RANGE` frames; `row_number`, `rank`, `dense_rank`, `lag`, `lead`, `first_value`, `last_value`, `nth_value`, plus the aggregates below as window functions |
 | **Aggregates** | `count`, `sum`, `avg`, `min`, `max`, `any`, `anyLast`, `argMin`, `argMax`, `uniq` (HyperLogLog), `uniqExact`, `quantile`/`quantileExact`/`median`, `varPop`, `varSamp`, `stddevPop`, `stddevSamp`, `groupArray`, plus every `-If` combinator (`sumIf`, `countIf`, …) and `count(DISTINCT …)` |
-| **Introspection** | `SHOW TABLES`, `SHOW DATABASES`, `SHOW CREATE TABLE`, `DESCRIBE`, `EXPLAIN [PLAN\|PIPELINE\|AST]`, `EXPLAIN ANALYZE`, `SHOW SETTINGS` |
+| **Backup and recovery** | `BACKUP TO '<archive>' [INCREMENTAL FROM '<base>']`, `VERIFY BACKUP '<archive>'`, `RESTORE FROM '<archive>' TO '<dir>' [UNTIL LSN <n> \| UNTIL TIMESTAMP '<ts>' \| UNTIL LATEST]` |
+| **Introspection** | `SHOW TABLES`, `SHOW DATABASES`, `SHOW CREATE TABLE`, `DESCRIBE`, `EXPLAIN [PLAN\|PIPELINE\|AST]`, `EXPLAIN ANALYZE`, `SHOW SETTINGS`, and the `system.parts` / `system.tables` / `system.columns` / `system.settings` tables |
 
 ### Not supported
 
@@ -493,9 +563,9 @@ feature. None of them silently do something else.
 
 | feature | note |
 |---|---|
-| correlated subqueries | rejected explicitly (uncorrelated ones work) |
+| correlated subqueries that do not correlate by equality | `WHERE b.id = a.id` decorrelates and works; `WHERE b.id <= a.id` is rejected, because the rewrite is a join and a join needs a key |
 | arrays | no `Array(T)` type. `groupArray` returns a joined `String`, `splitByChar` returns the first field |
-| `GROUP BY … WITH TOTALS/ROLLUP/CUBE` | `WITH TOTALS` parses and is rejected; `ROLLUP`/`CUBE` are not parsed |
+| `GROUP BY … WITH TOTALS` | parses and is rejected. `ROLLUP`, `CUBE` and `GROUPING SETS` all work; `WITH TOTALS` is the one spelling that does not |
 | regex (`match`, `extract`) | would need a regex engine; the crate has no dependencies |
 | `SummingMergeTree` | rejected, see the deviations below |
 | materialized views, `ARRAY JOIN`, `SAMPLE`, `TTL`, table functions, distributed/replicated engines | not implemented |
@@ -526,6 +596,16 @@ Behaviour differences you'd notice, so they're called out rather than buried:
 7. **`FINAL` is accepted and does nothing.** `MergeTree` here is already
    replacing, so there are never un-collapsed duplicate keys for `FINAL` to
    merge. It's redundant rather than ignored.
+8. **Decimal arithmetic answers at a decided scale.** `+`, `-` and small `*`
+   are exact. Division answers at six fractional digits or the left operand's
+   own scale, whichever is wider, so `1.0 / 3.0` is `0.333333`. Products cap at
+   six the same way, and never below the wider operand's scale, so
+   `1.50 * 1.50` is still `2.2500` but two six-digit quotients multiply to six
+   digits and not twelve. The cap is what keeps a ratio times a ratio inside an
+   `i64`: without it `(4000.0 / 2.0) * (4000.0 / 2.0)` wants scale 12, has six
+   integer digits left, and overflows on four million. No fixed scale is exact
+   for every quotient, so the choice is which digits to keep, and we keep the
+   range.
 
 ## Layout
 
@@ -537,9 +617,9 @@ src/
   types/      datatype.rs, value.rs, schema.rs, block.rs (vectorized batches)
   sort.rs     LSD radix sort over order-preserving lanes
   storage/    column.rs, granule.rs, part.rs, delta.rs, table.rs
-  persist/    format.rs, writer.rs, reader.rs, wal.rs, store.rs
+  persist/    format.rs, writer.rs, reader.rs, wal.rs, store.rs, backup.rs
   sql/        lexer.rs, ast.rs, parser.rs
-  planner/    logical.rs, binder.rs, optimizer.rs
+  planner/    logical.rs, binder.rs, optimizer.rs, physical.rs, stats.rs
   exec/       expr.rs, functions/, operators/
   catalog.rs  databases and tables
   session.rs  the public API
@@ -551,10 +631,10 @@ tests/
 ## License
 
 Dual-licensed under [Apache License 2.0](LICENSE-APACHE) or
-[MIT](LICENSE-MIT), at your option — the Rust ecosystem convention.
+[MIT](LICENSE-MIT), at your option. That is the rust ecosystem convention.
 
 Apache-2.0 is there for the explicit patent grant, which is worth more than
 usual for this project: the engine hand-rolls its own frame-of-reference bit
 packing, CHD minimal perfect hashing, split-block bloom filters, learned rank
 indexes and an LZ4 codec. MIT is there because it is shorter and imposes no
-`NOTICE` obligation. Take whichever suits you; you need not say which.
+`NOTICE` obligation. Take whichever suits you. You don't have to say which.
