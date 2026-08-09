@@ -195,6 +195,35 @@ const SENTINEL: &str = "<<granular-diff-boundary>>";
 //     exactly: named windows (`WINDOW w AS (..)`), a window function in the
 //     outer `ORDER BY`, and an explicit NULL `lag` default. A window function
 //     in `WHERE` is refused by both engines, which is correct in both.
+//
+// 11. Decimal arithmetic is fixed-scale.  `a / b` on decimal operands answers a
+//     `Decimal64(max(scale(a), 6))` (`DIV_MIN_SCALE`, exec/functions/scalar.rs);
+//     sqlite has no exact decimal and answers in binary64. So `1.0 / 3.0` is
+//     0.333333 here and 0.333333333333333 there, and `(2.25 / 8.0) / 4.0` is
+//     0.070313 here against an exact 0.0703125 -- the true quotient needs scale
+//     7 and the type carries 6. Neither engine is wrong: no fixed scale can be
+//     exact for every quotient, and the exactness this type buys on `+`, `-`
+//     and small `*` is the whole reason bare decimal literals stopped being
+//     floats.
+//
+//     Products round for the same reason, at `MUL_MAX_SCALE` (also 6, and
+//     never below the wider operand's own scale). That cap is *not* cosmetic:
+//     scales add under multiplication, so two scale-6 quotients used to make a
+//     scale-12 product with six integer digits left, and `(4000.0 / 2.0) *
+//     (4000.0 / 2.0)` -- four million -- was a hard EXECUTION_ERROR. That was a
+//     real bug, found at seed 999983 and fixed; only the rounding is a
+//     divergence.
+//
+//     Handled *without* a generator restriction, deliberately. Divergence #2
+//     already claimed the generator "only ever divides by a non-zero real
+//     literal, where both agree", and that claim was simply false -- it held
+//     for 25k cases because the literal pool happens to produce quotients that
+//     terminate by scale 6, and broke at 100k the first time two divisions
+//     chained. Narrowing the generator further would have hidden the class
+//     again. Instead `cells_equal` compares an exact decimal at its own scale:
+//     both sides must agree to within half a unit there. A quotient wrong by a
+//     unit still fails; only sqlite's extra digits are forgiven. Pinned by
+//     `decimal_division_is_fixed_scale_and_the_comparator_still_sees_errors`.
 // =========================================================================
 // BUGS THIS HARNESS FOUND -- real defects, each pinned by a test that asserts
 // the current *wrong* behaviour so it fails the day the engine is fixed. The
@@ -380,6 +409,14 @@ enum Cell {
     Null,
     Int(i64),
     Real(f64),
+    /// An exact decimal, carrying the scale granular answered at.
+    ///
+    /// Kept apart from `Real` because the two engines' numbers are not the same
+    /// kind of number. sqlite has no exact decimal, so it answers a division in
+    /// binary64; granular answers at a fixed scale, on purpose. Comparing the
+    /// two at `FLOAT_REL_TOL` asks granular to be a float, which is the one
+    /// thing this type exists not to be -- see KNOWN DIVERGENCE #11.
+    Dec(f64, u8),
     Text(String),
 }
 
@@ -406,6 +443,13 @@ impl Cell {
             Cell::Real(f) => {
                 let _ = write!(out, "{f:?}");
             }
+            // Written at its own scale, and never at scale 0: the `Real` arm's
+            // hazard applies here too. A `Decimal64(0)` rendered as `3` re-lexes
+            // as an integer and flips SQLite into integer division, which would
+            // manufacture a divergence out of a rendering choice.
+            Cell::Dec(f, s) => {
+                let _ = write!(out, "{f:.*}", (*s).max(1) as usize);
+            }
             Cell::Text(s) => {
                 out.push('\'');
                 for c in s.chars() {
@@ -426,15 +470,23 @@ impl Cell {
     fn rank(&self) -> u8 {
         match self {
             Cell::Null => 0,
-            Cell::Int(_) | Cell::Real(_) => 1,
+            Cell::Int(_) | Cell::Real(_) | Cell::Dec(..) => 1,
             Cell::Text(_) => 2,
+        }
+    }
+
+    /// The scale of an exact decimal, `None` for everything else.
+    fn scale(&self) -> Option<u8> {
+        match self {
+            Cell::Dec(_, s) => Some(*s),
+            _ => None,
         }
     }
 
     fn num(&self) -> f64 {
         match self {
             Cell::Int(i) => *i as f64,
-            Cell::Real(f) => *f,
+            Cell::Real(f) | Cell::Dec(f, _) => *f,
             _ => 0.0,
         }
     }
@@ -474,7 +526,7 @@ fn cells_equal(a: &Cell, b: &Cell) -> bool {
         (Cell::Null, Cell::Null) => true,
         (Cell::Text(x), Cell::Text(y)) => x == y,
         (Cell::Int(x), Cell::Int(y)) => x == y,
-        (Cell::Int(_) | Cell::Real(_), Cell::Int(_) | Cell::Real(_)) => {
+        (Cell::Int(_) | Cell::Real(_) | Cell::Dec(..), Cell::Int(_) | Cell::Real(_) | Cell::Dec(..)) => {
             let (x, y) = (a.num(), b.num());
             if x.is_nan() || y.is_nan() {
                 return x.is_nan() && y.is_nan();
@@ -482,7 +534,24 @@ fn cells_equal(a: &Cell, b: &Cell) -> bool {
             if x == y {
                 return true;
             }
-            (x - y).abs() <= FLOAT_REL_TOL * x.abs().max(y.abs()).max(1.0)
+            // One side is an exact decimal. Asking it to match a binary64 to
+            // 1e-12 is asking the wrong question -- `1.0 / 3.0` is 0.333333
+            // here and 0.333333333333333 there, and neither is wrong. The
+            // meaningful claim is that granular's answer is the *correct
+            // rounding* of the true value, so both sides are held to half a
+            // unit at the coarser of the two scales. That still catches a
+            // quotient that is wrong by a unit; it forgives only sqlite having
+            // digits granular's type does not carry.
+            match a.scale().into_iter().chain(b.scale()).min() {
+                Some(s) => {
+                    let half = 0.5 * 10f64.powi(-(s as i32));
+                    // The slack is for the exact ties (`0.0703125` at scale 6),
+                    // where the difference *is* half a unit and binary64 cannot
+                    // represent either side of it exactly.
+                    (x - y).abs() <= half * (1.0 + 1e-9)
+                }
+                None => (x - y).abs() <= FLOAT_REL_TOL * x.abs().max(y.abs()).max(1.0),
+            }
         }
         _ => false,
     }
@@ -516,6 +585,7 @@ fn fmt_cell(c: &Cell) -> String {
         Cell::Null => "NULL".into(),
         Cell::Int(i) => i.to_string(),
         Cell::Real(f) => format!("{f:?}"),
+        Cell::Dec(f, s) => format!("{f:.*}", *s as usize),
         Cell::Text(s) => format!("{s:?}"),
     }
 }
@@ -2458,11 +2528,15 @@ fn cell_of_value(v: &Value) -> Cell {
         Value::DateTime(t) => Cell::Int(*t),
         // SQLite has no exact decimal type, so a decimal can only ever be
         // diffed against a REAL and the comparison is necessarily approximate.
-        // The generator does not emit `Decimal` columns for exactly that reason
-        // (see `Ty`), so this arm exists to keep the match total rather than to
-        // carry traffic; `Decimal64` is covered by the property tests in
-        // src/types/value.rs and src/exec/functions/scalar.rs instead.
-        Value::Decimal(..) => Cell::Real(v.as_f64().unwrap_or(f64::NAN)),
+        //
+        // This arm was written as dead weight -- "the generator does not emit
+        // `Decimal` columns, so this exists to keep the match total". That
+        // stopped being true the day bare decimal literals became exact: every
+        // generated real literal is a `Decimal64` now, so this is one of the
+        // busiest arms in the file, and it was flattening an exactly-rounded
+        // scale-6 quotient into an f64 compared at 1e-12. It carries the scale
+        // through instead, and `cells_equal` compares at it.
+        Value::Decimal(_, s) => Cell::Dec(v.as_f64().unwrap_or(f64::NAN), *s),
     }
 }
 
@@ -2690,7 +2764,7 @@ impl Cell {
         matches!(self, Cell::Null)
     }
     fn is_zero(&self) -> bool {
-        matches!(self, Cell::Int(0)) || matches!(self, Cell::Real(f) if *f == 0.0)
+        matches!(self, Cell::Int(0)) || matches!(self, Cell::Real(f) | Cell::Dec(f, _) if *f == 0.0)
     }
 }
 
@@ -3716,6 +3790,69 @@ fn batched_and_unbatched_sqlite_agree() {
     }
 }
 
+/// KNOWN DIVERGENCE #11, and the guard on how it is absorbed.
+///
+/// Two claims, because the second is what makes the first safe to allow. The
+/// divergence is real: granular's decimal division rounds at `DIV_MIN_SCALE`
+/// where sqlite computes in binary64. And the slack `cells_equal` grants for
+/// it is bounded: a decimal that is wrong by one unit at its own scale is
+/// still caught, so absorbing the divergence did not blind the oracle to the
+/// arithmetic underneath it.
+#[test]
+fn decimal_division_is_fixed_scale_and_the_comparator_still_sees_errors() {
+    // The divergence itself, straight through the engine.
+    let mut sess = Session::in_memory();
+    let got = sess.query("SELECT 1.0 / 3.0").expect("divide").to_values();
+    let cell = cell_of_value(&got[0][0]);
+    assert!(
+        matches!(cell, Cell::Dec(_, 6)),
+        "decimal division stopped answering at DIV_MIN_SCALE: {cell:?}. If the scale rule \
+         changed, KNOWN DIVERGENCE #11 needs rewriting -- and the harness slack with it."
+    );
+
+    // sqlite's answer is *not* equal at 1e-12, which is why the divergence is
+    // filed at all -- and *is* equal once compared at the decimal's own scale.
+    let exact = Cell::Real(1.0f64 / 3.0);
+    assert!(
+        (cell.num() - exact.num()).abs() > FLOAT_REL_TOL,
+        "the two now agree to 1e-12; drop KNOWN DIVERGENCE #11"
+    );
+    assert!(cells_equal(&cell, &exact), "correct rounding must still compare equal");
+
+    // The bound. One unit at scale 6 is a real disagreement and stays visible;
+    // this is the assertion that says the slack is not a blanket pardon.
+    let off_by_one = Cell::Real(cell.num() + 1e-6);
+    assert!(
+        !cells_equal(&cell, &off_by_one),
+        "a decimal wrong by a unit at its own scale now compares equal -- the KNOWN \
+         DIVERGENCE #11 slack has swallowed the arithmetic it was supposed to leave alone"
+    );
+    // ...and the slack does not leak to two ordinary floats.
+    assert!(
+        !cells_equal(&Cell::Real(0.070313), &Cell::Real(0.0703125)),
+        "the decimal slack is being applied to plain floats"
+    );
+
+    // The boundary that keeps it that way. `div_scale` takes the decimal path
+    // only when *neither* side is a float, so ordinary float division still
+    // answers in binary64 and is still held to 1e-12. If that ever stops being
+    // true, float division would quietly inherit six-digit answers *and* the
+    // slack that forgives them -- which is the one way this divergence could
+    // turn into a hiding place.
+    for q in ["SELECT CAST(1.0 AS Float64) / 3.0", "SELECT 1.0 / CAST(3.0 AS Float64)"] {
+        let v = sess.query(q).expect("divide").to_values();
+        let c = cell_of_value(&v[0][0]);
+        assert!(
+            matches!(c, Cell::Real(_)),
+            "{q} answered {c:?}: a float operand must keep division in binary64"
+        );
+        assert!(
+            (c.num() - 1.0f64 / 3.0).abs() <= FLOAT_REL_TOL,
+            "{q} lost float precision: {c:?}"
+        );
+    }
+}
+
 /// KNOWN DIVERGENCES, pinned.
 ///
 /// Each entry is a dialect difference the generator deliberately avoids. This
@@ -4470,7 +4607,8 @@ fn both_mutation_spellings_agree_with_sqlite_and_with_each_other() {
 // integer definition, and `i128` holds every intermediate with room to spare:
 //
 //   a + b, a - b   out = max(sa,sb); rescale both, add unit counts
-//   a * b          out = sa+sb (rejected at bind time past 18); units multiply
+//   a * b          out = min(sa+sb, max(sa,sb,6)); units multiply, then
+//                  round_half_away back down to `out`
 //   a / b          out = max(sa,6); round_half_away(ua * 10^(sb+out-sa), ub)
 //   a <=> b        rescale to a common scale, compare unit counts
 //   sum            sum of unit counts, at the argument's own scale
@@ -4480,7 +4618,10 @@ fn both_mutation_spellings_agree_with_sqlite_and_with_each_other() {
 //                  neighbouring order statistics, at `out`
 //
 // The contract the engine states is **exact or refuse**: an answer that does not
-// fit eighteen significant digits is an error, never a clamped value. This
+// fit eighteen significant digits is an error, never a clamped value. `/` and
+// the capped half of `*` are the two places it is *correctly rounded* or refuse
+// instead -- a decided scale, not a clamp, and the oracle models the rounding
+// rather than loosening the comparison. This
 // oracle asserts exactly that, which is what would have caught the clamp on its
 // first run.
 //
@@ -4781,14 +4922,18 @@ fn decimal_arithmetic_matches_exact_integer_arithmetic() {
             }));
         }
 
-        // `*` keeps both lanes where they are: the product of two unit counts is
-        // already denominated in 10^-(sa+sb).
-        if sa + sb <= 18 {
-            tally(t.check("a * b", sa + sb, |a, b| {
-                let v = a * b;
-                (v.abs() <= DEC_MAX).then_some(Some(v))
-            }));
-        }
+        // `*` keeps both lanes where they are -- the product of two unit counts
+        // is already denominated in 10^-(sa+sb) -- and then comes back down to
+        // the capped result scale, rounded half away from zero like the
+        // quotient below. The cap is `max(sa, sb, MUL_MAX_SCALE)`, so it never
+        // takes a product below the scale one side already carried, and the
+        // guard this call used to need (`sa + sb <= 18`) is gone with it: a
+        // capped scale is representable by construction.
+        let mout = (sa + sb).min(sa.max(sb).max(6));
+        tally(t.check("a * b", mout, |a, b| {
+            let v = dec_div_round(a * b, pow10i(sa + sb - mout));
+            (v.abs() <= DEC_MAX).then_some(Some(v))
+        }));
 
         // `/` widens to at least six fractional digits, so the quotient of two
         // in-range operands is routinely out of range -- which is exactly the

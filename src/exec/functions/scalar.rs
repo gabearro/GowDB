@@ -93,7 +93,6 @@
 
 use super::ScalarFn;
 use crate::common::{hash_bytes, hash_key, splitmix64, BitSet, Error, Result};
-use crate::types::datatype::MAX_DECIMAL_PRECISION;
 use crate::types::value::{decimal_rescale, DECIMAL_MAX_UNITS, POW10};
 use crate::types::{
     civil_from_days, days_from_civil, fmt_date, fmt_datetime, parse_datetime, Column, ColumnData,
@@ -573,17 +572,22 @@ fn arith_ty(name: &str, a: &[DataType], additive: bool) -> Result<DataType> {
         // scales add. `promote` cannot express that -- it only ever unifies -- so
         // this is the one place `arith_ty` overrides it.
         //
-        // Overflowing 18 digits of scale is refused here, at bind time, rather
-        // than per row: `Decimal64(10) * Decimal64(10)` has no representable
-        // result at all and should not compile into a plan.
-        let s = scale_of(x) as u32 + scale_of(y) as u32;
-        if s > MAX_DECIMAL_PRECISION {
-            return Err(Error::bind(format!(
-                "{name}: {x} * {y} needs scale {s}, over the Decimal64 limit of \
-                 {MAX_DECIMAL_PRECISION}"
-            )));
-        }
-        DataType::Decimal64(s as u8)
+        // The scales add *up to a cap*, because adding them without one makes
+        // ordinary arithmetic unrepresentable. Division answers at
+        // `DIV_MIN_SCALE` (6), so `(a / b) * (c / d)` -- a ratio times a ratio,
+        // which is most of what anyone multiplies -- lands at scale 12 and has
+        // six integer digits left. `(4000.0 / 2.0) * (4000.0 / 2.0)` is four
+        // million and used to be a hard error. Found against sqlite at seed
+        // 999983.
+        //
+        // The cap never *reduces* below the wider operand: a scale-8 price
+        // times an integer count keeps its eight digits, since only the sum can
+        // exceed what either side asked for. So a product loses digits only
+        // where both sides are fractional and their sum overruns the cap, and
+        // the loss is a rounding at the last kept digit rather than a refusal.
+        let sum = scale_of(x) as u32 + scale_of(y) as u32;
+        let cap = (scale_of(x).max(scale_of(y)) as u32).max(MUL_MAX_SCALE as u32);
+        DataType::Decimal64(sum.min(cap) as u8)
     } else {
         DataType::promote(x, y)?
     };
@@ -606,14 +610,17 @@ fn r_multiply(a: &[DataType]) -> Result<DataType> {
 /// both lanes to the scale the *operands* need and run one checked pass:
 ///   * `+`/`-`: both sides rescale to the result scale, then add unit counts.
 ///   * `*`: neither side moves -- the unit counts multiply directly, and the
-///     product is already denominated in `10^-(s1+s2)`.
+///     product is already denominated in `10^-(s1+s2)`. When `arith_ty` capped
+///     the result below that sum, the product is divided back down to it,
+///     rounded half away from zero exactly as `dec_divide` rounds.
 ///
 /// `i128` for the accumulate, then one range check per row. Checked rather than
 /// wrapping, unlike every integer op in this module: a wrapped `Int64` is a
 /// documented deviation nobody stores money in, whereas a wrapped price is the
 /// exact failure this type was added to remove. **A multiply overflows far
 /// earlier than the operands suggest** -- two nine-digit values make eighteen --
-/// so the check is not theoretical.
+/// so the check is not theoretical. The i128 itself cannot overflow on the way:
+/// two `i64` lanes make at most ~8.5e37 against its ~1.7e38 ceiling.
 fn dec_arith(args: &[Column], rows: usize, out: u8, op: u8, who: &str) -> Result<Column> {
     let (x, y) = if op == b'*' {
         (args[0].to_i64_vec()?, args[1].to_i64_vec()?)
@@ -621,7 +628,7 @@ fn dec_arith(args: &[Column], rows: usize, out: u8, op: u8, who: &str) -> Result
         (dec_units(&args[0], out, who)?, dec_units(&args[1], out, who)?)
     };
     let mut o = Vec::with_capacity(rows);
-    // One match on the operator per *block*, three flat loops -- the alternative
+    // One match on the operator per *block*, four flat loops -- the alternative
     // costs a branch per row for something constant across the whole call.
     macro_rules! run {
         ($f:expr) => {{
@@ -635,10 +642,30 @@ fn dec_arith(args: &[Column], rows: usize, out: u8, op: u8, who: &str) -> Result
             }
         }};
     }
+    // How far the product has to come back down. Hoisted: it is a property of
+    // the three scales, not of any row, and it is 1 for every multiply the cap
+    // did not touch.
+    let shrink = if op == b'*' {
+        let sum = scale_of(&args[0].ty) as u32 + scale_of(&args[1].ty) as u32;
+        pow10(sum - out as u32).ok_or_else(|| dec_overflow(who, out))?
+    } else {
+        1
+    };
     match op {
         b'+' => run!(|a: i128, b: i128| a + b),
         b'-' => run!(|a: i128, b: i128| a - b),
-        _ => run!(|a: i128, b: i128| a * b),
+        _ if shrink == 1 => run!(|a: i128, b: i128| a * b),
+        _ => run!(move |a: i128, b: i128| {
+            let n = a * b;
+            let (q, rem) = (n / shrink, n % shrink);
+            // `shrink` is a power of ten and so always positive; the bump
+            // follows the product's sign alone.
+            if rem.unsigned_abs() * 2 >= shrink.unsigned_abs() {
+                q + if n < 0 { -1 } else { 1 }
+            } else {
+                q
+            }
+        }),
     }
     Ok(build(DataType::Decimal64(out), ColumnData::I64(o), nulls_of(args, rows)))
 }
@@ -689,6 +716,15 @@ arith!(e_multiply, r_multiply, *, wrapping_mul, b'*', "multiply");
 /// tax rate or an FX quote, and it is what SQL Server's `decimal` division
 /// guarantees.
 const DIV_MIN_SCALE: u8 = 6;
+
+/// The most fractional digits a *product* is allowed to invent.
+///
+/// Counterpart to [`DIV_MIN_SCALE`], and deliberately the same number: scales
+/// add under multiplication, so without a cap two scale-6 quotients make a
+/// scale-12 product with six integer digits left, and `(a / b) * (c / d)`
+/// overflows above a million. Never applied below the wider operand's own
+/// scale -- see `arith_ty`.
+const MUL_MAX_SCALE: u8 = 6;
 
 /// The scale of `a / b`, or `None` when the answer is a float.
 ///
@@ -2981,9 +3017,11 @@ mod tests {
     }
 
     /// The scales *add* under multiplication, which `DataType::promote` cannot
-    /// express -- it only ever unifies -- so `arith_ty` overrides it.
+    /// express -- it only ever unifies -- so `arith_ty` overrides it. They add
+    /// only up to [`MUL_MAX_SCALE`], and never below the wider operand's own
+    /// scale.
     #[test]
-    fn multiplication_adds_scales() {
+    fn multiplication_adds_scales_up_to_the_cap() {
         let out = call("multiply", &[dd(2, &[150]), dd(2, &[150])]).unwrap();
         assert_eq!(out.ty, DataType::Decimal64(4));
         assert_eq!(dtext(&out), ["2.2500"]);
@@ -2993,12 +3031,28 @@ mod tests {
         assert_eq!(out.ty, DataType::Decimal64(2));
         assert_eq!(dtext(&out), ["5.97"]);
 
-        // A result scale that cannot exist is refused at bind time, before a
-        // plan is built, rather than per row.
-        let e = ret_of("multiply", &[DataType::Decimal64(10), DataType::Decimal64(10)])
-            .unwrap_err()
-            .to_string();
-        assert!(e.contains("18"), "{e}");
+        // A sum of scales past the cap is rounded down to it, not refused.
+        // `Decimal64(10) * Decimal64(10)` wants scale 20, which cannot exist;
+        // it answers at 10, the wider operand's own scale, because the cap
+        // never takes a product below what one side already carried.
+        let ty = ret_of("multiply", &[DataType::Decimal64(10), DataType::Decimal64(10)]).unwrap();
+        assert_eq!(ty, DataType::Decimal64(10));
+
+        // Two scale-6 quotients are the case the cap exists for. Uncapped they
+        // make a scale-12 product with six integer digits left, so
+        // `(4000.0 / 2.0) * (4000.0 / 2.0)` -- four million -- was a hard
+        // error. Found against sqlite at seed 999983.
+        let ty = ret_of("multiply", &[DataType::Decimal64(6), DataType::Decimal64(6)]).unwrap();
+        assert_eq!(ty, DataType::Decimal64(6));
+        let out = call("multiply", &[dd(6, &[2_000_000_000]), dd(6, &[2_000_000_000])]).unwrap();
+        assert_eq!(dtext(&out), ["4000000.000000"]);
+
+        // ...and the cap rounds rather than truncating, half away from zero on
+        // both signs, exactly as division does.
+        let out = call("multiply", &[dd(6, &[1_500_000]), dd(6, &[1_000_001])]).unwrap();
+        assert_eq!(dtext(&out), ["1.500002"]);
+        let out = call("multiply", &[dd(6, &[-1_500_000]), dd(6, &[1_000_001])]).unwrap();
+        assert_eq!(dtext(&out), ["-1.500002"]);
     }
 
     /// The case this task exists for: a decimal multiply overflows `i64` while
@@ -3180,9 +3234,24 @@ mod tests {
             let got = i(&call("minus", &[ca.clone(), cb.clone()]).unwrap())[0];
             assert_eq!(got as i128, ea - eb, "case {case}: {ua}e-{sa} - {ub}e-{sb}");
 
+            // The scales add up to `MUL_MAX_SCALE`, and the product is exact
+            // whenever they do. Past it the result is *rounded* to the capped
+            // scale rather than refused, so the claim below covers both
+            // regimes at once: the product is within half a unit of the exact
+            // one at whatever scale it came back at. Where the cap does not
+            // bite `shrink` is 1 and that degenerates to plain equality, which
+            // is what this assertion used to say outright.
             let m = call("multiply", &[ca.clone(), cb.clone()]).unwrap();
-            assert_eq!(m.ty, DataType::Decimal64(sa + sb));
-            assert_eq!(i(&m)[0] as i128, ua as i128 * ub as i128, "case {case}");
+            let ms = (sa + sb).min(sa.max(sb).max(MUL_MAX_SCALE));
+            assert_eq!(m.ty, DataType::Decimal64(ms), "case {case}");
+            let (exact, shrink) = (ua as i128 * ub as i128, p(sa + sb - ms));
+            let got = i(&m)[0] as i128;
+            assert!(
+                (got * shrink - exact).abs() * 2 <= shrink,
+                "case {case}: {ua}e-{sa} * {ub}e-{sb} gave {got}e-{ms}, more than half a \
+                 unit from the exact {exact}e-{}",
+                sa + sb
+            );
 
             let d = call("divide", &[ca.clone(), cb.clone()]).unwrap();
             let os = sa.max(DIV_MIN_SCALE);

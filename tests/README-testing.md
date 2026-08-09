@@ -282,12 +282,17 @@ count ever did on its own.
 
 ---
 
-## Known divergences (excluded from the generator, pinned by tests)
+## Known divergences (pinned by tests)
 
-These are **dialect differences, not bugs**. Each is excluded from the generator
-so it cannot mask real findings, and each is pinned by
-`known_divergences_still_reproduce`, which fails the day the difference stops
-existing — so the exclusion gets re-argued or deleted instead of rotting.
+These are **dialect differences, not bugs**. Most are excluded from the
+generator so they cannot mask real findings, and each is pinned by a test that
+fails the day the difference stops existing — so the exclusion gets re-argued
+or deleted instead of rotting.
+
+"Most", not "all": #11 is absorbed by the *comparator* instead, and that is the
+better pattern where it applies. Excluding a construct costs the coverage of
+everything it would have reached; teaching the comparison what the two engines
+actually promise costs nothing and keeps generating the construct.
 
 | # | construct | granular | sqlite3 |
 |---|-----------|----------|---------|
@@ -300,6 +305,13 @@ existing — so the exclusion gets re-argued or deleted instead of rotting.
 | 7 | `INTERSECT ALL` / `EXCEPT ALL` | works | not parsed (3.54) — **direction inverted**; the plain forms are now generated |
 | 8 | `round(2.5)` | `2` (half to even) | `3.0` (half away from zero) |
 | 9 | `concat(NULL,'b')` | `NULL` (propagates) | `'b'` (skips NULLs) |
+| 10 | `GROUPS` frames, `RANGE <n> PRECEDING`, `EXCLUDE`, `FILTER` | parse error | supported |
+| 11 | `1.0 / 3.0` | `0.333333` (`Decimal64(6)`) | `0.333333333333333` (binary64) — **not generator-excluded**, see below |
+
+Row 11 covers products as well as quotients: multiplication caps at
+`MUL_MAX_SCALE` (6, never below the wider operand's own scale) and rounds past
+it. The cap was added because its absence was a genuine bug, not a dialect
+difference — see below.
 
 The generator sidesteps #3 by emitting only lowercase text and lowercase
 patterns, which makes the difference *unobservable* rather than papered over.
@@ -318,6 +330,58 @@ folds case. `replace(s,'a','X')` had the same hole. The fix is not to drop
 compares bytes — but to build `LIKE`'s operand from a plain column or literal
 instead of from the general text-expression generator. The rule to keep in mind
 when extending `gen_call`: **nothing case-shifted may reach a `LIKE`**.
+
+---
+
+Entry 11 is the counter-example to the whole "exclude it from the generator"
+reflex, and it is worth reading before adding a twelfth row to this table.
+
+Decimal division answers at `max(scale(lhs), DIV_MIN_SCALE)`, where
+`DIV_MIN_SCALE` is 6 — so `(2.25 / 8.0) / 4.0` is `0.070313` against an exact
+`0.0703125`, because the true quotient needs scale 7 and the type carries 6.
+That is not an engine bug: no fixed scale is exact for every quotient (`1/3`
+settles it), and the exactness the type buys on `+`, `-` and `*` is the entire
+reason bare decimal literals stopped being floats.
+
+Chasing that seed further turned up something that was *not* a divergence at
+all. Scales add under multiplication, and nothing capped them, so two scale-6
+quotients made a scale-12 product with six integer digits of headroom left:
+
+```sql
+SELECT (4000.0 / 2.0) * (4000.0 / 2.0);
+-- granular: ERROR  multiply: result does not fit Decimal64(12)
+-- sqlite:   4000000.0
+```
+
+Four million, refused. `2000.0 * 2000.0` was fine — it was the scale-6 division
+feeding the multiply that poisoned it, which is why the two decimal features
+had to be looked at together. Fixed by capping the product scale at
+`MUL_MAX_SCALE` and rounding into it rather than refusing; the 20 000-case
+property test in `scalar.rs` now asserts the product is within half a unit of
+exact at whatever scale it came back at, which is strictly stronger than the
+plain equality it asserted before, since that is what the claim degenerates to
+wherever the cap does not bite.
+
+The trap is that **divergence #2 already claimed to have handled this** — "the
+generator only ever divides by a non-zero *real* literal, where both agree".
+That claim was false. It survived 25 000 cases because the literal pool happens
+to produce quotients that terminate by scale 6, and it broke at 100 000 the
+first time two divisions chained. A restriction that is *almost* true is worse
+than no restriction, because the green runs are read as evidence.
+
+So the fix went into `cells_equal`, not the generator: an exact decimal is
+compared **at its own scale**, both sides held to within half a unit there. A
+quotient wrong by a unit still fails; only sqlite's extra digits are forgiven.
+`decimal_division_is_fixed_scale_and_the_comparator_still_sees_errors` pins
+both halves — that the divergence is real, *and* that the slack granted for it
+does not extend to a decimal that is genuinely wrong, or to two plain floats.
+
+The same reasoning had already been written down one section up, in the note
+about entry 1: an exclusion is a claim about the engine, and claims need
+evidence. `Value::Decimal`'s arm in `cell_of_value` even carried a comment
+saying it existed "to keep the match total rather than to carry traffic" — true
+when it was written, false the day decimal literals became exact, and nothing
+re-read it for two waves.
 
 ---
 
