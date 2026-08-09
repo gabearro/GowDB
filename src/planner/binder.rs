@@ -101,8 +101,8 @@ use crate::sql::ast::{
 use crate::types::{parse_date, parse_datetime, DataType, Field, Schema, Value};
 
 use super::logical::{
-    needs_null_census, BoundAgg, BoundExpr, LogicalPlan, MutationKind, MutationPlan, ScanNode,
-    SortKey,
+    needs_null_census, BoundAgg, BoundExpr, CorrKey, LogicalPlan, MutationKind, MutationPlan,
+    ScanNode, SortKey,
 };
 
 /// Marker base for hoisted aggregate calls. Any real column index is bounded
@@ -119,6 +119,22 @@ const AGG_MARK: usize = 1 << 40;
 /// strictly alone, since the `Window` node it will later be given sits *above*
 /// that and has not been built yet.
 const WIN_MARK: usize = 1 << 41;
+
+/// Marker base for a **correlated** column reference: a column of an enclosing
+/// query, which the block being bound has no place for.
+///
+/// Below [`AGG_MARK`] rather than above it, because the aggregate and window
+/// rewrites test `>= AGG_MARK` and must keep seeing a correlation marker as an
+/// ordinary column -- by the time either of them runs, `decorrelate` has
+/// already turned every marker into a join key and none can survive. A marker
+/// that somehow did would be reported as "column must appear in GROUP BY",
+/// which is a wrong message but not a wrong answer.
+const CORR_MARK: usize = 1 << 38;
+
+/// The same trick for a scalar subquery hoisted out of an expression, one
+/// octave up. `attach_scalars` resolves these to the column its left join put
+/// the value in, before anything else looks at the tree.
+const SUB_MARK: usize = 1 << 39;
 
 /// Guards against an alias cycle that the `expanding` stack cannot see (it
 /// only catches direct self-reference).
@@ -335,6 +351,25 @@ impl Scope {
         Ok(&self.cols[self.find_pos(n)?])
     }
 
+    /// [`Scope::resolve`], but "no such column here" is `Ok(None)` rather than
+    /// an error, so a correlated reference can keep looking outwards.
+    ///
+    /// Ambiguity stays an error: two columns of *this* scope answering to one
+    /// name is a fault in the query, and falling through to the enclosing query
+    /// would silently pick a third meaning.
+    fn lookup(&self, n: &ObjectName) -> Result<Option<BoundExpr>> {
+        match self.find_pos_opt(n)? {
+            None => Ok(None),
+            Some(pos) => {
+                let c = &self.cols[pos];
+                let index = c.index.ok_or_else(|| {
+                    Error::bind(format!("internal: column `{n}` was not projected into the scan"))
+                })?;
+                Ok(Some(col_expr(index, c)))
+            }
+        }
+    }
+
     /// Case-sensitive pass first, then case-insensitive -- the same two-step
     /// [`Schema::index_of`] uses, so `SELECT ID` finds `id`.
     ///
@@ -342,6 +377,12 @@ impl Scope {
     /// a `USING` key, where three entries (merged, left copy, right copy) share
     /// one block index and only the position tells them apart.
     fn find_pos(&self, n: &ObjectName) -> Result<usize> {
+        self.find_pos_opt(n)?.ok_or_else(|| {
+            Error::bind(format!("unknown column `{n}`; available: {}", self.available()))
+        })
+    }
+
+    fn find_pos_opt(&self, n: &ObjectName) -> Result<Option<usize>> {
         let qual = n.qualifier();
         let name = n.last();
         for insensitive in [false, true] {
@@ -381,13 +422,10 @@ impl Scope {
                 )));
             }
             if let Some(pos) = hit {
-                return Ok(pos);
+                return Ok(Some(pos));
             }
         }
-        Err(Error::bind(format!(
-            "unknown column `{n}`; available: {}",
-            self.available()
-        )))
+        Ok(None)
     }
 
     fn resolve(&self, n: &ObjectName) -> Result<BoundExpr> {
@@ -446,6 +484,23 @@ struct Ctx<'c> {
     /// so a nested window function is refused rather than silently hoisted into
     /// a step that runs after the one it sits inside.
     in_window: bool,
+    /// Scopes of the enclosing queries, innermost first. Empty everywhere but
+    /// inside a subquery, which is what makes an unresolvable name the same
+    /// "unknown column" it has always been at the top level.
+    outer: &'c [&'c Scope],
+    /// Correlated references met, in marker order: entry `p` is
+    /// `Column { index: CORR_MARK + p }`.
+    corr: Vec<CorrRef>,
+    /// Scalar subqueries hoisted out, in marker order, already bound.
+    subs: Vec<ScalarSub>,
+    /// The CTE stack, so a hoisted subquery can be bound where it is met.
+    ctes: &'c Ctes<'c>,
+    /// True only in the two clauses that have somewhere to put a scalar
+    /// subquery's join: `WHERE` and the select list. Elsewhere -- PREWHERE,
+    /// which lowers into the scan, a join `ON`, a `LIMIT` count, an
+    /// `ALTER ... UPDATE` assignment -- the hoist would leave a marker nobody
+    /// resolves, so the refusal stays.
+    allow_sub: bool,
 }
 
 /// A window call bound but not yet placed: the function, plus the keys of the
@@ -454,6 +509,14 @@ struct PendingWindow {
     func: BoundWindow,
     partition: Vec<BoundExpr>,
     order: Vec<SortKey>,
+}
+
+/// One correlated reference, as `Ctx` records it.
+struct CorrRef {
+    /// How far out it reached: 0 is the query immediately enclosing this one.
+    level: usize,
+    /// The column, resolved against *that* level's scope.
+    expr: BoundExpr,
 }
 
 impl<'c> Ctx<'c> {
@@ -469,17 +532,171 @@ impl<'c> Ctx<'c> {
             windows: Vec::new(),
             window_keys: Vec::new(),
             in_window: false,
+            outer: &[],
+            corr: Vec::new(),
+            subs: Vec::new(),
+            ctes: &[],
+            allow_sub: false,
         }
     }
 
     fn plain(scope: &'c Scope) -> Ctx<'c> {
         Ctx::new(scope, &[], false)
     }
+
+    /// Let this context reach outwards, and hoist a scalar subquery instead of
+    /// refusing it. The two travel together: both are only resolvable where the
+    /// caller is prepared to build a join.
+    fn joinable(mut self, outer: &'c [&'c Scope], ctes: &'c Ctes<'c>) -> Ctx<'c> {
+        self.outer = outer;
+        self.ctes = ctes;
+        self.allow_sub = true;
+        self
+    }
+
+    /// Let an outer name *resolve* without promising to decorrelate it, so the
+    /// clause that cannot use one refuses it by name (`no_correlation`) rather
+    /// than reporting a column the user can plainly see as unknown.
+    fn reaching(mut self, outer: &'c [&'c Scope]) -> Ctx<'c> {
+        self.outer = outer;
+        self
+    }
+
+    /// `n` as a column of some enclosing query, or the "unknown column" error
+    /// that has to mention every scope it was looked for in.
+    fn correlate(&mut self, n: &ObjectName) -> Result<BoundExpr> {
+        for (level, s) in self.outer.iter().enumerate() {
+            let Some(e) = s.lookup(n)? else { continue };
+            let (ty, name) = (e.ty(), n.last().to_string());
+            let rendered = e.to_string();
+            // The same outer column named twice is one join key, not two: the
+            // pairs end up in `Join::on`, where a duplicate costs a hash
+            // component and a comparison per probe for no filtering at all.
+            let p = self
+                .corr
+                .iter()
+                .position(|c| c.level == level && c.expr.to_string() == rendered)
+                .unwrap_or_else(|| {
+                    self.corr.push(CorrRef { level, expr: e });
+                    self.corr.len() - 1
+                });
+            return Ok(BoundExpr::Column { index: CORR_MARK + p, ty, name });
+        }
+        let mut avail = self.scope.available();
+        for s in self.outer {
+            avail.push_str("; enclosing: ");
+            avail.push_str(&s.available());
+        }
+        Err(Error::bind(format!("unknown column `{n}`; available: {avail}")))
+    }
 }
 
 /// A CTE stack. Entry `i` may only reference entries `< i`, which is what
 /// keeps a self-referential CTE from recursing forever.
 type Ctes<'q> = [(&'q str, &'q Query)];
+
+// ============================================================== correlation
+//
+// Decorrelation happens in three steps and they are deliberately far apart:
+//
+//   1. `Ctx::correlate` lets a name that misses locally resolve in an
+//      enclosing scope, and leaves a `CORR_MARK` marker where the column would
+//      have been. That alone turns the old "unknown column `x.k`" into a
+//      binding, and it is where the feature is *visible*.
+//   2. `split_correlated` classifies each WHERE conjunct that holds a marker.
+//      Only `outer = inner` decorrelates; everything else is refused by name
+//      rather than run as a loop. The surviving keys travel up as `SubCorr`.
+//   3. `LogicalPlan::exists_correlated` / `in_correlated` / `scalar_correlated`
+//      turn those keys into join keys.
+//
+// A key whose `level` is greater than zero belongs to a *grandparent* query.
+// It is handed out again by the level that could not use it, which works
+// because a semi-join appends the subquery's key columns to its output -- the
+// value is still there to join on one level further out. An anti-join is where
+// that stops: it keeps exactly the rows whose right side is all NULL, so there
+// is nothing to hand out, and `membership` refuses it.
+
+/// A correlation a block is handing out, as its own clauses see it: how many
+/// levels further it still has to travel, the key as the enclosing query
+/// computes it, and the key as *this* block computes it.
+///
+/// It becomes a [`SubCorr`] once the block's projection has a column for the
+/// third element, which is the only difference between the two.
+type Export = (usize, BoundExpr, BoundExpr);
+
+/// One entry of [`split_levels`]'s outward list before its column is known.
+type Deeper = (usize, BoundExpr);
+
+/// A correlation a subquery could not settle inside itself.
+struct SubCorr {
+    /// 0 is the query that will consume it; higher has to be handed out again.
+    level: usize,
+    /// The key as *that* query computes it, over its own scope.
+    outer: BoundExpr,
+    /// Column of this subquery's output holding the inner side.
+    inner: usize,
+}
+
+/// A bound query block, plus what the block enclosing it needs to join it.
+struct Bound {
+    plan: LogicalPlan,
+    corr: Vec<SubCorr>,
+    /// What the select list evaluates to over **no input rows at all**. Only a
+    /// scalar subquery reads it, and only to settle the "count bug": an outer
+    /// row whose group is empty must see `count()` as 0 where the left join
+    /// pads with NULL. Taken from a real accumulator rather than a table of
+    /// special cases, so it cannot drift from what the executor computes.
+    empty: BoundExpr,
+}
+
+impl Bound {
+    fn rows(plan: LogicalPlan) -> Bound {
+        Bound { plan, corr: Vec::new(), empty: BoundExpr::lit(Value::Null) }
+    }
+}
+
+/// Why a block is being bound. `Scalar` adds the obligation that it produce at
+/// most one row per correlation key, which the binder proves rather than
+/// checks -- see `select_block`'s scalar gate.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Want {
+    Rows,
+    Scalar,
+}
+
+/// A scalar subquery hoisted out of an expression: bound, and ready to be the
+/// right side of a join.
+struct ScalarSub {
+    plan: LogicalPlan,
+    keys: Vec<CorrKey>,
+    empty: BoundExpr,
+}
+
+impl ScalarSub {
+    /// The type the marker standing in for this subquery carries.
+    ///
+    /// A correlated one is a LEFT join, and an outer row that matches no group
+    /// sees NULL, so the type has to admit one however the subquery declared
+    /// it. An uncorrelated one is a cross join against a `GROUP BY`-less
+    /// aggregate, which produces its one row whatever its input, so nothing
+    /// widens.
+    fn value_ty(&self) -> DataType {
+        let t = self.plan.schema().fields()[0].ty.clone();
+        if self.keys.is_empty() {
+            t
+        } else {
+            t.to_nullable()
+        }
+    }
+}
+
+/// A correlated WHERE conjunct, classified.
+enum Conjunct {
+    /// No outer reference: the ordinary predicate it has always been.
+    Local(BoundExpr),
+    /// `outer = inner`, which is the only shape a join key is made of.
+    Key { level: usize, outer: BoundExpr, inner: BoundExpr },
+}
 
 // =================================================================== binder
 
@@ -647,6 +864,22 @@ impl<'a> Binder<'a> {
     // ------------------------------------------------------------- queries
 
     fn query<'q>(&self, q: &'q Query, outer: &Ctes<'q>) -> Result<LogicalPlan> {
+        Ok(self.query_in(q, outer, &[], Want::Rows)?.plan)
+    }
+
+    /// [`Binder::query`] with the two things a *subquery* needs: the scopes it
+    /// may correlate to, and whether it has to produce one row.
+    ///
+    /// `enclosing[0]` is the query immediately around this one. An empty chain
+    /// is the top level, where the binder behaves exactly as it did before
+    /// correlation existed -- every name resolves locally or not at all.
+    fn query_in<'q>(
+        &self,
+        q: &'q Query,
+        outer: &Ctes<'q>,
+        enclosing: &[&Scope],
+        want: Want,
+    ) -> Result<Bound> {
         let _guard = DepthGuard::enter(&self.depth, "query")?;
         let mut ctes: Vec<(&'q str, &'q Query)> = outer.to_vec();
         for c in &q.with {
@@ -657,15 +890,26 @@ impl<'a> Binder<'a> {
             // A single SELECT owns the whole query's tail, because ORDER BY
             // wants to sit under the projection (see the module docs) and only
             // `select_block` knows where that is.
-            SetExpr::Select(sel) => self.select_block(sel, q, &ctes),
+            SetExpr::Select(sel) => self.select_block(sel, q, &ctes, enclosing, want),
             other => {
-                let plan = self.set_expr(other, &ctes)?;
-                self.tail_above(plan, q)
+                if want == Want::Scalar {
+                    return Err(Error::unsupported(
+                        "a scalar subquery must be a single SELECT: a set operation has no \
+                         row count the planner can bound",
+                    ));
+                }
+                let b = self.set_expr(other, &ctes, enclosing)?;
+                Ok(Bound::rows(self.tail_above(b.plan, q)?))
             }
         }
     }
 
-    fn set_expr<'q>(&self, e: &'q SetExpr, ctes: &Ctes<'q>) -> Result<LogicalPlan> {
+    fn set_expr<'q>(
+        &self,
+        e: &'q SetExpr,
+        ctes: &Ctes<'q>,
+        enclosing: &[&Scope],
+    ) -> Result<Bound> {
         // Guarded in its own right: `a UNION b UNION c UNION ...` is a loop in
         // the parser but a left-deep `SetOperation` tree here, so this is the
         // one recursion that neither `query` nor `table_ref` sits on.
@@ -673,10 +917,10 @@ impl<'a> Binder<'a> {
         match e {
             SetExpr::Select(sel) => {
                 let empty = Query::simple((**sel).clone());
-                self.select_block(sel, &empty, ctes)
+                self.select_block(sel, &empty, ctes, enclosing, Want::Rows)
             }
-            SetExpr::Query(q) => self.query(q, ctes),
-            SetExpr::Values(rows) => self.values(rows),
+            SetExpr::Query(q) => self.query_in(q, ctes, enclosing, Want::Rows),
+            SetExpr::Values(rows) => Ok(Bound::rows(self.values(rows)?)),
             SetExpr::SetOperation { op, all, left, right } => {
                 if !matches!(op, SetOp::Union) {
                     let name = if matches!(op, SetOp::Except) { "EXCEPT" } else { "INTERSECT" };
@@ -685,13 +929,24 @@ impl<'a> Binder<'a> {
                          anti-join predicate"
                     )));
                 }
-                let l = self.set_expr(left, ctes)?;
-                let r = self.set_expr(right, ctes)?;
+                // A branch may still *name* an enclosing column -- refusing the
+                // chain outright would report "unknown column" and send the
+                // reader looking for a typo. Decorrelating it is what is not
+                // implemented: each branch would need the correlation key in
+                // its own output and the union would have to key on it.
+                let l = self.set_expr(left, ctes, enclosing)?;
+                let r = self.set_expr(right, ctes, enclosing)?;
+                if !l.corr.is_empty() || !r.corr.is_empty() {
+                    return Err(Error::unsupported(
+                        "a correlated reference inside UNION: the correlation would have to be \
+                         a key of every branch",
+                    ));
+                }
                 let mut inputs = Vec::new();
-                flatten_union(l, *all, &mut inputs);
-                flatten_union(r, *all, &mut inputs);
+                flatten_union(l.plan, *all, &mut inputs);
+                flatten_union(r.plan, *all, &mut inputs);
                 let schema = union_schema(&inputs)?;
-                Ok(LogicalPlan::Union { inputs, all: *all, schema })
+                Ok(Bound::rows(LogicalPlan::Union { inputs, all: *all, schema }))
             }
         }
     }
@@ -824,7 +1079,9 @@ impl<'a> Binder<'a> {
         sel: &'q Select,
         q: &'q Query,
         ctes: &Ctes<'q>,
-    ) -> Result<LogicalPlan> {
+        enclosing: &[&Scope],
+        want: Want,
+    ) -> Result<Bound> {
         if sel.with_totals {
             return Err(Error::unsupported(
                 "GROUP BY ... WITH TOTALS: the logical plan has no TOTALS node",
@@ -865,8 +1122,13 @@ impl<'a> Binder<'a> {
         if let Some(pw) = &sel.prewhere {
             // Aggregates stay banned here — an aggregate in WHERE is a user
             // error, not something to hoist.
-            let mut ctx = Ctx::new(&scope, &aliases, false);
+            let mut ctx = Ctx::new(&scope, &aliases, false).reaching(enclosing);
             let pred = self.bind(pw, &mut ctx)?;
+            // PREWHERE lowers *into the scan*, below every join this block
+            // could build, so a correlation here has nowhere to go. Reported by
+            // name rather than as an unknown column, which is what it would
+            // otherwise look like.
+            no_correlation(&ctx, "PREWHERE")?;
             plan = match plan {
                 LogicalPlan::Scan(mut s) => {
                     s.filters.extend(pred.split_conjuncts());
@@ -876,6 +1138,16 @@ impl<'a> Binder<'a> {
             };
         }
 
+        // The scopes a subquery inside this block may reach: this one, then
+        // whatever this block could already reach.
+        let mut inner_chain: Vec<&Scope> = Vec::with_capacity(1 + enclosing.len());
+        inner_chain.push(&scope);
+        inner_chain.extend_from_slice(enclosing);
+
+        // Correlations this block cannot settle: its own references to an
+        // enclosing query, plus the ones its subqueries handed further out.
+        let mut exported: Vec<Export> = Vec::new();
+
         if let Some(w) = &sel.selection {
             // A membership subquery at the top of the AND-spine is a *join*,
             // not a predicate. Everything else in the spine binds as usual and
@@ -884,16 +1156,33 @@ impl<'a> Binder<'a> {
             // and pushdown still sinks those conjuncts into the scan, because
             // nothing between them and it has changed.
             let (rest, subs) = split_membership(w);
-            let mut ctx = Ctx::new(&scope, &aliases, false);
+            let mut ctx = Ctx::new(&scope, &aliases, false).joinable(enclosing, ctes);
             let mut conjuncts = Vec::with_capacity(rest.len());
             for r in rest {
                 conjuncts.push(self.bind(r, &mut ctx)?);
             }
-            if let Some(predicate) = BoundExpr::join_conjuncts(conjuncts) {
+            let corr = std::mem::take(&mut ctx.corr);
+            let pending = std::mem::take(&mut ctx.subs);
+            drop(ctx);
+            // A scalar subquery in WHERE is a join, and the filter that reads
+            // its value has to sit above it. Appending is what makes that free:
+            // the join leaves `0..n` alone, so every conjunct bound a moment
+            // ago still names the same columns.
+            let values = attach_scalars(&mut plan, pending);
+            let mut keep = Vec::with_capacity(conjuncts.len());
+            for c in conjuncts {
+                match split_correlated(resolve_subs(c, &values), &corr)? {
+                    Conjunct::Local(e) => keep.push(e),
+                    Conjunct::Key { level, outer, inner } => exported.push((level, outer, inner)),
+                }
+            }
+            if let Some(predicate) = BoundExpr::join_conjuncts(keep) {
                 plan = LogicalPlan::Filter { input: Box::new(plan), predicate };
             }
             for s in subs {
-                plan = self.membership(plan, s, &scope, &aliases, ctes)?;
+                let out = self.membership(plan, s, &scope, &aliases, ctes, &inner_chain)?;
+                plan = out.0;
+                exported.extend(out.1);
             }
         }
 
@@ -902,7 +1191,7 @@ impl<'a> Binder<'a> {
         let mut group = Vec::with_capacity(sel.group_by.len());
         let mut group_fields = Vec::with_capacity(sel.group_by.len());
         {
-            let mut ctx = Ctx::new(&scope, &aliases, false);
+            let mut ctx = Ctx::new(&scope, &aliases, false).reaching(enclosing);
             for g in &sel.group_by {
                 // `GROUP BY 1` has to bind the select item exactly the way the
                 // projection did, alias shadowing included, or the two trees
@@ -915,11 +1204,12 @@ impl<'a> Binder<'a> {
                 group_fields.push(Field::new(g.display_name(), b.ty()));
                 group.push(b);
             }
+            no_correlation(&ctx, "GROUP BY")?;
         }
 
         // One context for the select list, HAVING, ORDER BY and LIMIT BY, so
         // that `sum(v)` mentioned in two of them shares one accumulator.
-        let mut ctx = Ctx::new(&scope, &aliases, true);
+        let mut ctx = Ctx::new(&scope, &aliases, true).joinable(enclosing, ctes);
 
         let mut proj: Vec<BoundExpr> = Vec::new();
         let mut proj_names: Vec<String> = Vec::new();
@@ -989,12 +1279,64 @@ impl<'a> Binder<'a> {
             }
         }
 
-        let aggregating = !group.is_empty() || !ctx.aggs.is_empty();
+        no_correlation(&ctx, "the SELECT list, HAVING or ORDER BY")?;
+        // Scalar subqueries met anywhere in the select list, HAVING or ORDER BY
+        // become left joins *here* -- above WHERE and the membership joins,
+        // below GROUP BY -- because their value is a property of a source row.
+        // They append columns, so every expression bound above still reads the
+        // same indices and nothing needs remapping but the markers themselves.
         let mut having = having;
+        {
+            let pending = std::mem::take(&mut ctx.subs);
+            if !pending.is_empty() {
+                let values = attach_scalars(&mut plan, pending);
+                for e in proj.iter_mut().chain(having.iter_mut()) {
+                    replace(e, |x| resolve_subs(x, &values));
+                }
+                for k in sort_keys.iter_mut() {
+                    replace(&mut k.expr, |x| resolve_subs(x, &values));
+                }
+                if let Some((_, keys)) = limit_by.as_mut() {
+                    for k in keys.iter_mut() {
+                        replace(k, |x| resolve_subs(x, &values));
+                    }
+                }
+                for a in ctx.aggs.iter_mut() {
+                    for e in a.args.iter_mut() {
+                        replace(e, |x| resolve_subs(x, &values));
+                    }
+                }
+            }
+        }
 
+        let aggregating = !group.is_empty() || !ctx.aggs.is_empty();
+        // A correlation key is a group key when the block groups at all: that
+        // is what makes `(SELECT count() FROM b WHERE b.k = a.k)` one row per
+        // `k` instead of one row overall, and it is the whole of decorrelating
+        // an aggregate. Appended rather than prepended so the user's own group
+        // positions -- which `rewrite_over_agg` matches by index -- do not move.
+        let n_user_group = group.len();
+        if aggregating {
+            for (j, (_, _, inner)) in exported.iter().enumerate() {
+                group_fields.push(Field::new(format!("__corr{j}"), inner.ty()));
+                group.push(inner.clone());
+            }
+        }
+        if want == Want::Scalar {
+            self.check_scalar_shape(sel, q, aggregating, &proj, &ctx)?;
+        }
+
+        let mut empty_aggs: Vec<(usize, Value)> = Vec::new();
         if aggregating {
             let aggs = std::mem::take(&mut ctx.aggs);
             let n_group = group.len();
+            if want == Want::Scalar {
+                empty_aggs = aggs
+                    .iter()
+                    .enumerate()
+                    .map(|(j, a)| Ok((n_group + j, empty_agg(a)?)))
+                    .collect::<Result<Vec<_>>>()?;
+            }
             let group_keys: Vec<String> = group.iter().map(|g| g.to_string()).collect();
             let mut fields = group_fields.clone();
             fields.extend(aggs.iter().map(|a| Field::new(a.name.clone(), a.ty.clone())));
@@ -1050,6 +1392,18 @@ impl<'a> Binder<'a> {
             }
         }
 
+        // What the select list is worth over no rows at all, for the one caller
+        // that needs it. Only reachable for a scalar subquery, which the gate
+        // above has already proved aggregates and does not group, so every
+        // column left in `proj[0]` is an aggregate marker the substitution
+        // below turns into that accumulator's own empty value. Anything else
+        // it still reads -- a correlation key, which the injected GROUP BY made
+        // referenceable -- has no value over no rows, and NULL is that.
+        let empty = match want {
+            Want::Scalar => empty_value(&proj[0], &empty_aggs)?,
+            Want::Rows => BoundExpr::lit(Value::Null),
+        };
+
         // HAVING is a Filter above the Aggregate. Without aggregation it has
         // nothing to filter that WHERE could not, so it lands in the same
         // place WHERE would -- below the projection, against the source scope.
@@ -1076,6 +1430,44 @@ impl<'a> Binder<'a> {
                 for k in keys.iter_mut() {
                     resolve_windows(k, &remap)?;
                 }
+            }
+        }
+
+        // Every correlation key this block hands out has to be a *column* of
+        // its output, or the join one level up has nothing to name. Appending
+        // to the projection is what puts it there; the enclosing level narrows
+        // straight back down, so the widening never reaches an operator that
+        // would copy it.
+        let mut corr = Vec::with_capacity(exported.len());
+        if !exported.is_empty() {
+            if !ctx.windows.is_empty() {
+                return Err(Error::unsupported(
+                    "a correlated subquery with a window function: the window step runs above \
+                     the correlation key and would have to partition by it",
+                ));
+            }
+            if q.limit.is_some() || q.offset.is_some() || q.limit_by.is_some() {
+                return Err(Error::unsupported(
+                    "a correlated subquery with LIMIT: the limit applies per outer row, which \
+                     a join cannot express -- it would have to be one LIMIT per correlation key",
+                ));
+            }
+            for (j, (level, outer, inner)) in exported.into_iter().enumerate() {
+                let e = if aggregating {
+                    // The key is a group key now, at the position `n_user_group`
+                    // pushed it to.
+                    let i = n_user_group + j;
+                    BoundExpr::Column {
+                        index: i,
+                        ty: group_fields[i].ty.clone(),
+                        name: group_fields[i].name.clone(),
+                    }
+                } else {
+                    inner
+                };
+                corr.push(SubCorr { level, outer, inner: proj.len() });
+                proj_names.push(format!("__corr{j}"));
+                proj.push(e);
             }
         }
 
@@ -1149,7 +1541,90 @@ impl<'a> Binder<'a> {
             plan = LogicalPlan::Project { input: Box::new(plan), exprs: proj, schema: out_schema };
         }
 
-        self.apply_limit(plan, q)
+        Ok(Bound { plan: self.apply_limit(plan, q)?, corr, empty })
+    }
+
+    /// The one-row obligation a scalar subquery carries, discharged at plan
+    /// time.
+    ///
+    /// `(SELECT v FROM y WHERE y.k = x.k)` has no defined value when two rows
+    /// of `y` share a key, and the engine has **no way to raise from an
+    /// expression** -- every scalar function in the registry answers NULL
+    /// rather than failing, by design (see `functions::scalar`'s module docs on
+    /// division by zero). So there are three possible behaviours and only one
+    /// of them is honest: pick a row silently (wrong, and the thing this whole
+    /// wave exists to avoid), raise at run time (not expressible), or prove the
+    /// row count at plan time and refuse what cannot be proved.
+    ///
+    /// The proof is narrow and mechanical: an aggregate with no `GROUP BY` of
+    /// its own produces exactly one row per group, and after decorrelation the
+    /// groups *are* the correlation keys. Everything else is refused with the
+    /// rewrite that would fix it, which is a one-word edit -- `min`, `max` or
+    /// `any` around the select item -- and which makes the answer defined
+    /// rather than merely quiet.
+    fn check_scalar_shape(
+        &self,
+        sel: &Select,
+        q: &Query,
+        aggregating: bool,
+        proj: &[BoundExpr],
+        ctx: &Ctx<'_>,
+    ) -> Result<()> {
+        if proj.len() != 1 {
+            return Err(Error::bind(format!(
+                "a scalar subquery must select exactly one column, got {}",
+                proj.len()
+            )));
+        }
+        let bad = |why: &str| {
+            Err(Error::unsupported(format!(
+                "a scalar subquery must produce at most one row per correlation key, and {why}. \
+                 Wrap the select item in an aggregate -- `any(x)`, `min(x)`, `max(x)` -- which \
+                 makes the answer defined instead of whichever row the executor reached first"
+            )))
+        };
+        if !sel.group_by.is_empty() {
+            return bad("its own GROUP BY produces one row per group");
+        }
+        if !ctx.windows.is_empty() {
+            return bad("a window function computes one value per row, not per group");
+        }
+        if q.limit.is_some() || q.offset.is_some() || q.limit_by.is_some() {
+            return bad(
+                "LIMIT bounds the whole subquery rather than each correlation key, so a \
+                 decorrelated plan cannot honour it",
+            );
+        }
+        if sel.distinct {
+            return bad("DISTINCT bounds the rows to the distinct ones, which is still many");
+        }
+        if !aggregating {
+            return bad("this one selects a column and can match any number of rows");
+        }
+        Ok(())
+    }
+
+    /// A scalar subquery, bound and checked, ready for `attach_scalars`.
+    fn scalar_subquery(&self, q: &Query, ctx: &Ctx<'_>) -> Result<ScalarSub> {
+        let mut chain: Vec<&Scope> = Vec::with_capacity(1 + ctx.outer.len());
+        chain.push(ctx.scope);
+        chain.extend_from_slice(ctx.outer);
+        let b = self.query_in(q, ctx.ctes, &chain, Want::Scalar)?;
+        let mut keys = Vec::with_capacity(b.corr.len());
+        for c in b.corr {
+            if c.level > 0 {
+                // A left join pads the right with NULLs, so the key column it
+                // would hand outwards is NULL for exactly the rows that have no
+                // match -- and joining on that one level further out means
+                // something else entirely.
+                return Err(Error::unsupported(
+                    "a scalar subquery that references a column two queries out: the left join \
+                     it becomes cannot carry the key any further",
+                ));
+            }
+            keys.push(CorrKey { outer: c.outer, inner: c.inner });
+        }
+        Ok(ScalarSub { plan: b.plan, keys, empty: b.empty })
     }
 
     /// One `WHERE` conjunct that is a membership test, as a join over `left`.
@@ -1158,6 +1633,11 @@ impl<'a> Binder<'a> {
     /// what makes it a first-class relation: it gets the CTE stack, the depth
     /// guard, projection narrowing, and every optimizer pass that runs on the
     /// outer plan. Nothing here executes anything.
+    /// A correlated one is the same join with more keys -- and an
+    /// **uncorrelated** one takes exactly the path it took before this existed,
+    /// because `keys` empty is not a special case of the correlated builder, it
+    /// is a different call. That is deliberate: the uncorrelated plans are
+    /// measured (see [`LogicalPlan::in_subquery`]) and must not move.
     fn membership<'q>(
         &self,
         left: LogicalPlan,
@@ -1165,25 +1645,61 @@ impl<'a> Binder<'a> {
         scope: &Scope,
         aliases: &[(String, Expr)],
         ctes: &Ctes<'q>,
-    ) -> Result<LogicalPlan> {
+        inner: &[&Scope],
+    ) -> Result<(LogicalPlan, Vec<Export>)> {
         match e {
             Expr::InSubquery { expr, subquery, negated } => {
                 let mut ctx = Ctx::new(scope, aliases, false);
                 let probe = self.bind(expr, &mut ctx)?;
-                let sub = self.query(subquery, ctes)?;
+                let b = self.query_in(subquery, ctes, inner, Want::Rows)?;
+                let sub = b.plan;
                 // Cases 2 and 4 in `LogicalPlan::in_subquery`. Two types that
                 // cannot hold a NULL make the census -- and the second pass
                 // over the subquery it costs -- provably dead, which is the
                 // common case, because the subquery is usually a key.
-                let nulls = (*negated
-                    && sub.schema().len() == 1
-                    && needs_null_census(&probe.ty(), &sub.schema().fields()[0].ty))
-                .then(|| self.query(subquery, ctes))
+                let value_ty = sub.schema().fields().first().map(|f| f.ty.clone());
+                let census = (*negated
+                    && value_ty
+                        .as_ref()
+                        .is_some_and(|t| needs_null_census(&probe.ty(), t)))
+                .then(|| self.query_in(subquery, ctes, inner, Want::Rows).map(|b| b.plan))
                 .transpose()?;
-                LogicalPlan::in_subquery(left, probe, sub, nulls, *negated)
+                if b.corr.is_empty() {
+                    return Ok((
+                        LogicalPlan::in_subquery(left, probe, sub, census, *negated)?,
+                        Vec::new(),
+                    ));
+                }
+                // The value is column 0 and the correlation keys were appended
+                // to the subquery's projection, so the arity check the
+                // uncorrelated path does on the whole schema has to look at
+                // what the user actually selected instead.
+                if sub.schema().len() != 1 + b.corr.len() {
+                    return Err(Error::bind(format!(
+                        "IN (SELECT ...) must select exactly one column, got {}",
+                        sub.schema().len() - b.corr.len()
+                    )));
+                }
+                let (keys, exports, deeper) = split_levels(b.corr, *negated, "NOT IN")?;
+                let (plan, at) = LogicalPlan::in_correlated(
+                    left, probe, keys, &exports, sub, census, *negated,
+                )?;
+                let out = handed_out(&plan, deeper, &at);
+                Ok((plan, out))
             }
             Expr::Exists { subquery, negated } => {
-                Ok(LogicalPlan::exists_subquery(left, self.query(subquery, ctes)?, *negated))
+                let b = self.query_in(subquery, ctes, inner, Want::Rows)?;
+                if b.corr.is_empty() {
+                    return Ok((
+                        LogicalPlan::exists_subquery(left, b.plan, *negated),
+                        Vec::new(),
+                    ));
+                }
+                let (keys, exports, deeper) = split_levels(b.corr, *negated, "NOT EXISTS")?;
+                let (plan, at) =
+                    LogicalPlan::exists_correlated(left, keys, &exports, b.plan, *negated);
+                let out = handed_out(&plan, deeper, &at);
+                Ok((plan, out))
             }
             // `split_membership` selects the two arms above and nothing else.
             other => Err(Error::bind(format!("`{other}` is not a membership test"))),
@@ -1423,7 +1939,13 @@ impl<'a> Binder<'a> {
                         }
                     }
                 }
-                ctx.scope.resolve(name)
+                match ctx.scope.lookup(name)? {
+                    Some(e) => Ok(e),
+                    // Not here: either a correlated reference to a query
+                    // outside this one, or the same unknown column it always
+                    // was. `Ctx::correlate` is the only place that can tell.
+                    None => ctx.correlate(name),
+                }
             }
 
             Expr::Wildcard => Err(Error::bind(
@@ -1601,9 +2123,33 @@ impl<'a> Binder<'a> {
                 "tuple expressions outside of IN / LIMIT BY / ORDER BY",
             )),
 
-            Expr::Subquery(_) => Err(Error::unsupported(
-                "scalar subqueries: the binder has no executor to evaluate one with",
-            )),
+            // Hoisted, not evaluated: the subquery becomes a join below this
+            // expression and the marker becomes the column that join produced.
+            // `attach_scalars` does both. Only the two clauses that have a
+            // place to put that join set `allow_sub`.
+            Expr::Subquery(q) => {
+                if !ctx.allow_sub {
+                    return Err(Error::unsupported(
+                        "a scalar subquery is a join, and only binds in `WHERE` or the SELECT \
+                         list; here there is nothing to join it to",
+                    ));
+                }
+                if ctx.in_window {
+                    return Err(Error::unsupported(
+                        "a scalar subquery inside an OVER clause: the window step runs above \
+                         the join the subquery becomes",
+                    ));
+                }
+                // Bound here rather than at the hoist site, because the
+                // surrounding expression cannot be typed without the
+                // subquery's type. `attach_scalars` re-runs nothing; it only
+                // places the join this plan is the right side of.
+                let sub = self.scalar_subquery(q, ctx)?;
+                let ty = sub.value_ty();
+                let p = ctx.subs.len();
+                ctx.subs.push(sub);
+                Ok(BoundExpr::Column { index: SUB_MARK + p, ty, name: "subquery".into() })
+            }
 
             Expr::Exists { .. } => Err(Error::unsupported(
                 "EXISTS (SELECT ...) is a semi-join and only binds as a whole WHERE \
@@ -2340,6 +2886,226 @@ fn split_membership(e: &Expr) -> (Vec<&Expr>, Vec<&Expr>) {
     (rest, subs)
 }
 
+// ------------------------------------------------------------ decorrelation
+
+/// A reference to column `i` of a plan, by that plan's own schema.
+fn plan_col(plan: &LogicalPlan, i: usize) -> BoundExpr {
+    let f = &plan.schema().fields()[i];
+    BoundExpr::Column { index: i, ty: f.ty.clone(), name: f.name.clone() }
+}
+
+/// Refuse a correlated reference in a clause that has nowhere to put the join
+/// it would become. The reference itself already *bound*, which is the point:
+/// the message can say what is unsupported instead of "unknown column".
+fn no_correlation(ctx: &Ctx<'_>, what: &str) -> Result<()> {
+    match ctx.corr.first() {
+        None => Ok(()),
+        Some(c) => Err(Error::unsupported(format!(
+            "`{}` in {what} references the query enclosing this one; only a `WHERE` conjunct \
+             can be decorrelated, because only there is it a join key",
+            c.expr
+        ))),
+    }
+}
+
+/// Split a subquery's correlations into the ones the level that just bound it
+/// consumes, and the ones it has to hand further out.
+fn split_levels(
+    corr: Vec<SubCorr>,
+    negated: bool,
+    what: &str,
+) -> Result<(Vec<CorrKey>, Vec<usize>, Vec<Deeper>)> {
+    let mut keys = Vec::new();
+    let mut exports = Vec::new();
+    let mut deeper = Vec::new();
+    for c in corr {
+        if c.level == 0 {
+            keys.push(CorrKey { outer: c.outer, inner: c.inner });
+            continue;
+        }
+        if negated {
+            return Err(Error::unsupported(format!(
+                "`{what}` whose subquery references a column two queries out: an anti-join \
+                 keeps exactly the rows that matched nothing, so the key it would have to \
+                 carry outwards is NULL on every row it kept"
+            )));
+        }
+        exports.push(c.inner);
+        deeper.push((c.level - 1, c.outer));
+    }
+    Ok((keys, exports, deeper))
+}
+
+/// The grandparent correlations a join is handing on, paired with the columns
+/// it put them in.
+fn handed_out(
+    plan: &LogicalPlan,
+    deeper: Vec<Deeper>,
+    at: &[usize],
+) -> Vec<Export> {
+    deeper
+        .into_iter()
+        .zip(at)
+        .map(|((level, outer), &i)| (level, outer, plan_col(plan, i)))
+        .collect()
+}
+
+/// Each hoisted scalar subquery as a left join under `plan`, and the expression
+/// that reads its value back out.
+fn attach_scalars(plan: &mut LogicalPlan, pending: Vec<ScalarSub>) -> Vec<BoundExpr> {
+    let mut values = Vec::with_capacity(pending.len());
+    for s in pending {
+        let taken = std::mem::replace(plan, LogicalPlan::Empty { schema: Schema::empty() });
+        let (p, v) = LogicalPlan::scalar_correlated(taken, s.keys, s.plan, s.empty);
+        *plan = p;
+        values.push(v);
+    }
+    values
+}
+
+/// Point every scalar-subquery marker at the join column its value landed in.
+fn resolve_subs(e: BoundExpr, values: &[BoundExpr]) -> BoundExpr {
+    if values.is_empty() {
+        return e;
+    }
+    substitute(e, &|i| i.checked_sub(SUB_MARK).and_then(|p| values.get(p).cloned()))
+}
+
+/// `f(e)` applied through a `&mut`. The hole left while the subtree is out is a
+/// fieldless literal, so it costs a discriminant store and no allocation.
+fn replace(e: &mut BoundExpr, f: impl FnOnce(BoundExpr) -> BoundExpr) {
+    let taken = std::mem::replace(e, BoundExpr::lit(Value::Null));
+    *e = f(taken);
+}
+
+/// Replace every `Column` the mapper answers for with the expression it
+/// returns. The one rewrite [`BoundExpr::remap_columns`] cannot do: it renumbers
+/// a column, where this replaces the node.
+fn substitute(e: BoundExpr, f: &dyn Fn(usize) -> Option<BoundExpr>) -> BoundExpr {
+    if let BoundExpr::Column { index, .. } = &e {
+        if let Some(r) = f(*index) {
+            return r;
+        }
+        return e;
+    }
+    let rec = |x: Box<BoundExpr>| -> Box<BoundExpr> { Box::new(substitute(*x, f)) };
+    match e {
+        BoundExpr::Literal { .. } | BoundExpr::Column { .. } => e,
+        BoundExpr::Unary { op, expr, ty } => BoundExpr::Unary { op, expr: rec(expr), ty },
+        BoundExpr::Binary { left, op, right, ty } => {
+            BoundExpr::Binary { left: rec(left), op, right: rec(right), ty }
+        }
+        BoundExpr::Scalar { func, args, ty } => BoundExpr::Scalar {
+            func,
+            args: args.into_iter().map(|a| substitute(a, f)).collect(),
+            ty,
+        },
+        BoundExpr::Cast { expr, ty } => BoundExpr::Cast { expr: rec(expr), ty },
+        BoundExpr::Case { when_then, else_result, ty } => BoundExpr::Case {
+            when_then: when_then
+                .into_iter()
+                .map(|(w, t)| (substitute(w, f), substitute(t, f)))
+                .collect(),
+            else_result: else_result.map(rec),
+            ty,
+        },
+        BoundExpr::InList { expr, list, negated } => {
+            BoundExpr::InList { expr: rec(expr), list, negated }
+        }
+        BoundExpr::Like { expr, pattern, negated, case_insensitive } => {
+            BoundExpr::Like { expr: rec(expr), pattern, negated, case_insensitive }
+        }
+        BoundExpr::IsNull { expr, negated } => BoundExpr::IsNull { expr: rec(expr), negated },
+    }
+}
+
+/// Which correlation markers a bound tree holds, and whether it also reads a
+/// column of the block it was bound in.
+fn marker_levels(e: &BoundExpr, corr: &[CorrRef]) -> (Vec<usize>, bool) {
+    let (mut levels, mut local) = (Vec::new(), false);
+    e.visit(&mut |x| {
+        if let BoundExpr::Column { index, .. } = x {
+            match index.checked_sub(CORR_MARK).and_then(|p| corr.get(p)) {
+                Some(c) => {
+                    if !levels.contains(&c.level) {
+                        levels.push(c.level);
+                    }
+                }
+                None => local = true,
+            }
+        }
+    });
+    (levels, local)
+}
+
+/// One WHERE conjunct of a subquery, classified into the join key it becomes.
+///
+/// **Only an equality decorrelates.** `y.v > x.v` is a perfectly meaningful
+/// correlated predicate and this refuses it, for a concrete reason rather than
+/// a missing feature: there is no semi-join *operator*, only an inner join
+/// against a deduplicated subquery, and a residual predicate defeats the
+/// deduplication -- one left row would match several distinct (key, value)
+/// pairs and be emitted several times, turning an existence test into a count.
+/// Refusing is the honest half of "do not silently fall back to a loop".
+fn split_correlated(c: BoundExpr, corr: &[CorrRef]) -> Result<Conjunct> {
+    let (levels, _) = marker_levels(&c, corr);
+    if levels.is_empty() {
+        return Ok(Conjunct::Local(c));
+    }
+    let refuse = |why: &str| {
+        Err(Error::unsupported(format!(
+            "`{c}` correlates this subquery to the query enclosing it, and {why}. A \
+             correlation decorrelates into a join key only when it is an equality between an \
+             expression over the outer row and one over the inner row"
+        )))
+    };
+    let BoundExpr::Binary { left, op: BinaryOp::Eq, right, .. } = &c else {
+        return refuse("it is not an equality");
+    };
+    let (l, r) = (marker_levels(left, corr), marker_levels(right, corr));
+    // Exactly one side reads the outer row, and that side reads nothing else.
+    let (outer_side, inner_side, level) = match (&l, &r) {
+        ((ls, false), (rs, _)) if !ls.is_empty() && rs.is_empty() && ls.len() == 1 => {
+            (left, right, ls[0])
+        }
+        ((ls, _), (rs, false)) if !rs.is_empty() && ls.is_empty() && rs.len() == 1 => {
+            (right, left, rs[0])
+        }
+        _ if l.0.len() > 1 || r.0.len() > 1 => {
+            return refuse("it mixes columns from two different enclosing queries")
+        }
+        _ => return refuse("one side of it reads the outer row and the inner row at once"),
+    };
+    let outer = substitute(outer_side.as_ref().clone(), &|i| {
+        i.checked_sub(CORR_MARK).and_then(|p| corr.get(p)).map(|c| c.expr.clone())
+    });
+    Ok(Conjunct::Key { level, outer, inner: inner_side.as_ref().clone() })
+}
+
+/// What an aggregate is worth over **no rows**, taken from a fresh accumulator
+/// rather than a table of special cases -- `count()` is 0 and everything else
+/// is NULL today, and if that ever stops being true here it stops being true in
+/// the executor at the same moment.
+fn empty_agg(a: &BoundAgg) -> Result<Value> {
+    let tys: Vec<DataType> = a.args.iter().map(|x| x.ty()).collect();
+    (a.func.new)(&tys, &a.params)?.finish()
+}
+
+/// A scalar subquery's select item, evaluated over no input rows.
+///
+/// Every aggregate becomes its own empty value; anything else the expression
+/// still reads is a correlation key, which over no rows has no value at all --
+/// so the whole thing is NULL, which is also what the left join would have
+/// padded with.
+fn empty_value(proj: &BoundExpr, aggs: &[(usize, Value)]) -> Result<BoundExpr> {
+    let e = substitute(proj.clone(), &|i| {
+        aggs.iter().find(|(j, _)| *j == i).map(|(_, v)| BoundExpr::lit(v.clone()))
+    });
+    let mut has_col = false;
+    e.visit(&mut |x| has_col |= matches!(x, BoundExpr::Column { .. }));
+    Ok(if has_col { BoundExpr::lit(Value::Null) } else { e })
+}
+
 /// Peel equi-join pairs out of an ON predicate. `on` indices are per-side
 /// (`(left index, right index)`); whatever is left over stays expressed
 /// against the concatenated schema, which is what the executor evaluates it
@@ -2453,6 +3219,75 @@ fn select_item_at(sel: &Select, n: usize) -> Result<(&Expr, Option<&str>)> {
     }
 }
 
+/// Every column name an expression mentions, **including the ones written
+/// inside a subquery**.
+///
+/// `Expr::visit` stops at a nested query -- `push_children` treats one as a
+/// leaf -- and a correlated reference lives on the far side of exactly that
+/// boundary. Missing it leaves the outer scan without the column the join will
+/// key on, which surfaces as "column `x.k` was not projected into the scan".
+///
+/// Names are collected into an owned list rather than pushed straight into
+/// [`Demand`], because a `&Expr` handed to a `visit` callback cannot outlive
+/// the callback and a nested `Query` is one.
+fn names_in(e: &Expr, out: &mut Vec<String>) {
+    e.visit(&mut |x| match x {
+        Expr::Column(n) => out.push(n.last().to_ascii_lowercase()),
+        Expr::Subquery(q) | Expr::Exists { subquery: q, .. } => names_in_query(q, out),
+        Expr::InSubquery { subquery, .. } => names_in_query(subquery, out),
+        _ => {}
+    });
+}
+
+/// [`names_in`] over a whole query block. Deliberately blunt: every name
+/// anywhere inside, which over-approximates by exactly the amount the rest of
+/// [`Demand`] already does -- an inner name that happens to match an outer
+/// column costs that column being read. Narrowing it would need scopes, and
+/// scopes do not exist yet when the scan is chosen.
+///
+/// Depth is bounded by the parser's own nesting limit, which is what keeps this
+/// from being a second unguarded recursion.
+fn names_in_query(q: &Query, out: &mut Vec<String>) {
+    for e in q.order_by.iter().map(|o| &o.expr).chain(q.limit.iter()).chain(q.offset.iter()) {
+        names_in(e, out);
+    }
+    for c in &q.with {
+        names_in_query(&c.query, out);
+    }
+    names_in_body(&q.body, out);
+}
+
+fn names_in_body(b: &SetExpr, out: &mut Vec<String>) {
+    match b {
+        SetExpr::Select(sel) => {
+            for item in &sel.projection {
+                if let SelectItem::Expr { expr, .. } = item {
+                    names_in(expr, out);
+                }
+            }
+            for e in sel
+                .prewhere
+                .iter()
+                .chain(sel.selection.iter())
+                .chain(sel.having.iter())
+                .chain(sel.group_by.iter())
+            {
+                names_in(e, out);
+            }
+        }
+        SetExpr::Query(q) => names_in_query(q, out),
+        SetExpr::SetOperation { left, right, .. } => {
+            names_in_body(left, out);
+            names_in_body(right, out);
+        }
+        SetExpr::Values(rows) => {
+            for e in rows.iter().flatten() {
+                names_in(e, out);
+            }
+        }
+    }
+}
+
 // ------------------------------------------------------------------ demand
 
 /// Which of a table's columns this query block could possibly touch.
@@ -2502,14 +3337,13 @@ impl Demand {
     }
 
     fn walk(&mut self, e: &Expr) {
-        e.visit(&mut |x| {
-            if let Expr::Column(n) = x {
-                let lower = n.last().to_ascii_lowercase();
-                if !self.names.contains(&lower) {
-                    self.names.push(lower);
-                }
+        let mut found = Vec::new();
+        names_in(e, &mut found);
+        for n in found {
+            if !self.names.contains(&n) {
+                self.names.push(n);
             }
-        });
+        }
     }
 
     fn walk_from(&mut self, tr: &TableRef) {
@@ -3351,14 +4185,144 @@ mod tests {
 
     #[test]
     fn subquery_expressions_are_refused_rather_than_faked() {
-        let m = err("SELECT id FROM events WHERE ms = (SELECT max(age) FROM users)");
-        assert!(m.contains("not implemented") && m.contains("scalar subqueries"), "{m}");
+        // INVERTED. This used to assert `SELECT ... WHERE ms = (SELECT max(age)
+        // FROM users)` was refused with "scalar subqueries: the binder has no
+        // executor to evaluate one with". It is now a join -- the binder never
+        // needed an executor, it needed somewhere to put the other relation --
+        // so the pin becomes the plan it produces.
+        let e = explain("SELECT id FROM events WHERE ms = (SELECT max(age) FROM users)");
+        assert!(e.contains("CrossJoin"), "an uncorrelated scalar subquery is a cross join: {e}");
+        assert!(e.contains("Aggregate group=[] aggs=[max(age#0)]"), "{e}");
+
+        // What is still refused is the shape with no defined *value*, and the
+        // message names the edit that gives it one.
+        let m = err("SELECT id FROM events WHERE ms = (SELECT age FROM users)");
+        assert!(m.contains("at most one row") && m.contains("any(x)"), "{m}");
+
         // A membership test is refused only where it would have to be a value.
         // As a whole WHERE conjunct it is a join, and has its own tests below.
         let m = err("SELECT id FROM events WHERE user_id IN (SELECT user_id FROM users) OR id = 1");
         assert!(m.contains("semi-join") && m.contains("per-row value"), "{m}");
         let m = err("SELECT NOT EXISTS (SELECT 1 FROM users) FROM events");
         assert!(m.contains("EXISTS") && m.contains("semi-join"), "{m}");
+    }
+
+    // ------------------------------------------------ correlated subqueries
+
+    #[test]
+    fn a_correlated_reference_binds_instead_of_erroring() {
+        // The refusal this wave closed, verbatim: `unknown column `x.user_id``
+        // with the subquery's own columns listed, which was honest and useless.
+        let e = explain(
+            "SELECT id FROM events x WHERE EXISTS \
+             (SELECT 1 FROM users y WHERE y.user_id = x.user_id)",
+        );
+        assert!(e.contains("InnerJoin on [l#1 = r#0]"), "{e}");
+        // Once, over the whole subquery -- not once per outer row.
+        assert_eq!(e.matches("Scan default.users").count(), 1, "{e}");
+        assert!(e.contains("Distinct"), "a semi-join must not multiply the left row: {e}");
+    }
+
+    #[test]
+    fn correlated_not_exists_is_an_anti_join() {
+        let e = explain(
+            "SELECT id FROM events x WHERE NOT EXISTS \
+             (SELECT 1 FROM users y WHERE y.user_id = x.user_id)",
+        );
+        assert!(e.contains("LeftJoin on [l#1 = r#0]"), "{e}");
+        assert!(e.contains("Filter __corr0"), "the anti-join tests the padded key: {e}");
+    }
+
+    #[test]
+    fn an_uncorrelated_subquery_keeps_its_old_plan() {
+        // The negative case, and the reason `membership` branches on an empty
+        // key list rather than treating it as a degenerate correlation: these
+        // plans are measured and must not move.
+        let e = explain("SELECT id FROM events WHERE user_id IN (SELECT user_id FROM users)");
+        assert!(e.contains("InnerJoin on [l#1 = r#0]"), "{e}");
+        assert!(!e.contains("__corr"), "no correlation machinery: {e}");
+        let e = explain("SELECT id FROM events WHERE EXISTS (SELECT 1 FROM users)");
+        assert!(e.contains("CrossJoin on []"), "{e}");
+        assert!(e.contains("Limit 1 offset 0"), "the existence test still stops at one row: {e}");
+    }
+
+    #[test]
+    fn correlated_not_in_grows_a_grouped_census() {
+        // `notes.n` is the fixture's nullable column, so cases 2 and 3 are
+        // live: the census has to be per correlation key, not one row overall.
+        let e = explain(
+            "SELECT id FROM notes x WHERE x.n NOT IN \
+             (SELECT y.n FROM notes y WHERE y.id = x.id)",
+        );
+        assert!(e.contains("Aggregate group=[__corr0#1] aggs=[count(), count(n#0)]"), "{e}");
+        // Left, not cross: a key with no rows in the subquery has no census row
+        // at all, and that NULL is what "the group is empty" means.
+        assert_eq!(e.matches("LeftJoin").count(), 2, "{e}");
+    }
+
+    #[test]
+    fn a_correlated_scalar_subquery_groups_by_the_correlation() {
+        let e = explain(
+            "SELECT id, (SELECT count() FROM users y WHERE y.user_id = x.user_id) \
+             FROM events x",
+        );
+        assert!(e.contains("Aggregate group=[user_id#0] aggs=[count()]"), "{e}");
+        assert!(e.contains("LeftJoin on [l#1 = r#1]"), "{e}");
+        // The count bug: an outer row with no group must see 0, and the left
+        // join pads with NULL. The CASE is what turns one into the other, and
+        // the 0 came from a real accumulator.
+        assert!(e.contains("CASE WHEN"), "{e}");
+    }
+
+    #[test]
+    fn undecorrelatable_shapes_are_refused_by_name() {
+        // Not an equality: a residual would defeat the Distinct that stands in
+        // for a semi-join operator, so one left row would be emitted once per
+        // matching right row.
+        let m = err(
+            "SELECT id FROM events x WHERE EXISTS \
+             (SELECT 1 FROM users y WHERE y.age > x.ms)",
+        );
+        assert!(m.contains("not an equality"), "{m}");
+
+        // Per-key LIMIT is not expressible as a join.
+        let m = err(
+            "SELECT id FROM events x WHERE EXISTS \
+             (SELECT 1 FROM users y WHERE y.user_id = x.user_id LIMIT 1)",
+        );
+        assert!(m.contains("LIMIT") && m.contains("per outer row"), "{m}");
+
+        // A correlated reference outside WHERE has nowhere to become a key.
+        let m = err(
+            "SELECT id FROM events x WHERE EXISTS \
+             (SELECT 1 FROM users y GROUP BY x.user_id)",
+        );
+        assert!(m.contains("GROUP BY") && m.contains("enclosing"), "{m}");
+    }
+
+    #[test]
+    fn a_grandparent_reference_is_carried_out_through_semi_joins_only() {
+        let e = explain(
+            "SELECT id FROM events x WHERE EXISTS (SELECT 1 FROM users y \
+             WHERE y.user_id = x.user_id AND EXISTS \
+             (SELECT 1 FROM notes z WHERE z.id = y.age AND z.id = x.ms))",
+        );
+        // Two nested semi-joins, the inner one handing `z.id` outwards so the
+        // outer one can key on it: `x.ms` never becomes a per-row lookup.
+        assert_eq!(e.matches("InnerJoin").count(), 2, "{e}");
+        // `user_id` is events#1 and `ms` is events#2: the outer join keys on
+        // both, the second having been carried up out of the inner subquery.
+        assert!(e.contains("InnerJoin on [l#1 = r#0, l#2 = r#1]"), "{e}");
+        assert_eq!(e.matches("Scan default.notes").count(), 1, "once, not per row: {e}");
+
+        // An anti-join has nothing to carry: it keeps the rows whose right side
+        // is all NULL.
+        let m = err(
+            "SELECT id FROM events x WHERE EXISTS (SELECT 1 FROM users y \
+             WHERE y.user_id = x.user_id AND NOT EXISTS \
+             (SELECT 1 FROM notes z WHERE z.id = x.ms))",
+        );
+        assert!(m.contains("two queries out"), "{m}");
     }
 
     // ------------------------------------------------- membership subqueries

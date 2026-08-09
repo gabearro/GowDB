@@ -78,6 +78,36 @@
 //! every `TABLE` record parsed, every part the manifest names resolved to a
 //! body, and every name it would create checked for being a legal directory
 //! entry. It is deliberately not a header check.
+//!
+//! ## Point-in-time recovery
+//!
+//! A backup restores the instant it was taken, and only that instant. What
+//! turns it into "any instant since" is the WAL archive that
+//! [`crate::persist::wal`] keeps: [`restore_until`] unpacks the base and then
+//! lays the archived log down beside it, cut to the target.
+//!
+//! Two numbers make that exact. Every archive records the **recovery LSN**
+//! current when it was taken -- `wal::commit_seq()`, read after the snapshots
+//! are pinned and under the same write borrow, so every record acknowledged
+//! before it is inside the parts and every record after it is not. And every
+//! archived log record is stamped by the tick in front of the `fsync` that
+//! made it durable. So the roll-forward is a byte range of the archive, from
+//! the tick after the backup's LSN to the tick the target names, with no
+//! record re-encoded and no guess about which side of the backup anything
+//! falls on.
+//!
+//! The cut is not applied here. The recovered bytes are written out *as the
+//! restored table's `wal.log`*, and the ordinary loader replays them the way
+//! it replays any log a crash left behind -- so a restored-to-a-timestamp
+//! database goes through exactly the recovery path that runs a thousand times
+//! a day, rather than through a second one written for this feature that
+//! nothing else exercises.
+//!
+//! What it refuses, loudly, rather than approximating: a target before the
+//! backup, a target past the end of the archive, an archive with a hole in it,
+//! a segment retention has dropped, and a segment a crash caught mid-archive.
+//! Every one of those is a state a recovery could otherwise report as success
+//! while silently skipping records.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -87,9 +117,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::common::{Error, FastMap, Result};
 use crate::persist::format::{self, Reader, Writer};
 use crate::persist::mmap::Mmap;
+use crate::persist::wal;
 use crate::persist::{reader, store, writer};
 use crate::storage::part::Snapshot;
 use crate::types::TableDef;
+
+pub use crate::persist::wal::Target;
 
 /// Conventional extension. Not enforced -- the footer's magic is what says
 /// whether a file is an archive -- but it is what the error messages suggest.
@@ -127,6 +160,10 @@ pub struct Report {
     pub bytes: u64,
     /// Parts an incremental archive resolved from its base instead of storing.
     pub reused: usize,
+    /// Logged mutations a point-in-time restore laid down on top of the base.
+    /// Always zero for a plain [`restore`], which is the whole difference
+    /// between the two.
+    pub replayed: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -171,7 +208,13 @@ pub fn write_archive(
         let mut rep = Report::default();
         let mut man = Writer::with_capacity(512 + src.len() * 256);
         man.str(&base.map_or(String::new(), |b| b.to_string_lossy().into_owned()));
-        man.u64(now_unix());
+        man.u64(now_ms());
+        // The boundary a point-in-time recovery rolls forward from. Read here
+        // rather than by the caller, and *after* the snapshots were pinned:
+        // the writer that pinned them still holds the borrow, so nothing can
+        // have been acknowledged in between and every LSN below this one is
+        // inside the parts about to be written.
+        man.varint(wal::commit_seq());
 
         man.varint(dbs.len() as u64);
         for db in dbs {
@@ -329,8 +372,11 @@ fn tmp_path(target: &Path) -> PathBuf {
     dir.join(format!(".{stem}.tmp-{}", std::process::id()))
 }
 
-fn now_unix() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs())
+/// Milliseconds, not seconds: this is the lower bound a `RESTORE ... UNTIL
+/// TIMESTAMP` is checked against, and a second of slack there is a second of
+/// recovery target nobody can name.
+fn now_ms() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64)
 }
 
 // ---------------------------------------------------------------------------
@@ -340,7 +386,11 @@ fn now_unix() -> u64 {
 /// One archive's manifest, decoded.
 struct Manifest {
     base: String,
+    /// When it was taken, in milliseconds since the epoch.
     created: u64,
+    /// The recovery LSN current when it was taken. Every record with a
+    /// smaller one is already inside the parts this archive holds.
+    boundary: u64,
     dbs: Vec<(String, Vec<ArchivedTable>)>,
 }
 
@@ -469,6 +519,7 @@ fn decode_manifest(buf: &[u8]) -> Result<Manifest> {
     let mut r = Reader::new(body);
     let base = r.str()?.to_string();
     let created = r.u64()?;
+    let boundary = r.varint()?;
     let ndbs = bounded(r.varint()?, "database count")?;
     let mut dbs = Vec::with_capacity(ndbs.min(64));
     for _ in 0..ndbs {
@@ -498,7 +549,7 @@ fn decode_manifest(buf: &[u8]) -> Result<Manifest> {
         }
         dbs.push((name, tables));
     }
-    Ok(Manifest { base, created, dbs })
+    Ok(Manifest { base, created, boundary, dbs })
 }
 
 fn bounded(v: u64, what: &str) -> Result<usize> {
@@ -517,10 +568,21 @@ fn resolve_base(archive: &Path, base: &Path) -> PathBuf {
     archive.parent().unwrap_or_else(|| Path::new(".")).join(base)
 }
 
-/// When the archive was taken, as seconds since the epoch.
+/// When the archive was taken, as milliseconds since the epoch.
 pub fn created_at(path: &Path) -> Result<u64> {
+    Ok(head(path)?.created)
+}
+
+/// The recovery LSN an archive was taken at: the point [`restore_until`] rolls
+/// forward from.
+pub fn boundary_of(path: &Path) -> Result<u64> {
+    Ok(head(path)?.boundary)
+}
+
+/// An archive's own manifest, without walking its base chain.
+fn head(path: &Path) -> Result<Manifest> {
     let map = Mmap::open(path).map_err(|e| store::prefix(path, e))?;
-    Ok(decode_manifest(map.as_slice())?.created)
+    decode_manifest(map.as_slice()).map_err(|e| store::prefix(path, e))
 }
 
 // ---------------------------------------------------------------------------
@@ -678,6 +740,214 @@ pub fn restore(path: &Path, into: &Path) -> Result<Report> {
     // And the root catalog last of all, for the same reason one level up.
     store::commit(&into.join(store::CATALOG_FILE), &writer::catalog_doc(&roster))?;
     Ok(rep)
+}
+
+// ---------------------------------------------------------------------------
+// point in time
+// ---------------------------------------------------------------------------
+
+/// [`restore`], then roll forward through the WAL archive under `data_root`
+/// until `target`.
+///
+/// `data_root` is the data directory whose archive holds the log -- the live
+/// one, read but never written, which is why this is allowed while that
+/// database is open. `into` is a **new** directory, exactly as for `restore`.
+///
+/// The result is a checkpointed database directory plus one `wal.log` per
+/// table holding the records between the backup and the target, so the
+/// ordinary loader finishes the job. Running it twice with the same target
+/// produces the same bytes: every cut is at a tick, and a tick is a fact about
+/// the archive rather than about when the recovery ran.
+pub fn restore_until(
+    archive: &Path,
+    data_root: &Path,
+    into: &Path,
+    target: Target,
+) -> Result<Report> {
+    let man = head(archive)?;
+    let end = wal::archive_end(data_root)?;
+    check_target(archive, data_root, &man, &end, target)?;
+
+    let mut rep = restore(archive, into)?;
+    for (db, tables) in &man.dbs {
+        for t in tables {
+            let rec = wal::recover(data_root, db, &t.def.name, man.boundary, target)?;
+            if rec.records == 0 {
+                continue;
+            }
+            // Written last, after `restore` has published the parts and the
+            // commit record: a directory that holds a log and no commit record
+            // is one the loader would replay from the beginning of time.
+            let tdir = into.join(db).join(&t.def.name);
+            store::atomic_write(&tdir.join(store::WAL_FILE), &rec.bytes)?;
+            rep.replayed += rec.records;
+        }
+    }
+    Ok(rep)
+}
+
+/// Everything that makes a target unanswerable, checked before a byte is
+/// unpacked so a refusal leaves the operator with the archive they had.
+fn check_target(
+    archive: &Path,
+    data_root: &Path,
+    man: &Manifest,
+    end: &wal::Span,
+    target: Target,
+) -> Result<()> {
+    // A backup restores its own instant with no archive at all; asking for any
+    // *other* instant needs one.
+    if end.last_seq == 0 && target != Target::Latest {
+        return Err(Error::storage(format!(
+            "there is no archived write-ahead log under {}, so {} is not a state this \
+             backup can be recovered to. Only the instant {} was taken is available, \
+             through `RESTORE FROM ... TO ...`",
+            wal::archive_dir(data_root, "", "").display(),
+            describe(target),
+            archive.display()
+        )));
+    }
+    match target {
+        Target::Latest => {}
+        // `boundary` is the first *unused* LSN at backup time, so the backup
+        // already holds `boundary - 1`. Asking for that is asking for the
+        // backup, which is answerable; asking for less is not.
+        Target::Lsn(n) if n + 1 < man.boundary => {
+            return Err(Error::storage(format!(
+                "recovery LSN {n} is before {}, which was taken at LSN {}. A backup cannot \
+                 be rolled *backwards*: restore an older backup instead",
+                archive.display(),
+                man.boundary
+            )))
+        }
+        // An LSN is a number some tool handed the operator, so one past
+        // everything ever issued is a mistake worth naming whether or not the
+        // archive is behind. A timestamp is not: being after the last write is
+        // the ordinary shape of "restore to this afternoon", and it is only
+        // unanswerable when the archive really is missing the tail.
+        Target::Lsn(n) if n > end.last_seq => {
+            return Err(Error::storage(format!(
+                "recovery LSN {n} is past the end of the archive, which reaches LSN {}. \
+                 Recovering to it would silently return an earlier state than the one \
+                 asked for{}",
+                end.last_seq,
+                lag_note(data_root)?
+            )))
+        }
+        Target::Time(t) if t < man.created => {
+            return Err(Error::storage(format!(
+                "{} is before {}, which was taken at {}. A backup cannot be rolled \
+                 *backwards*: restore an older backup instead",
+                fmt_ms(t),
+                archive.display(),
+                fmt_ms(man.created)
+            )))
+        }
+        Target::Time(t) if t > end.last_ms => {
+            if let Some(behind) = wal::archive_lags(data_root)? {
+                return Err(Error::storage(format!(
+                    "{} is past the end of the archive, which reaches {}, and `{behind}` \
+                     still holds un-archived records in its live log. Recovering to it \
+                     would silently return an earlier state than the one asked for; \
+                     checkpoint {} first",
+                    fmt_ms(t),
+                    fmt_ms(end.last_ms),
+                    data_root.display()
+                )));
+            }
+        }
+        _ => {}
+    }
+    // The archive has to reach *back* to the backup, or the window between
+    // them is a hole nothing recorded -- which is what turning archiving on
+    // after taking a backup leaves behind.
+    if end.first_seq > man.boundary {
+        return Err(Error::storage(format!(
+            "the archived write-ahead log under {} begins at recovery LSN {}, after {} \
+             was taken at LSN {}. Whatever was written in between is not in the archive \
+             and not in the backup, so rolling forward would skip it",
+            data_root.display(),
+            end.first_seq,
+            archive.display(),
+            man.boundary
+        )));
+    }
+    Ok(())
+}
+
+/// `UNTIL <kind> <value>`, for the statement that spells a target.
+///
+/// Lives here rather than in the parser because the grammar of a recovery
+/// target is the grammar of this module's `Target`, and one place that turns
+/// text into one is one place that can get it wrong.
+pub fn parse_target(kind: &str, value: &str) -> Result<Target> {
+    if kind.eq_ignore_ascii_case("latest") {
+        return Ok(Target::Latest);
+    }
+    if kind.eq_ignore_ascii_case("lsn") {
+        return value.trim().parse().map(Target::Lsn).map_err(|_| {
+            Error::bind(format!("`UNTIL LSN {value}` wants a whole number: the recovery LSN \
+                 a `BACKUP` reported, or one `SHOW SETTINGS`-style tooling handed you"))
+        });
+    }
+    if kind.eq_ignore_ascii_case("timestamp") || kind.eq_ignore_ascii_case("time") {
+        return parse_ms(value).map(Target::Time);
+    }
+    Err(Error::bind(format!(
+        "`UNTIL {kind}` is not a recovery target. Use `UNTIL LATEST`, `UNTIL LSN <n>` or \
+         `UNTIL TIMESTAMP '<YYYY-MM-DD HH:MM:SS[.mmm]>'`"
+    )))
+}
+
+/// `YYYY-MM-DD HH:MM:SS[.mmm]` in UTC, as milliseconds since the epoch.
+///
+/// Fractional seconds are optional and are the reason this is not just
+/// [`crate::types::parse_datetime`]: a recovery target of "just before the bad
+/// deploy" is often within the same second as the write that has to survive.
+fn parse_ms(s: &str) -> Result<u64> {
+    let t = s.trim();
+    let (head, frac) = match t.rsplit_once('.') {
+        // Only a fraction if what follows the dot is digits; a date never has
+        // one, so this cannot swallow part of a legal timestamp.
+        Some((h, f)) if !f.is_empty() && f.bytes().all(|b| b.is_ascii_digit()) => (h, f),
+        _ => (t, ""),
+    };
+    let secs = crate::types::parse_datetime(head)?;
+    let mut ms = frac.chars().chain(std::iter::repeat('0')).take(3).fold(0u64, |a, c| {
+        a * 10 + c.to_digit(10).unwrap_or(0) as u64
+    });
+    if secs < 0 {
+        return Err(Error::bind(format!(
+            "`{s}` is before the epoch; a recovery target is a moment this database could \
+             have been running"
+        )));
+    }
+    ms += secs as u64 * 1000;
+    Ok(ms)
+}
+
+/// The sentence that says whether the missing records are merely un-archived.
+fn lag_note(root: &Path) -> Result<String> {
+    Ok(match wal::archive_lags(root)? {
+        Some(t) => format!("; `{t}` still holds un-archived records, so checkpointing {} may be all this needs", root.display()),
+        None => format!(", and every log under {} is already archived -- so there is no such LSN", root.display()),
+    })
+}
+
+fn fmt_ms(ms: u64) -> String {
+    let s = crate::types::fmt_datetime((ms / 1000) as i64);
+    match ms % 1000 {
+        0 => s,
+        f => format!("{s}.{f:03}"),
+    }
+}
+
+fn describe(t: Target) -> String {
+    match t {
+        Target::Latest => "the latest archived state".to_string(),
+        Target::Lsn(n) => format!("recovery LSN {n}"),
+        Target::Time(ms) => fmt_ms(ms),
+    }
 }
 
 #[cfg(test)]
@@ -885,6 +1155,68 @@ mod tests {
         let img = reader::read_table_image(&out.join("default").join("hits")).unwrap();
         let back: usize = img.parts.iter().map(|p| p.born_live_rows()).sum();
         assert_eq!(back, live);
+    }
+
+    /// The number the whole point-in-time story hangs off. It is read after
+    /// the snapshots are pinned, so it is the exact frontier between what the
+    /// archive holds and what a recovery has to replay onto it.
+    #[test]
+    fn an_archive_records_the_recovery_lsn_it_was_taken_at() {
+        let s = Scratch::new("bk-boundary");
+        let t = sample_table("hits", &[100]);
+        let arc = s.join("a.gbak");
+        let before = crate::persist::wal::commit_seq();
+        write_archive(&arc, &roster(), &sources(std::slice::from_ref(&t)), None).unwrap();
+        let at = boundary_of(&arc).unwrap();
+        assert_eq!(at, before, "the boundary is the counter as it stood");
+        assert!(at >= 1, "and it is never zero, so zero can mean `no tick`");
+
+        // ...and the clock beside it is milliseconds, because a second of
+        // slack is a second of recovery target nobody could name.
+        let created = created_at(&arc).unwrap();
+        assert!(created > 1_700_000_000_000, "created must be millis, not seconds: {created}");
+        assert!(created <= now_ms());
+    }
+
+    /// A backup with no archive behind it restores its own instant and says so
+    /// about any other -- rather than quietly handing back the same directory
+    /// whatever was asked for.
+    #[test]
+    fn without_an_archive_only_the_backups_own_instant_is_available() {
+        let s = Scratch::new("bk-noarchive");
+        let t = sample_table("hits", &[100]);
+        let arc = s.join("a.gbak");
+        write_archive(&arc, &roster(), &sources(std::slice::from_ref(&t)), None).unwrap();
+
+        let root = s.join("root");
+        let e = restore_until(&arc, &root, &s.join("out"), Target::Lsn(1))
+            .expect_err("a target needs an archive");
+        assert!(e.to_string().contains("no archived write-ahead log"), "{e}");
+        assert!(!s.join("out").exists(), "a refused recovery must write nothing");
+        // `LATEST` of nothing is the backup itself, which is answerable.
+        let rep = restore_until(&arc, &root, &s.join("latest"), Target::Latest).unwrap();
+        assert_eq!(rep.replayed, 0);
+        assert_eq!(rep.rows, 100);
+    }
+
+    /// A recovery target is text an operator types under pressure, so every
+    /// spelling that parses has to mean what it looks like.
+    #[test]
+    fn a_target_parses_to_the_instant_it_names() {
+        // 2026-08-07 14:32:00 UTC, the example in the wave's brief.
+        let base = (crate::types::days_from_civil(2026, 8, 7) * 86_400 + 14 * 3600 + 32 * 60) as u64;
+        assert_eq!(parse_ms("2026-08-07 14:32:00").unwrap(), base * 1000);
+        assert_eq!(parse_ms("2026-08-07 14:32:00.5").unwrap(), base * 1000 + 500);
+        assert_eq!(parse_ms("2026-08-07 14:32:00.007").unwrap(), base * 1000 + 7);
+        // Over-long fractions truncate rather than round: a target that moved
+        // forward by a millisecond could cross a commit.
+        assert_eq!(parse_ms("2026-08-07 14:32:00.0009").unwrap(), base * 1000);
+        assert_eq!(parse_ms(" 2026-08-07T14:32:00 ").unwrap(), base * 1000);
+        assert_eq!(fmt_ms(base * 1000 + 7), "2026-08-07 14:32:00.007");
+        assert_eq!(fmt_ms(base * 1000), "2026-08-07 14:32:00");
+        for bad in ["1969-12-31 23:59:59", "not a time", "2026-13-01 00:00:00", ""] {
+            assert!(parse_ms(bad).is_err(), "{bad}");
+        }
     }
 
     #[test]

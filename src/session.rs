@@ -2102,7 +2102,12 @@ impl Session {
     fn plan_in(&self, q: &crate::sql::ast::Query, ctx: &QueryContext) -> Result<LogicalPlan> {
         let q = self.resolve_subqueries(q, ctx)?;
         let plan = Binder::new(&self.catalog).bind_query(&q)?;
-        optimizer::optimize(plan)
+        // Costed, not plain: the catalog is what makes a join order choosable,
+        // because cardinality is a property of the data and not of the plan.
+        // The mutation call sites below stay on `optimize` deliberately -- they
+        // are single-table by construction and have no order to choose, so they
+        // would pay the estimator for nothing.
+        optimizer::optimize_costed(plan, &self.catalog)
     }
 
     /// Evaluate uncorrelated subqueries and fold them into literals.
@@ -2341,22 +2346,33 @@ impl Session {
             Expr::Interval { value, .. } => self.rewrite_expr(value, budget)?,
             Expr::Literal(_) | Expr::Column(_) | Expr::Wildcard => {}
             // --- the three that actually get folded ---
+            //
+            // `None` means the subquery is *correlated*: it names a column of
+            // the query enclosing it and has no value of its own to fold to.
+            // The node is left exactly where it is and the binder decorrelates
+            // it into a join. Folding stays what it always was -- the
+            // uncorrelated fast path -- and keeps its measured plans.
             Expr::Subquery(q) => {
-                let vals = self.eval_subquery(q, budget, "scalar subquery", 1)?;
-                *e = Expr::Literal(vals.into_iter().next().unwrap_or(Value::Null));
+                if let Some(vals) = self.eval_subquery(q, budget, "scalar subquery", 1)? {
+                    *e = Expr::Literal(vals.into_iter().next().unwrap_or(Value::Null));
+                }
             }
             Expr::InSubquery { expr, subquery, negated } => {
                 self.rewrite_expr(expr, budget)?;
-                let vals = self.eval_subquery(subquery, budget, "IN (SELECT ...)", usize::MAX)?;
-                *e = Expr::InList {
-                    expr: expr.clone(),
-                    list: vals.into_iter().map(Expr::Literal).collect(),
-                    negated: *negated,
-                };
+                if let Some(vals) =
+                    self.eval_subquery(subquery, budget, "IN (SELECT ...)", usize::MAX)?
+                {
+                    *e = Expr::InList {
+                        expr: expr.clone(),
+                        list: vals.into_iter().map(Expr::Literal).collect(),
+                        negated: *negated,
+                    };
+                }
             }
             Expr::Exists { subquery, negated } => {
-                let vals = self.eval_subquery(subquery, budget, "EXISTS", usize::MAX)?;
-                *e = Expr::Literal(Value::Bool(!vals.is_empty() != *negated));
+                if let Some(vals) = self.eval_subquery(subquery, budget, "EXISTS", usize::MAX)? {
+                    *e = Expr::Literal(Value::Bool(!vals.is_empty() != *negated));
+                }
             }
         }
         Ok(())
@@ -2370,7 +2386,7 @@ impl Session {
         budget: &mut Sub<'_>,
         what: &str,
         max_rows: usize,
-    ) -> Result<Vec<Value>> {
+    ) -> Result<Option<Vec<Value>>> {
         if budget.left == 0 {
             return Err(Error::unsupported(format!(
                 "{what}: subquery nesting is too deep"
@@ -2381,14 +2397,17 @@ impl Session {
         // `plan_in`, not `plan`: the outer statement flushed already if it was
         // going to, and a subquery must not be the thing that decides a read
         // needs `&mut`.
-        let plan = self.plan_in(q, budget.ctx).map_err(|e| match e {
-            // A correlated subquery cannot bind on its own, and the resulting
-            // "unknown column" is a confusing way to say so.
-            Error::Bind(m) => Error::unsupported(format!(
-                "{what}: correlated subqueries are not supported ({m})"
-            )),
-            other => other,
-        })?;
+        // A correlated subquery cannot bind on its own: it names a column of
+        // the query around it, which is not in scope out here. That is no
+        // longer an error -- the binder decorrelates it into a join -- so
+        // folding declines and leaves the node alone. A *genuine* bind error
+        // inside the subquery is not lost either: the binder meets it a moment
+        // later, in the scope where it can say what is actually wrong.
+        let plan = match self.plan_in(q, budget.ctx) {
+            Ok(p) => p,
+            Err(Error::Bind(_)) | Err(Error::Storage(_)) => return Ok(None),
+            Err(other) => return Err(other),
+        };
         if plan.schema().len() != 1 {
             return Err(Error::bind(format!(
                 "{what} must select exactly one column, got {}",
@@ -2425,7 +2444,7 @@ impl Session {
                 "{what} returned more than one row, expected at most 1"
             )));
         }
-        Ok(out)
+        Ok(Some(out))
     }
 
     /// The read path, end to end, from `&self`: plan, run, collect.

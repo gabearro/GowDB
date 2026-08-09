@@ -642,16 +642,29 @@ fn bad_subqueries_report_clearly() {
         .unwrap_err();
     assert!(e.to_string().contains("expected at most 1"), "{e}");
 
-    // Correlated subqueries are genuinely unsupported; say so rather than
-    // leaking an unknown-column error.
+    // Correlated subqueries used to be refused outright, and this asserted the
+    // refusal. They decorrelate into joins now, so the equality-correlated form
+    // -- which is nearly all of them in practice -- answers.
+    let ids = col0(
+        &mut s,
+        "SELECT id FROM events e
+         WHERE latency = (SELECT max(latency) FROM events f WHERE f.country = e.country)",
+    );
+    assert!(!ids.is_empty(), "an equality-correlated subquery should answer");
+
+    // What is still refused is a correlation that is not an equality, because
+    // that is the shape with no join key to decorrelate onto. The refusal has
+    // to explain that rather than leak an unknown-column error, since the
+    // difference is "rewrite this" and not "you typed it wrong".
     let e = s
         .query(
             "SELECT id FROM events e
-             WHERE latency = (SELECT max(latency) FROM events f WHERE f.country = e.country)",
+             WHERE latency = (SELECT max(latency) FROM events f WHERE f.country <> e.country)",
         )
         .unwrap_err();
     assert_eq!(e.code(), "NOT_IMPLEMENTED", "{e}");
-    assert!(e.to_string().contains("correlated"), "{e}");
+    assert!(e.to_string().contains("correlate"), "{e}");
+    assert!(e.to_string().contains("equality"), "should name why it cannot: {e}");
 }
 
 #[test]

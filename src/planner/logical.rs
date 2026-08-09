@@ -949,6 +949,378 @@ fn anti(left: LogicalPlan, key: Option<usize>, right: LogicalPlan) -> LogicalPla
     }
 }
 
+// -------------------------------------------------------- correlated subqueries
+
+/// One decorrelated correlation: an expression the **enclosing** query can
+/// compute, and the subquery column it has to equal.
+///
+/// `outer` is bound against the enclosing block's scope and `inner` indexes the
+/// subquery plan's output schema. Everything a decorrelation pass has to decide
+/// is already decided by the time one of these exists: that the correlation was
+/// an equality, that one side reads only outer columns and the other only inner
+/// ones, and that the inner side survived the subquery's own projection.
+pub struct CorrKey {
+    pub outer: BoundExpr,
+    pub inner: usize,
+}
+
+/// Correlated subqueries, as joins.
+///
+/// A correlated subquery is one that names a column of the query enclosing it.
+/// Evaluated literally it is a loop -- run the subquery once per outer row --
+/// which is O(outer x inner) and is the thing this whole section exists to
+/// avoid. **Decorrelation** turns the correlation predicate into a *join key*
+/// and runs the subquery once:
+///
+/// ```text
+///   WHERE EXISTS (SELECT 1 FROM b y WHERE y.k = x.k)
+///     ->  semi-join x to (SELECT DISTINCT k FROM b) on x.k = k
+///
+///   WHERE NOT EXISTS (...)          ->  the same, anti
+///   WHERE v IN     (SELECT w ...)   ->  semi on (v = w AND x.k = k)
+///   WHERE v NOT IN (SELECT w ...)   ->  anti on the same, plus a *grouped*
+///                                       null census (see `in_correlated`)
+///   SELECT (SELECT max(w) ... )     ->  left join to
+///                                       (SELECT k, max(w) FROM b GROUP BY k)
+/// ```
+///
+/// The shapes are the uncorrelated ones with more keys, which is the point of
+/// building them as joins in the first place -- see the long comment above
+/// [`LogicalPlan::in_subquery`], which this section extends rather than
+/// replaces. An **uncorrelated** subquery still goes through that code and gets
+/// exactly the plan it got before: `keys` empty is not a special case here, it
+/// is a different call at the binder.
+///
+/// ## The NULL rules, and which join shape each one falls out of
+///
+///   1. `EXISTS` is never NULL. It is an existence test over a *set*, and a
+///      correlated one is an existence test over the set for one key. Both the
+///      semi- and the anti-join answer it exactly: a NULL key on either side
+///      matches nothing, which is what `y.k = x.k` being UNKNOWN means.
+///   2. A correlated `NOT IN` is NULL for an outer row as soon as **its** group
+///      holds a NULL -- not the whole subquery's, only the rows that share the
+///      correlation key. So the census that settles it has to be grouped by the
+///      correlation keys too, and joined on them. The uncorrelated census is
+///      the same aggregate with an empty group list, which is why one cross
+///      join becomes one left join and nothing else changes.
+///   3. An outer row whose group is **empty** makes `NOT IN` TRUE, vacuously
+///      and even for a NULL probe. After a left join to the census that row has
+///      a NULL `rows`, so `rows IS NULL` is exactly "the group is empty" and is
+///      the correlated spelling of the uncorrelated `rows = 0`.
+///   4. A correlated scalar subquery over an empty group is **NULL**, which is
+///      what the left join produces on its own -- except for an aggregate whose
+///      value over no rows is not NULL (`count()` is 0), which is the classic
+///      "count bug". [`LogicalPlan::scalar_correlated`] takes that value from
+///      the accumulator itself rather than a table of special cases, so it
+///      cannot drift from what the executor computes.
+///   5. A scalar subquery returning **more than one row** for a key has no
+///      defined value. The binder refuses that shape rather than picking a row;
+///      see `scalar_subquery` there for why it is a refusal and not a runtime
+///      raise.
+///
+/// ## Measured
+///
+/// The claim is asymptotic, so it is measured at three sizes rather than one.
+/// `n` x `n` rows, half the left keys matching, A/B interleaved against the
+/// same query written by hand as a join, best of 5 per side:
+///
+/// ```text
+///   n         EXISTS    hand join   ratio    NOT EXISTS   scalar (count>0)
+///    25 000    1.907 ms   1.888 ms  1.01x      2.050 ms      2.177 ms
+///   100 000    7.495 ms   7.434 ms  1.01x      8.119 ms      7.970 ms
+///   400 000   31.709 ms  30.557 ms  1.04x     33.855 ms     31.898 ms
+/// ```
+///
+/// 3.93x then 4.23x for 4x the rows on both sides -- linear, and within 4% of
+/// the hand-written join at every size, which is the number that matters
+/// because the join is the floor. The loop this replaces, measured as `n` point
+/// queries against the same table, is 7.9 / 17.1 / 41.1 ms at n = 1 000 /
+/// 2 000 / 4 000: 2.2x then 2.4x per *doubling*, already 5x slower at n = 4 000
+/// than the decorrelated form is at n = 25 000.
+///
+/// **The uncorrelated case is not routed through any of this**, and that is a
+/// call site rather than a branch: `binder::membership` builds the old plan
+/// when the subquery reported no correlations, so the numbers above
+/// [`LogicalPlan::in_subquery`] still describe exactly what runs. Measured
+/// anyway, because the *binder* did change under it -- `Demand` now walks into
+/// a subquery to find correlated names, which can widen the outer scan when an
+/// inner name happens to match an outer column. The worst case that could
+/// build (a 300k-row outer with a fat `String` column whose name the subquery
+/// also uses) came out at 27.3 ms against the baseline's 26.8, one round inside
+/// this machine's noise, because `prune_projections` narrows the scan straight
+/// back down. Recorded so the widening is not re-litigated.
+impl LogicalPlan {
+    /// `EXISTS (sub)` / `NOT EXISTS (sub)`, correlated on `keys`.
+    ///
+    /// `exports` are further subquery columns to keep visible in the output --
+    /// correlations to a *grandparent* query, which this level cannot resolve
+    /// and has to hand outwards. Their positions in the joined schema come
+    /// back with the plan. `negated` forbids them: an anti-join keeps exactly
+    /// the rows where the right side is all NULL, so there is nothing to hand
+    /// out, and the binder refuses that combination before calling.
+    pub fn exists_correlated(
+        left: LogicalPlan,
+        keys: Vec<CorrKey>,
+        exports: &[usize],
+        sub: LogicalPlan,
+        negated: bool,
+    ) -> (LogicalPlan, Vec<usize>) {
+        let (left, on, right) = corr_join_inputs(left, keys, exports, sub, &[]);
+        let n = left.schema().len();
+        let nk = on.len();
+        if negated {
+            let joined = append_join(left, right, on, JoinOp::Left);
+            // The mark is the right's first key column: a matched row copied it
+            // from the left, where a NULL would not have matched at all.
+            let mark = BoundExpr::IsNull { expr: Box::new(col_at(&joined, n)), negated: false };
+            (LogicalPlan::Filter { predicate: mark, input: Box::new(joined) }, Vec::new())
+        } else {
+            let joined = append_join(left, right, on, JoinOp::Inner);
+            (joined, (0..exports.len()).map(|j| n + nk + j).collect())
+        }
+    }
+
+    /// `probe IN (sub)` / `probe NOT IN (sub)`, correlated on `keys`.
+    ///
+    /// Column 0 of `sub` is the value being matched. `census` is a **second
+    /// binding** of the same subquery, required for the negated case exactly
+    /// when [`needs_null_census`] says so, and ignored otherwise -- same
+    /// contract as [`LogicalPlan::in_subquery`]'s `sub_nulls`.
+    pub fn in_correlated(
+        left: LogicalPlan,
+        probe: BoundExpr,
+        keys: Vec<CorrKey>,
+        exports: &[usize],
+        sub: LogicalPlan,
+        census: Option<LogicalPlan>,
+        negated: bool,
+    ) -> Result<(LogicalPlan, Vec<usize>)> {
+        let sub_ty = sub.schema().fields()[0].ty.clone();
+        let probe_ty = probe.ty();
+        DataType::promote(&probe_ty, &sub_ty)?;
+
+        // The census needs the correlation keys as *its* group list, and it is
+        // a different plan object, so the key columns are read off `keys`
+        // before they are consumed.
+        let key_cols: Vec<usize> = keys.iter().map(|k| k.inner).collect();
+        let outers: Vec<BoundExpr> = keys.iter().map(|k| k.outer.clone()).collect();
+
+        // Value first, then the join keys: `on` names the value pair and the
+        // key pairs together, and the anti-join's mark is the value column for
+        // the same reason it is in the uncorrelated case -- a NULL there cannot
+        // have matched.
+        let nk = keys.len();
+        let (left, mut on, right) = corr_join_inputs(left, keys, exports, sub, &[0]);
+        // `keyed` may append a column, but the `Project` it inserts passes
+        // `0..n` through unchanged, so the key indices just computed still hold.
+        let (left, p) = keyed(left, probe);
+        on.insert(0, (p, 0));
+
+        if !negated {
+            let n = left.schema().len();
+            let joined = append_join(left, right, on, JoinOp::Inner);
+            let at = (0..exports.len()).map(|j| n + 1 + nk + j).collect();
+            return Ok((joined, at));
+        }
+        let w = left.schema().len();
+        let joined = append_join(left, right, on, JoinOp::Left);
+        let mark = BoundExpr::IsNull { expr: Box::new(col_at(&joined, w)), negated: false };
+        let anti = LogicalPlan::Filter { predicate: mark, input: Box::new(joined) };
+        // Nothing is handed outwards from an anti-join, and the binder refuses
+        // that combination before it gets here.
+        match census {
+            Some(c) => {
+                let key = col_at(&anti, p);
+                let guarded =
+                    grouped_census(anti, key, &outers, c, &key_cols, &probe_ty, &sub_ty)?;
+                Ok((guarded, Vec::new()))
+            }
+            None => Ok((anti, Vec::new())),
+        }
+    }
+
+    /// A scalar subquery as a left join, plus the expression that reads its
+    /// value out of the joined row.
+    ///
+    /// Column 0 of `sub` is the value; `keys` correlate it. `empty` is what the
+    /// subquery's select list evaluates to over **no rows**, which is what an
+    /// outer row with no matching group must see: NULL for every aggregate but
+    /// `count`, and the reason the caller computes it from a real accumulator.
+    /// It costs nothing when it is NULL, because that is what the left join
+    /// already pads with.
+    pub fn scalar_correlated(
+        left: LogicalPlan,
+        keys: Vec<CorrKey>,
+        sub: LogicalPlan,
+        empty: BoundExpr,
+    ) -> (LogicalPlan, BoundExpr) {
+        let first_key = keys.first().map(|k| k.inner);
+        let probes: Vec<BoundExpr> = keys.iter().map(|k| k.outer.clone()).collect();
+        let (left, lk) = keyed_many(left, probes);
+        let n = left.schema().len();
+        let on: Vec<(usize, usize)> =
+            lk.iter().zip(keys.iter()).map(|(&l, k)| (l, k.inner)).collect();
+        // No keys is the uncorrelated case, and a `GROUP BY`-less aggregate
+        // emits exactly one row however empty its input, so the cross join
+        // preserves the outer cardinality and `empty` can never fire.
+        let op = if first_key.is_none() { JoinOp::Cross } else { JoinOp::Left };
+        let joined = append_join(left, sub, on, op);
+        let value = col_at(&joined, n);
+        let is_null = |e: BoundExpr| BoundExpr::IsNull { expr: Box::new(e), negated: false };
+        let value = match (first_key, empty.as_literal()) {
+            (None, _) | (_, Some(Value::Null)) => value,
+            (Some(k), _) => {
+                // The mark is the right's first correlation key, NULL for
+                // exactly the outer rows that found no group -- the same trick
+                // the anti-join uses, and it needs no column of its own.
+                let mark = col_at(&joined, n + k);
+                let ty = DataType::promote(&value.ty(), &empty.ty())
+                    .unwrap_or_else(|_| value.ty())
+                    .to_nullable();
+                BoundExpr::Case {
+                    when_then: vec![(is_null(mark), empty)],
+                    else_result: Some(Box::new(value)),
+                    ty,
+                }
+            }
+        };
+        (joined, value)
+    }
+}
+
+/// The three things every decorrelated join needs: a left that can name each
+/// correlation key as a column, the `on` pairs, and a right narrowed to the
+/// columns the join and its callers use.
+///
+/// `lead` are subquery columns that must come *before* the keys in the right's
+/// projection -- the matched value for `IN`, nothing for `EXISTS`.
+fn corr_join_inputs(
+    left: LogicalPlan,
+    keys: Vec<CorrKey>,
+    exports: &[usize],
+    sub: LogicalPlan,
+    lead: &[usize],
+) -> (LogicalPlan, Vec<(usize, usize)>, LogicalPlan) {
+    let mut cols: Vec<usize> = lead.to_vec();
+    cols.extend(keys.iter().map(|k| k.inner));
+    cols.extend_from_slice(exports);
+    let right = narrow(sub, &cols);
+    let probes: Vec<BoundExpr> = keys.into_iter().map(|k| k.outer).collect();
+    let (left, lk) = keyed_many(left, probes);
+    let base = lead.len();
+    let on = lk.iter().enumerate().map(|(j, &l)| (l, base + j)).collect();
+    (left, on, right)
+}
+
+/// `sub` projected to `cols`, deduplicated.
+///
+/// The `Distinct` is what the uncorrelated semi-join needs and for the same
+/// reason -- an inner join multiplies a left row by its number of matches, and
+/// existence is not a count. Narrowing first is what makes it cheap: the key
+/// tuple is the only thing the join reads, so deduplication runs over the
+/// correlation's *distinct* pairs rather than over whole subquery rows.
+fn narrow(sub: LogicalPlan, cols: &[usize]) -> LogicalPlan {
+    let exprs: Vec<BoundExpr> = cols.iter().map(|&i| col_at(&sub, i)).collect();
+    let schema =
+        Schema::new_unchecked(cols.iter().map(|&i| sub.schema().fields()[i].clone()).collect());
+    distinct(LogicalPlan::Project { input: Box::new(sub), exprs, schema })
+}
+
+/// [`keyed`] for several probes at once, with the common case -- every probe
+/// already a column, which is what `y.k = x.k` binds to -- costing no node.
+fn keyed_many(left: LogicalPlan, probes: Vec<BoundExpr>) -> (LogicalPlan, Vec<usize>) {
+    if probes.iter().all(|p| p.as_column().is_some()) {
+        let idx = probes.iter().filter_map(|p| p.as_column()).collect();
+        return (left, idx);
+    }
+    let n = left.schema().len();
+    let mut exprs: Vec<BoundExpr> = (0..n).map(|i| col_at(&left, i)).collect();
+    let mut fields = left.schema().fields().to_vec();
+    let mut idx = Vec::with_capacity(probes.len());
+    for p in probes {
+        match p.as_column() {
+            Some(i) => idx.push(i),
+            None => {
+                idx.push(exprs.len());
+                fields.push(Field::new("corr", p.ty()));
+                exprs.push(p);
+            }
+        }
+    }
+    let schema = Schema::new_unchecked(fields);
+    (LogicalPlan::Project { input: Box::new(left), exprs, schema }, idx)
+}
+
+/// Cases 2 and 3 of the NULL rules, per correlation key: `[count(), count(y)]`
+/// grouped by the correlation keys, **left** joined on, then tested.
+///
+/// The left join is the whole difference from the uncorrelated
+/// [`census_guard`]: there the census is one row and a cross join always finds
+/// it, here a key with no rows in the subquery has no census row at all, and
+/// the NULL the left join pads with *is* the "empty group" fact.
+fn grouped_census(
+    left: LogicalPlan,
+    key: BoundExpr,
+    outers: &[BoundExpr],
+    sub: LogicalPlan,
+    key_cols: &[usize],
+    probe_ty: &DataType,
+    sub_ty: &DataType,
+) -> Result<LogicalPlan> {
+    let func = aggregate("count").expect("`count` is a registry builtin");
+    let y = col_at(&sub, 0);
+    let agg = |args: Vec<BoundExpr>, name: &str| -> Result<BoundAgg> {
+        let tys: Vec<DataType> = args.iter().map(|a| a.ty()).collect();
+        Ok(BoundAgg {
+            func,
+            ty: (func.ret)(&tys, &[])?,
+            args,
+            params: Vec::new(),
+            distinct: false,
+            name: name.into(),
+        })
+    };
+    let group: Vec<BoundExpr> = key_cols.iter().map(|&i| col_at(&sub, i)).collect();
+    let aggs = vec![agg(Vec::new(), "rows")?, agg(vec![y], "nonnull")?];
+    let mut fields: Vec<Field> = key_cols
+        .iter()
+        .map(|&i| Field::new(format!("g{i}"), sub.schema().fields()[i].ty.clone()))
+        .collect();
+    fields.extend(aggs.iter().map(|a| Field::new(a.name.clone(), a.ty.clone())));
+    let schema = Schema::new_unchecked(fields);
+    let census = LogicalPlan::Aggregate { input: Box::new(sub), group, aggs, schema };
+
+    let (left, lk) = keyed_many(left, outers.to_vec());
+    let n = left.schema().len();
+    let on = lk.iter().enumerate().map(|(j, &l)| (l, j)).collect();
+    let joined = append_join(left, census, on, JoinOp::Left);
+    let g = outers.len();
+    let (rows, nonnull) = (col_at(&joined, n + g), col_at(&joined, n + g + 1));
+    let cmp = |l: BoundExpr, op: BinaryOp, r: BoundExpr| BoundExpr::Binary {
+        left: Box::new(l),
+        op,
+        right: Box::new(r),
+        ty: DataType::Bool,
+    };
+    let empty =
+        |e: &BoundExpr| BoundExpr::IsNull { expr: Box::new(e.clone()), negated: false };
+    let mut conj = Vec::new();
+    if sub_ty.is_nullable() {
+        conj.push(cmp(empty(&rows), BinaryOp::Or, cmp(rows.clone(), BinaryOp::Eq, nonnull)));
+    }
+    if probe_ty.is_nullable() {
+        conj.push(cmp(
+            BoundExpr::IsNull { expr: Box::new(key), negated: true },
+            BinaryOp::Or,
+            empty(&rows),
+        ));
+    }
+    Ok(match BoundExpr::join_conjuncts(conj) {
+        Some(predicate) => LogicalPlan::Filter { input: Box::new(joined), predicate },
+        None => joined,
+    })
+}
+
 // --------------------------------------------------------------- mutations
 
 /// What a [`MutationPlan`] does with the rows its source selects.

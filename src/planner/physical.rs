@@ -277,14 +277,33 @@
 //! task's file. The tests in `tests/plan_access_paths.rs` assert the absence
 //! instead.
 //!
-//! ## What this is deliberately *not*
+//! ## Where the cost model is, and why it is not here
 //!
-//! Not a cost model. There are no statistics beyond "how many live rows does
-//! this table have", no cardinality estimates and no plan search. The one
-//! number that could be called a cost --
-//! [`SCAN_ROWS_PER_PROBE`] -- is a measured constant with the measurement
-//! written next to it. A real cost model is a later, separate piece of work;
-//! what matters here is that there is now somewhere for it to go.
+//! This file used to say "not a cost model, and a real one is later, separate
+//! work". The later work happened: statistics and cardinality estimation live
+//! in [`crate::planner::optimizer::stats`], and the plan search that uses them
+//! -- join reordering -- is a pass in `optimizer.rs`.
+//!
+//! It is one level up rather than in here, and the **Borrowing** section below
+//! is the reason. Reordering a join tree produces intermediate schemas and
+//! `ON` column pairs that exist nowhere in the input plan, and a
+//! `PhysicalPlan<'a>` can only point at things the `&'a LogicalPlan` already
+//! contains. So a search that changes the *shape* of a plan has to run while
+//! the plan is still owned, which is the logical optimizer; what is left here
+//! is the choice of access path for a shape already settled, and none of those
+//! choices need a cardinality estimate:
+//!
+//!   * [`index_path`] fires on a predicate the key index can answer exactly.
+//!     Rows do not enter into it -- one probe beats any scan;
+//!   * [`meta_path`] answers from headers or does not answer at all;
+//!   * `read_in_order` removes a sort that was reproducing its input's order;
+//!   * [`exchange::degree`] is the one decision here that reads a row count,
+//!     and it reads the exact one out of part metadata rather than an estimate.
+//!
+//! The measured constants that look like costs --
+//! [`SCAN_ROWS_PER_PROBE`] here, `JOIN_ROWS_PER_PROBE` in
+//! `exec::operators::join` -- stay measured constants. `stats.rs` says why it
+//! does not price the strategy the second one guards.
 //!
 //! ## Borrowing
 //!

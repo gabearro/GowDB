@@ -138,6 +138,96 @@
 //! a multi-table transaction skips all of it and truncates to a bare header,
 //! as before.
 //!
+//! ## Ticks: when a record became a fact
+//!
+//! A byte offset says where a record is, not *when* it happened, and a
+//! point-in-time recovery has to answer both. So [`Wal::sync`] -- the call
+//! that turns appended bytes into acknowledged ones -- first appends a
+//! [`TAG_TICK`] carrying two numbers: the wall clock, and a **recovery LSN**
+//! taken from a process-wide counter.
+//!
+//! The placement is the whole design. A record's timestamp is the *first tick
+//! at or after it*, which is exactly the instant it became durable; records
+//! with no tick behind them were never acknowledged and a recovery must not
+//! resurrect them. That makes every recovery cut land on a tick boundary, and
+//! a cut on a tick boundary is a state the database really was in.
+//!
+//! The cost is one clock read and one 16-byte record per `fsync`, not per
+//! record: a tick is emitted only when something has been appended since the
+//! last one, so group commit -- several statements behind one `fsync` -- gets
+//! one tick for the group, which is the correct granularity anyway.
+//!
+//! Measured through the CLI against a git-worktree build of the pre-archiving
+//! engine, A/B interleaved, best-of-13 per side: 400 autocommit `INSERT`s
+//! 230.8 -> 228.4 stmt/s, 300 single-table transactions 212.7 -> 211.4 txn/s,
+//! 200 three-table transactions 53.0 -> 50.7 txn/s. An A/A run of the same
+//! harness -- the *same* binary on both sides -- spreads 0.5%, so those are at
+//! the floor. Isolated directly with a temporary switch that skipped the tick
+//! and nothing else: 233.2 stmt/s with, 232.1 without, i.e. free. It is the
+//! same `fsync` either way; only 16 more bytes go into it.
+//!
+//! The recovery LSN is *global* and the byte LSN is per log, deliberately.
+//! Logs are per table, so a byte offset cannot order a write to `a` against a
+//! write to `b`, and "restore the database to this point" is a statement about
+//! every table at once. One counter, bumped under the writer serialization
+//! that already exists, gives every table's cut the same meaning. It is
+//! resumed at [`Wal::open`] from the highest tick in the file (and, for a log
+//! a checkpoint has already emptied, from the newest archived segment), so it
+//! never repeats a number across a restart.
+//!
+//! ## WAL archiving: the log between two backups
+//!
+//! A checkpoint folds the log into parts and recycles it, which is why a
+//! backup could only ever be restored to the instant it was taken. Archiving
+//! keeps those bytes: [`Wal::truncate`] **hard-links** the log into
+//! `<root>/.wal-archive/<db>/<table>/` before publishing a fresh one.
+//!
+//! A link, not a copy: the segment is the same inode, so archiving a 200 MB
+//! log costs one `link` and one `fsync` of a directory rather than 200 MB of
+//! I/O, and it cannot half-succeed. That is also why the fresh log is
+//! published by *rename* rather than by `set_len(0)` as it used to be --
+//! truncating in place would truncate the archived segment with it, since they
+//! are the same file.
+//!
+//! Nothing on the write path changed: archiving happens at a checkpoint, and a
+//! checkpoint is not a commit. What it does cost is three more `fsync`-class
+//! operations at a checkpoint that has something to archive -- the seal's
+//! bytes, the archive directory's entry, and the table directory's entry now
+//! that the fresh log arrives by rename rather than by `set_len(0)`. Measured
+//! at 40.0 -> 53.8 ms for a one-statement CLI invocation, which is one write
+//! and one checkpoint; an invocation that writes 400 rows pays the same 14 ms
+//! once, which is why the throughput numbers above do not move. A read-only
+//! invocation pays nothing (10.36 -> 10.6 ms, noise): its log is empty, so no
+//! checkpoint retires one.
+//!
+//! Getting there took removing two things a first cut had: a seal read per
+//! segment per checkpoint (`prune` and the position allocator each walked
+//! every seal -- 38 ms at 40 segments, growing), and an `fsync` of the log
+//! before the link, which is only needed when this checkpoint actually
+//! appended a tick.
+//!
+//! A segment is named for the **stream position** it starts at -- the
+//! cumulative byte count of every segment before it -- so the seals alone
+//! prove the archive has no hole: segment *n+1* must start exactly where
+//! segment *n* ends.
+//!
+//! The `.gseal` sidecar beside each one is what makes it a segment, and it is
+//! written *after* the link. So the archive is exactly its sealed segments,
+//! and joining it is a single rename: a crash between the link and the seal
+//! leaves a `.gwal` that is not part of anything, and the records it holds are
+//! still in the log the interrupted checkpoint never got round to replacing.
+//! The next checkpoint discards that link and archives the log as it now
+//! stands, which is a superset of it. There is deliberately no state in which
+//! a recovery can read a segment that is shorter than it claims -- a seal that
+//! disagrees with its segment's length is reported rather than followed.
+//!
+//! Retention is a byte budget ([`set_archive_retention`], reached from SQL by
+//! `SET wal_archive_retention`), because an archive that grows without bound
+//! is how this feature becomes an outage. Pruning drops whole segments,
+//! oldest first, and records what it dropped in a `HORIZON` file -- so a
+//! recovery that would have needed them refuses and names the range instead of
+//! quietly replaying across the hole.
+//!
 //! ## What replay does not do
 //!
 //! Nothing here interprets records. `replay` hands back `Insert`/`Delete` in
@@ -149,6 +239,8 @@
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::common::{Error, Result};
 use crate::types::{Block, Schema};
@@ -173,6 +265,10 @@ const TAG_DECIDE: u8 = 5;
 /// decisions. Without it the counter would restart at zero and a fresh
 /// transaction could mint the number a surviving prepare still cites.
 const TAG_FENCE: u8 = 6;
+/// Recovery LSN and wall clock, written by [`Wal::sync`] in front of the
+/// `fsync` that makes the records behind it facts. Body: the LSN, then
+/// milliseconds since the epoch. See the module docs.
+const TAG_TICK: u8 = 7;
 
 /// Set on an `INSERT`/`DELETE` tag to mark the record staged: durable, but not
 /// part of the log's history until a [`TAG_COMMIT`] -- or a [`TAG_DECIDE`], or
@@ -187,6 +283,127 @@ const STAGED: u8 = 0x80;
 /// Delete records framed into one buffer before it is handed to `write`.
 /// See [`Wal::put_deletes`] for why it is a chunk rather than the batch.
 const DELETE_BATCH: usize = 8192;
+
+// --------------------------------------------------------------- the archive
+
+/// Where archived segments live, under the data root.
+///
+/// Dot-prefixed for the same reason [`store::atomic_write`]'s temp files are:
+/// [`store::is_safe_name`] refuses a leading dot, so no `CREATE DATABASE` can
+/// ever collide with it and no checkpoint can mistake it for one.
+pub const ARCHIVE_DIR: &str = ".wal-archive";
+
+/// One archived segment: a hard link to the log a checkpoint retired.
+const SEG_EXT: &str = "gwal";
+/// The sidecar naming what that segment spans. Written *after* the link, so a
+/// segment without one is a crash caught mid-archive.
+const SEAL_EXT: &str = "gseal";
+/// Records what retention has thrown away, so a recovery that needed it can
+/// refuse instead of replaying across the hole.
+const HORIZON_FILE: &str = "HORIZON";
+
+/// Bytes of archived log kept per table before the oldest segments are
+/// dropped.
+///
+/// 64 MiB is about 3.5 million logged deletes, or the log of a fairly busy
+/// day for an embedded workload -- enough to cover the window between two
+/// backups, small enough that nobody notices it under their data directory.
+/// The alternative default, *off*, was rejected: point-in-time recovery you
+/// have to have switched on before the incident is point-in-time recovery you
+/// do not have when it happens.
+pub const DEFAULT_ARCHIVE_BYTES: u64 = 64 << 20;
+
+/// The live retention budget. 0 disables archiving entirely.
+///
+/// Process-global rather than per-session, which is the opposite of how
+/// [`crate::settings`] holds everything else, and deliberately: retention
+/// describes a *directory*, not a connection, and two sessions with different
+/// retentions on one data directory would each be wrong about what the archive
+/// contains. There is one writer per directory (the `LOCK` file sees to that),
+/// so there is one answer.
+static ARCHIVE_BYTES: AtomicU64 = AtomicU64::new(DEFAULT_ARCHIVE_BYTES);
+
+/// The next recovery LSN. Never zero, so zero is free to mean "no tick".
+static NEXT_COMMIT: AtomicU64 = AtomicU64::new(1);
+
+pub fn set_archive_retention(bytes: u64) {
+    ARCHIVE_BYTES.store(bytes, Ordering::Relaxed);
+}
+
+pub fn archive_retention() -> u64 {
+    ARCHIVE_BYTES.load(Ordering::Relaxed)
+}
+
+/// The recovery LSN the next `fsync` will stamp.
+///
+/// Every record acknowledged so far carries a strictly smaller one, which is
+/// what makes this the exact boundary between "already in the backup being
+/// taken" and "must be replayed on top of it" -- see
+/// [`crate::backup::write_archive`].
+pub fn commit_seq() -> u64 {
+    NEXT_COMMIT.load(Ordering::Acquire)
+}
+
+/// Resume the counter past `seq`, which some log or segment already used.
+fn observe_commit(seq: u64) {
+    if seq != 0 {
+        NEXT_COMMIT.fetch_max(seq + 1, Ordering::AcqRel);
+    }
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64)
+}
+
+/// The recovery LSNs and wall-clock times a log -- or an archived segment --
+/// spans. All zero means "nothing was ever acknowledged from it".
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Span {
+    pub first_seq: u64,
+    pub last_seq: u64,
+    pub first_ms: u64,
+    pub last_ms: u64,
+}
+
+impl Span {
+    fn observe(&mut self, seq: u64, ms: u64) {
+        if self.last_seq == 0 {
+            self.first_seq = seq;
+            self.first_ms = ms;
+        }
+        self.last_seq = seq;
+        self.last_ms = ms;
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.last_seq == 0
+    }
+}
+
+/// Where a point-in-time recovery stops.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Target {
+    /// Everything the archive holds.
+    Latest,
+    /// Up to and including this recovery LSN.
+    Lsn(u64),
+    /// Up to and including this instant, in milliseconds since the epoch.
+    Time(u64),
+}
+
+impl Target {
+    /// Does a tick stamped `(seq, ms)` fall at or before the target?
+    ///
+    /// Both axes are monotone in the log, so the first tick that answers `no`
+    /// ends the replay and nothing after it need be read.
+    fn keeps(self, seq: u64, ms: u64) -> bool {
+        match self {
+            Target::Latest => true,
+            Target::Lsn(n) => seq <= n,
+            Target::Time(t) => ms <= t,
+        }
+    }
+}
 
 /// One logged mutation.
 #[derive(Clone, Debug, PartialEq)]
@@ -209,6 +426,29 @@ enum Entry<'a> {
     /// open-time scan straight off the frame; by the time `replay` sees one
     /// there is nothing left in it to do.
     Fence,
+    /// A durability stamp. Bookkeeping to `replay` -- which only has to keep
+    /// the recovery LSN counter from reissuing the number -- and the whole
+    /// index to a point-in-time recovery, which reads it off the frame.
+    Tick(u64),
+}
+
+/// What the open-time scan learned about a log file. See [`Wal::scan`].
+#[derive(Clone, Copy, Default)]
+struct Scanned {
+    /// End offset of the last structurally intact record.
+    good: u64,
+    /// First staging sequence number free to hand out.
+    next_seq: u64,
+    /// The file holds a [`TAG_DECIDE`] another log may cite.
+    decides: bool,
+    /// The file holds at least one `Insert` or `Delete`.
+    mutations: bool,
+    /// The file ends in records behind its last tick -- an append a crash
+    /// caught before its `fsync`. Replay applies those records like any other
+    /// (a plain append is part of the log's history the instant it is framed),
+    /// so a recovery has to be able to place them in time too.
+    dirty: bool,
+    span: Span,
 }
 
 pub struct Wal {
@@ -225,6 +465,17 @@ pub struct Wal {
     /// a multi-table transaction -- which is every log in a workload that
     /// never opens one -- answers `false` without reading a byte.
     decides: bool,
+    /// Whether the file holds anything a recovery would replay. Tracked as it
+    /// is written rather than rediscovered, so [`Wal::archive`] can skip a log
+    /// made only of bookkeeping without reading it back.
+    mutations: bool,
+    /// The ticks this generation of the file covers, for the segment's seal.
+    span: Span,
+    /// Records behind the last tick. What keeps [`Wal::sync`] from growing the
+    /// log every time it is called on an idle table -- and, resumed by the
+    /// open-time scan, what tells [`Wal::archive`] that the file it is about
+    /// to retire ends in records no tick covers.
+    dirty: bool,
 }
 
 impl Wal {
@@ -247,8 +498,7 @@ impl Wal {
             .map_err(|e| store::io_err("stat", path, e))?
             .len();
 
-        let mut next_seq = 0u64;
-        let mut decides = false;
+        let mut scanned = Scanned::default();
         if len < format::HEADER_LEN as u64 {
             file.set_len(0).map_err(|e| store::io_err("truncate", path, e))?;
             write_header(&mut file, path)?;
@@ -266,18 +516,34 @@ impl Wal {
             // next replay would stop before it and silently lose an
             // acknowledged write. Find the last intact boundary and discard
             // everything after it, so the log is append-clean again.
-            let (good, seen, cited) = Self::scan(&buf).map_err(|e| store::prefix(path, e))?;
-            next_seq = seen;
-            decides = cited;
-            if good < len {
-                file.set_len(good)
+            scanned = Self::scan(&buf).map_err(|e| store::prefix(path, e))?;
+            if scanned.good < len {
+                file.set_len(scanned.good)
                     .map_err(|e| store::io_err("truncate the torn tail of", path, e))?;
                 file.sync_all().map_err(|e| store::io_err("sync", path, e))?;
                 store::sync_dir(dir)?;
-                len = good;
+                len = scanned.good;
             }
         }
-        Ok(Wal { file, path: path.to_path_buf(), len, next_seq, decides })
+        // A recovery LSN is only unique if it is never handed out twice, and a
+        // checkpoint empties the log that would otherwise remember the last
+        // one -- so a log with no tick of its own resumes from the newest
+        // segment it archived. One small read, once per table per open, and
+        // only for a log a checkpoint has already emptied.
+        observe_commit(match scanned.span.last_seq {
+            0 => archive_dir_for(path).map_or(0, |d| newest_seal(&d).map_or(0, |s| s.last_seq)),
+            seq => seq,
+        });
+        Ok(Wal {
+            file,
+            path: path.to_path_buf(),
+            len,
+            next_seq: scanned.next_seq,
+            decides: scanned.decides,
+            mutations: scanned.mutations,
+            span: scanned.span,
+            dirty: scanned.dirty,
+        })
     }
 
     /// Log an insert. Not durable until [`Wal::sync`]. Returns its LSN.
@@ -442,6 +708,7 @@ impl Wal {
         let mut body = Writer::with_capacity(block.bytes() + 64);
         put_tag(&mut body, TAG_INSERT, seq);
         super::writer::put_block(&mut body, block);
+        self.mutations = true;
         self.append(&body.finish())
     }
 
@@ -455,6 +722,7 @@ impl Wal {
         if lanes.is_empty() {
             return Ok(self.len);
         }
+        self.mutations = true;
         let lsn = self.len;
         let mut head = Writer::with_capacity(16);
         put_tag(&mut head, TAG_DELETE, seq);
@@ -505,14 +773,44 @@ impl Wal {
             .write_all(bytes)
             .map_err(|e| store::io_err("append to", &self.path, e))?;
         self.len += bytes.len() as u64;
+        self.dirty = true;
         Ok(lsn)
     }
 
-    /// Make every appended record durable.
+    /// Make every appended record durable, and stamp it.
+    ///
+    /// The tick goes in *before* the `fsync`, so it is durable with exactly
+    /// the records it covers -- a record whose tick did not make it was never
+    /// acknowledged, and a point-in-time recovery must not resurrect it. See
+    /// the module docs for why this is the right granularity and why it costs
+    /// one clock read per `fsync` rather than one per record.
+    ///
+    /// A `sync` with nothing appended behind it writes nothing: an idle table
+    /// that is `sync`ed in a loop does not grow a log.
     pub fn sync(&mut self) -> Result<()> {
+        if self.dirty {
+            self.tick()?;
+        }
         self.file
             .sync_all()
             .map_err(|e| store::io_err("fsync", &self.path, e))
+    }
+
+    fn tick(&mut self) -> Result<()> {
+        let seq = NEXT_COMMIT.fetch_add(1, Ordering::AcqRel);
+        // Non-decreasing per log even if the system clock steps backwards: a
+        // recovery navigates this column with a binary decision per tick, and
+        // a column that goes backwards would make the cut ambiguous. The
+        // recovery LSN beside it is exact regardless.
+        let ms = now_ms().max(self.span.last_ms);
+        let mut body = Writer::with_capacity(24);
+        body.u8(TAG_TICK);
+        body.varint(seq);
+        body.varint(ms);
+        self.append(&body.finish())?;
+        self.span.observe(seq, ms);
+        self.dirty = false;
+        Ok(())
     }
 
     /// Discard every record, durably, keeping the file (and its header) in
@@ -535,30 +833,30 @@ impl Wal {
         } else {
             Vec::new()
         };
-        if carry.is_empty() {
-            self.file
-                .set_len(0)
-                .map_err(|e| store::io_err("truncate", &self.path, e))?;
-            write_header(&mut self.file, &self.path)?;
-            self.len = format::HEADER_LEN as u64;
-            self.decides = false;
-            return Ok(());
-        }
-        // Rebuilt through a rename, not by emptying the file and writing the
-        // decisions back into it. The intermediate state of the second one --
-        // a log that has been emptied and whose decisions are not durable yet
-        // -- is a log that says "aborted" about transactions that committed,
-        // and a power cut in that window would silently drop them from every
-        // *other* table. A rename cannot be observed half-done.
+        // Before a byte of the replacement exists: once the fresh log is
+        // published these bytes are unreachable, and the archive is the only
+        // thing that will still have them.
+        self.archive()?;
+
+        // Rebuilt through a rename, never by emptying the file in place. Two
+        // reasons, and either alone would be enough. The archived segment is a
+        // *hard link* to this inode, so `set_len(0)` would empty the archive
+        // with the log. And the intermediate state of an in-place rebuild -- a
+        // log that has been emptied and whose carried decisions are not
+        // durable yet -- is a log that says "aborted" about transactions that
+        // committed, so a power cut in that window would silently drop them
+        // from every *other* table. A rename cannot be observed half-done.
         let mut w = Writer::with_capacity(format::HEADER_LEN + 16 * (carry.len() + 1));
         format::write_header(&mut w);
-        for (tag, v) in std::iter::once((TAG_FENCE, self.next_seq))
-            .chain(carry.iter().map(|&s| (TAG_DECIDE, s)))
-        {
-            let mut body = Writer::with_capacity(11);
-            body.u8(tag);
-            body.varint(v);
-            format::write_framed(&mut w, body.as_slice());
+        if !carry.is_empty() {
+            for (tag, v) in std::iter::once((TAG_FENCE, self.next_seq))
+                .chain(carry.iter().map(|&s| (TAG_DECIDE, s)))
+            {
+                let mut body = Writer::with_capacity(11);
+                body.u8(tag);
+                body.varint(v);
+                format::write_framed(&mut w, body.as_slice());
+            }
         }
         let bytes = w.finish();
         store::atomic_write(&self.path, &bytes)?;
@@ -570,7 +868,124 @@ impl Wal {
             .open(&self.path)
             .map_err(|e| store::io_err("reopen", &self.path, e))?;
         self.len = bytes.len() as u64;
+        self.decides = !carry.is_empty();
+        self.mutations = false;
+        self.dirty = false;
+        // The tick column is per generation, but the *clock* is not: keeping
+        // `last_ms` stops a new segment's first tick reading earlier than the
+        // one before it if the system clock has moved backwards meanwhile.
+        self.span = Span { last_ms: self.span.last_ms, ..Span::default() };
         Ok(())
+    }
+
+    /// Hard-link this log into the WAL archive, seal it, and prune.
+    ///
+    /// A no-op when retention is off, when the log holds nothing a recovery
+    /// would replay, or when the log is not a table's log inside a data
+    /// directory -- see [`archive_dir_for`], which is the same layout
+    /// inference [`Wal::may_be_cited`] makes.
+    ///
+    /// Ordering is the whole correctness argument. The link is published
+    /// first and the seal after it, so every crash point leaves a state that
+    /// reads correctly:
+    ///
+    ///   * before the link -- nothing archived, and the log still holds the
+    ///     records, so the next checkpoint archives them. No hole.
+    ///   * between the link and the seal -- a segment with no seal, which
+    ///     reads as *detectably incomplete*. The next checkpoint finds the
+    ///     link already there, and because a segment is named for the stream
+    ///     position it starts at, "already there" can only mean *these bytes*:
+    ///     it re-seals and carries on. No hole and no duplicate.
+    ///   * after the seal, before the replacement -- the same, and the
+    ///     re-archive is a no-op.
+    fn archive(&mut self) -> Result<()> {
+        let budget = archive_retention();
+        let Some(dir) = archive_dir_for(&self.path) else { return Ok(()) };
+        if !self.mutations && !self.decides {
+            return Ok(());
+        }
+        if budget == 0 {
+            // Archiving is off but this table has an archive, so somebody
+            // turned it off. Record the loss: a recovery that would have
+            // needed these records must refuse, not replay across the hole.
+            return match dir.exists() {
+                true => drop_through(&dir, self.span.last_seq),
+                false => Ok(()),
+            };
+        }
+        std::fs::create_dir_all(&dir).map_err(|e| store::io_err("create directory", &dir, e))?;
+        // Everything in the segment has to sit behind a tick, or a recovery
+        // has no way to place it in time and would leave it out.
+        //
+        // Not a formality. A plain append is part of the log's history the
+        // instant it is framed, so a writer that a crash caught between the
+        // append and its `fsync` leaves records that the *next* open replays
+        // like any other -- while the tick that would have stamped them was
+        // never written. Those records become durable history here, at the
+        // checkpoint that folds them into parts and retires the log, and this
+        // is the stamp that says so. The case that found it: a killed writer
+        // followed by a read-only session, whose exit checkpoint archived a
+        // whole segment that carried no tick at all.
+        //
+        // The `fsync` that follows is conditional on the same flag, and that
+        // is not an oversight: every acknowledged write already fsynced this
+        // file, so with no tick to add there are no bytes here that are not
+        // already on the platter, and the link would be fsyncing them twice.
+        // Worth the sentence -- an `fsync` is ~3.5 ms on this machine and this
+        // is the ordinary path.
+        if self.dirty {
+            self.tick()?;
+            self.file.sync_all().map_err(|e| store::io_err("fsync", &self.path, e))?;
+        }
+        // One directory read for the whole of what follows: where this segment
+        // starts, and whether retention has anything to do.
+        let segs = sealed(&dir)?;
+        let origin = segs
+            .last()
+            .map_or(0, |&(o, len)| o + len.saturating_sub(format::HEADER_LEN as u64));
+        let seg = dir.join(seg_name(origin, SEG_EXT));
+        // A link with no seal beside it is debris from an archive a crash
+        // interrupted, and it can only ever be here: `next_origin` counts
+        // sealed segments only, so this position is one no sealed segment
+        // occupies. The log still holds every record it held -- the
+        // replacement never happened either -- so the honest repair is to
+        // discard it and archive the log as it stands now, which is a superset.
+        if !dir.join(seg_name(origin, SEAL_EXT)).exists() {
+            match std::fs::remove_file(&seg) {
+                Ok(()) | Err(_) => {}
+            }
+        }
+        match std::fs::hard_link(&self.path, &seg) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                let there = std::fs::metadata(&seg)
+                    .map_err(|e| store::io_err("stat", &seg, e))?
+                    .len();
+                if there != self.len {
+                    return Err(Error::corruption(format!(
+                        "the archived segment {} is {there} bytes but the log it was taken \
+                         from is {}; the archive and the log have diverged and this \
+                         checkpoint would make it permanent",
+                        seg.display(),
+                        self.len
+                    )));
+                }
+            }
+            Err(e) => return Err(store::io_err("archive", &seg, e)),
+        }
+        let mut w = Writer::with_capacity(64);
+        w.varint(origin);
+        w.varint(origin + self.len - format::HEADER_LEN as u64);
+        w.varint(self.span.first_seq);
+        w.varint(self.span.last_seq);
+        w.varint(self.span.first_ms);
+        w.varint(self.span.last_ms);
+        // The seal is what publishes the segment, so it is published the way
+        // every other commit record in this engine is: fsynced, then renamed.
+        // `atomic_write` fsyncs the directory itself, so the link the rename
+        // makes durable is the link to the segment as well.
+        store::atomic_write(&dir.join(seg_name(origin, SEAL_EXT)), &framed(&w.finish()))?;
+        prune(&dir, budget, &segs)
     }
 
     /// The sequence numbers this log has decided, ascending.
@@ -665,8 +1080,10 @@ impl Wal {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(e) => return Err(store::io_err("read", path, e)),
         };
-        Self::replay_entries(&buf, schema, from, Some(parent_of(path)))
-            .map_err(|e| store::prefix(path, e))
+        let out = Self::replay_entries(&buf, schema, from, Some(parent_of(path)))
+            .map_err(|e| store::prefix(path, e))?;
+        resume_commit(path);
+        Ok(out)
     }
 
     /// End offset of the last structurally intact record, the first sequence
@@ -678,22 +1095,34 @@ impl Wal {
     /// decodes against the current schema. Truncating on a body error would
     /// throw away durable data because of a schema mismatch, so body damage is
     /// left for `replay` to report.
-    fn scan(buf: &[u8]) -> Result<(u64, u64, bool)> {
+    fn scan(buf: &[u8]) -> Result<Scanned> {
+        let mut out = Scanned { good: format::HEADER_LEN as u64, ..Scanned::default() };
         if buf.len() < format::HEADER_LEN {
-            return Ok((format::HEADER_LEN as u64, 0, false));
+            return Ok(out);
         }
         let mut r = Reader::new(buf);
         format::read_header(&mut r)?;
-        let mut good = r.pos() as u64;
-        let mut next_seq = 0u64;
-        let mut decides = false;
+        out.good = r.pos() as u64;
         while !r.is_empty() {
             let at = r.pos();
             match format::read_framed(&mut r) {
                 Ok(body) => {
-                    good = r.pos() as u64;
-                    next_seq = next_seq.max(body_next_seq(body));
-                    decides |= tagged(body, TAG_DECIDE).is_some();
+                    out.good = r.pos() as u64;
+                    out.next_seq = out.next_seq.max(body_next_seq(body));
+                    out.decides |= tagged(body, TAG_DECIDE).is_some();
+                    out.dirty = true;
+                    match body.first() {
+                        Some(&t) if t & !STAGED == TAG_INSERT || t & !STAGED == TAG_DELETE => {
+                            out.mutations = true
+                        }
+                        Some(&TAG_TICK) => {
+                            out.dirty = false;
+                            if let Some((seq, ms)) = tick_of(body) {
+                                out.span.observe(seq, ms);
+                            }
+                        }
+                        _ => {}
+                    }
                 }
                 // A torn tail is the normal shape of a crash: stop here.
                 Err(_) if is_tail(buf, at) => break,
@@ -702,7 +1131,7 @@ impl Wal {
                 Err(e) => return Err(record_err(at, 0, e)),
             }
         }
-        Ok((good, next_seq, decides))
+        Ok(out)
     }
 
     /// Every record at or after byte offset `from`.
@@ -717,8 +1146,17 @@ impl Wal {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(e) => return Err(store::io_err("read", path, e)),
         };
-        Self::replay_bytes(&buf, schema, from, Some(parent_of(path)))
-            .map_err(|e| store::prefix(path, e))
+        let out = Self::replay_bytes(&buf, schema, from, Some(parent_of(path)))
+            .map_err(|e| store::prefix(path, e))?;
+        // Recovery, not replay, is what needs this -- but recovery runs in a
+        // process that opened the database, and *this* is the call every open
+        // makes for every table. A log a checkpoint has emptied carries no
+        // tick, so the number has to come from the segment it was emptied
+        // into; without it the next backup would name a boundary that had
+        // already been used and the recovery after it would replay records
+        // the backup already held.
+        resume_commit(path);
+        Ok(out)
     }
 
     pub(crate) fn replay_bytes(
@@ -807,6 +1245,9 @@ impl Wal {
                 }
                 // Bookkeeping a truncation left behind; it releases nothing.
                 Entry::Fence => {}
+                // Recovery navigates by these; a replay only has to make sure
+                // the counter never hands the number out twice.
+                Entry::Tick(seq) => observe_commit(seq),
             }
             seen += 1;
         }
@@ -833,6 +1274,491 @@ impl Wal {
     pub fn lsn(&self) -> u64 {
         self.len
     }
+}
+
+// ---------------------------------------------------------------------------
+// the archive
+// ---------------------------------------------------------------------------
+
+/// `<root>/.wal-archive/<db>/<table>` for a log at `<root>/<db>/<table>/wal.log`.
+///
+/// `None` for anything that is not that shape, or whose root has no `CATALOG`
+/// -- the same inference [`Wal::may_be_cited`] makes, and for the same reason:
+/// a log opened as a bare file by a test must never send this walking a tree
+/// it does not own. Conservative in the harmless direction, because a log that
+/// is not part of a database has no database to recover.
+fn archive_dir_for(log: &Path) -> Option<PathBuf> {
+    let tdir = log.parent()?;
+    let table = tdir.file_name()?.to_str()?;
+    let ddir = tdir.parent()?;
+    let db = ddir.file_name()?.to_str()?;
+    let root = ddir.parent()?;
+    if !store::is_safe_name(db) || !store::is_safe_name(table) {
+        return None;
+    }
+    root.join(store::CATALOG_FILE)
+        .exists()
+        .then(|| archive_dir(root, db, table))
+}
+
+/// Where `<db>.<table>`'s archived segments live under data root `root`.
+pub fn archive_dir(root: &Path, db: &str, table: &str) -> PathBuf {
+    root.join(ARCHIVE_DIR).join(db).join(table)
+}
+
+/// A segment is named for the stream position it starts at, zero-padded so
+/// that lexical order is numeric order. That is what lets a directory listing
+/// alone prove the archive has no hole -- see [`segments`] -- with no file
+/// opened and no seal read.
+fn seg_name(origin: u64, ext: &str) -> String {
+    format!("seg_{origin:020}.{ext}")
+}
+
+fn parse_seg_origin(name: &str) -> Option<u64> {
+    parse_origin(name, SEG_EXT)
+}
+
+fn parse_seal_origin(name: &str) -> Option<u64> {
+    parse_origin(name, SEAL_EXT)
+}
+
+fn parse_origin(name: &str, ext: &str) -> Option<u64> {
+    let digits = name.strip_prefix("seg_")?.strip_suffix(ext)?.strip_suffix('.')?;
+    (digits.len() == 20 && digits.bytes().all(|b| b.is_ascii_digit()))
+        .then(|| digits.parse().ok())
+        .flatten()
+}
+
+fn framed(body: &[u8]) -> Vec<u8> {
+    let mut w = Writer::with_capacity(body.len() + 16);
+    format::write_header(&mut w);
+    format::write_framed(&mut w, body);
+    w.finish()
+}
+
+/// One archived segment.
+#[derive(Clone, Debug)]
+pub struct Segment {
+    /// Stream position of its first record: the total size of every segment
+    /// before it. Globally monotone, and it never restarts -- which is exactly
+    /// what a byte LSN cannot be across a truncation.
+    pub origin: u64,
+    /// One past its last record's stream position.
+    pub end: u64,
+    /// The recovery LSNs and wall-clock times it covers.
+    pub span: Span,
+    pub path: PathBuf,
+}
+
+/// Every segment of `<db>.<table>`, oldest first.
+///
+/// **Sealed segments only.** A `.gwal` with no seal beside it is not a short
+/// segment, it is not part of the archive at all: the seal is published after
+/// the link and by a rename, so a segment joins the archive atomically or not
+/// at all, and the records of one that did not are still in the live log the
+/// interrupted checkpoint never replaced. Treating one as data is exactly the
+/// "silently short" failure -- so instead the *next* checkpoint discards it and
+/// archives the log as it now stands, which is a superset of it.
+///
+/// A hole between two sealed segments is reported rather than skipped: two
+/// that do not meet exactly means records between them are gone, and replaying
+/// across that is the one failure a recovery feature must never have. So is a
+/// segment whose file no longer has the length its seal claims.
+pub fn segments(root: &Path, db: &str, table: &str) -> Result<Vec<Segment>> {
+    let dir = archive_dir(root, db, table);
+    let rd = match std::fs::read_dir(&dir) {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(store::io_err("read directory", &dir, e)),
+    };
+    let mut out: Vec<Segment> = Vec::new();
+    for e in rd {
+        let e = e.map_err(|e| store::io_err("read directory entry in", &dir, e))?;
+        let name = e.file_name();
+        let Some(origin) = name.to_str().and_then(parse_seg_origin) else { continue };
+        let path = dir.join(&name);
+        let Some((span, end)) = read_seal(&dir, origin)? else { continue };
+        let len = e.metadata().map_err(|e| store::io_err("stat", &path, e))?.len();
+        if len < format::HEADER_LEN as u64 || origin + len - format::HEADER_LEN as u64 != end {
+            return Err(Error::corruption(format!(
+                "archived segment {} is {len} bytes; its seal says it runs from {origin} to \
+                 {end}, which is {} of log. A recovery through it would stop early and \
+                 report success",
+                path.display(),
+                end - origin
+            )));
+        }
+        out.push(Segment { origin, end, span, path });
+    }
+    out.sort_unstable_by_key(|s| s.origin);
+    for w in out.windows(2) {
+        if w[0].end != w[1].origin {
+            return Err(Error::corruption(format!(
+                "the WAL archive of `{db}.{table}` has a hole: log bytes {}..{} are missing \
+                 between {} and {}. A recovery that spans the hole would silently skip \
+                 whatever those records held",
+                w[0].end,
+                w[1].origin,
+                w[0].path.display(),
+                w[1].path.display()
+            )));
+        }
+    }
+    Ok(out)
+}
+
+/// The `(span, end)` the seal beside segment `origin` declares, or `None` when
+/// there is not one.
+fn read_seal(dir: &Path, origin: u64) -> Result<Option<(Span, u64)>> {
+    let path = dir.join(seg_name(origin, SEAL_EXT));
+    let buf = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(store::io_err("read", &path, e)),
+    };
+    let mut r = Reader::new(&buf);
+    let read = (|| -> Result<(Span, u64)> {
+        format::read_header(&mut r)?;
+        let body = format::read_framed(&mut r)?;
+        let mut b = Reader::new(body);
+        let (at, end) = (b.varint()?, b.varint()?);
+        if at != origin || end < at {
+            return Err(Error::corruption(format!(
+                "seal names log bytes {at}..{end}; the segment beside it starts at {origin}"
+            )));
+        }
+        let span = Span {
+            first_seq: b.varint()?,
+            last_seq: b.varint()?,
+            first_ms: b.varint()?,
+            last_ms: b.varint()?,
+        };
+        Ok((span, end))
+    })();
+    read.map(Some).map_err(|e| store::prefix(&path, e))
+}
+
+/// Every sealed segment in `dir` as `(origin, length in bytes)`, oldest first.
+///
+/// One `read_dir` and nothing else: a segment counts as sealed when a
+/// `.gseal` is present beside it, and the *extent* is the segment file's own
+/// length. Deliberately not a seal read -- this runs on the checkpoint path,
+/// and opening one small file per segment per checkpoint is how an archive of
+/// a few hundred segments turns into a visible pause. The seal's own copy of
+/// the extent is cross-checked in [`segments`], which is the read path.
+fn sealed(dir: &Path) -> Result<Vec<(u64, u64)>> {
+    let mut segs: Vec<(u64, u64)> = Vec::new();
+    let mut seals: Vec<u64> = Vec::new();
+    let rd = match std::fs::read_dir(dir) {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(segs),
+        Err(e) => return Err(store::io_err("read directory", dir, e)),
+    };
+    for e in rd {
+        let e = e.map_err(|e| store::io_err("read directory entry in", dir, e))?;
+        let name = e.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if let Some(origin) = parse_seg_origin(name) {
+            let len = e.metadata().map_err(|e| store::io_err("stat", dir, e))?.len();
+            segs.push((origin, len));
+        } else if let Some(origin) = parse_seal_origin(name) {
+            seals.push(origin);
+        }
+    }
+    seals.sort_unstable();
+    segs.retain(|&(o, _)| seals.binary_search(&o).is_ok());
+    segs.sort_unstable();
+    Ok(segs)
+}
+
+/// The span of the newest sealed segment, for resuming the recovery LSN.
+fn newest_seal(dir: &Path) -> Option<Span> {
+    let (origin, _) = *sealed(dir).ok()?.last()?;
+    read_seal(dir, origin).ok()?.map(|(span, _)| span)
+}
+
+/// The stream position the next segment starts at: where the newest sealed one
+/// ends.
+///
+/// Derived from the archive rather than carried in the log, so wiping the live
+/// log cannot renumber the stream. Unsealed links do not count: one is the
+/// debris of an interrupted archive whose records the log still holds, so the
+/// retry has to land on the *same* position and supersede it -- counting it
+/// would put those records in the stream twice.
+fn next_origin(dir: &Path) -> Result<u64> {
+    Ok(sealed(dir)?
+        .last()
+        .map_or(0, |&(o, len)| o + len.saturating_sub(format::HEADER_LEN as u64)))
+}
+
+/// The highest recovery LSN this table's archive no longer holds.
+fn horizon(dir: &Path) -> Result<u64> {
+    let path = dir.join(HORIZON_FILE);
+    let buf = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(store::io_err("read", &path, e)),
+    };
+    let mut r = Reader::new(&buf);
+    (|| -> Result<u64> {
+        format::read_header(&mut r)?;
+        Reader::new(format::read_framed(&mut r)?).varint()
+    })()
+    .map_err(|e| store::prefix(&path, e))
+}
+
+/// Record that everything up to recovery LSN `seq` has left the archive.
+///
+/// Monotone: a horizon that went backwards would make a recovery believe it
+/// had records it had already thrown away.
+fn drop_through(dir: &Path, seq: u64) -> Result<()> {
+    if seq == 0 || horizon(dir)? >= seq {
+        return Ok(());
+    }
+    let mut w = Writer::with_capacity(16);
+    w.varint(seq);
+    store::atomic_write(&dir.join(HORIZON_FILE), &framed(&w.finish()))
+}
+
+/// Drop whole segments, oldest first, until the archive fits `budget`.
+///
+/// Never the newest one, whatever the budget: it is what [`next_origin`] reads
+/// to keep the stream numbering monotone, and losing it would let a later
+/// segment reuse a stream position an older backup still refers to.
+fn prune(dir: &Path, budget: u64, segs: &[(u64, u64)]) -> Result<()> {
+    let mut total: u64 = segs.iter().map(|&(_, len)| len).sum();
+    // The early exit is the whole point of taking `segs` from the caller: on
+    // every checkpoint that is inside its budget -- which is every checkpoint
+    // of a healthy database -- pruning costs one comparison and touches no
+    // file at all.
+    if total <= budget || segs.len() < 2 {
+        return Ok(());
+    }
+    let mut dropped = 0u64;
+    for &(origin, len) in &segs[..segs.len() - 1] {
+        if total <= budget {
+            break;
+        }
+        // The horizon is raised *before* the bytes go, so a crash in the
+        // middle of pruning leaves a horizon that is too conservative -- which
+        // refuses a recovery that might have worked -- rather than one that is
+        // too optimistic, which would replay across a hole and say nothing.
+        if let Some((span, _)) = read_seal(dir, origin)? {
+            drop_through(dir, span.last_seq)?;
+        }
+        // ...and the seal goes first, for the same reason: a segment with no
+        // seal is not part of the archive, so a crash between the two unlinks
+        // leaves a hole nobody can mistake for data.
+        for ext in [SEAL_EXT, SEG_EXT] {
+            let p = dir.join(seg_name(origin, ext));
+            match std::fs::remove_file(&p) {
+                Ok(()) | Err(_) => {}
+            }
+        }
+        total -= len;
+        dropped += 1;
+    }
+    if dropped > 0 {
+        store::sync_dir(dir)?;
+    }
+    Ok(())
+}
+
+/// Every `(db, table)` with an archive under `root`.
+pub fn archived_tables(root: &Path) -> Result<Vec<(String, String)>> {
+    let base = root.join(ARCHIVE_DIR);
+    let mut out = Vec::new();
+    let Ok(dbs) = std::fs::read_dir(&base) else { return Ok(out) };
+    for db in dbs.flatten() {
+        let Some(dbn) = db.file_name().to_str().map(str::to_string) else { continue };
+        let Ok(tables) = std::fs::read_dir(db.path()) else { continue };
+        for t in tables.flatten() {
+            if let Some(tn) = t.file_name().to_str() {
+                out.push((dbn.clone(), tn.to_string()));
+            }
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
+/// The table whose live log still holds records the archive does not, if there
+/// is one.
+///
+/// The archive is published by a checkpoint, so between checkpoints it is
+/// behind the database. That difference is the whole of "this instant is not
+/// recoverable yet": with every log emptied, the archive *is* the database's
+/// history and any instant up to now is answerable; with one of them holding
+/// records, an instant after the last archived tick would quietly resolve to
+/// an earlier state.
+///
+/// A stat per table, and conservative in the direction that refuses: a writer
+/// appending while this runs makes the log look non-empty, which is exactly
+/// the answer that case deserves.
+pub fn archive_lags(root: &Path) -> Result<Option<String>> {
+    for (db, table) in archived_tables(root)? {
+        let log = root.join(&db).join(&table).join(store::WAL_FILE);
+        if std::fs::metadata(&log).is_ok_and(|m| m.len() > format::HEADER_LEN as u64) {
+            return Ok(Some(format!("{db}.{table}")));
+        }
+    }
+    Ok(None)
+}
+
+/// The last tick the whole archive under `root` holds: the newest state any
+/// recovery from it can reach.
+pub fn archive_end(root: &Path) -> Result<Span> {
+    let mut end = Span::default();
+    for (db, table) in archived_tables(root)? {
+        for s in segments(root, &db, &table)? {
+            let sp = s.span;
+            end.last_seq = end.last_seq.max(sp.last_seq);
+            end.last_ms = end.last_ms.max(sp.last_ms);
+            if sp.first_seq != 0 && (end.first_seq == 0 || sp.first_seq < end.first_seq) {
+                end.first_seq = sp.first_seq;
+                end.first_ms = sp.first_ms;
+            }
+        }
+    }
+    Ok(end)
+}
+
+/// One table's archived stream, cut to `[from_seq, target]`.
+#[derive(Debug)]
+pub struct Recovered {
+    /// A whole log file -- header plus the framed records in range -- ready to
+    /// be written into a restored table directory and replayed by the ordinary
+    /// loader. Byte ranges of the archived segments, copied verbatim: there is
+    /// no second encoder here to drift from the one that wrote them.
+    pub bytes: Vec<u8>,
+    /// Mutations it holds. Bookkeeping records are not counted.
+    pub records: u64,
+    /// The ticks actually included.
+    pub applied: Span,
+}
+
+/// The records of `<db>.<table>` that a backup taken at recovery LSN
+/// `from_seq` does not already hold, up to `target`.
+///
+/// Both ends of the cut land on a tick, because a tick is the instant a group
+/// of records became durable: everything behind one is a state the database
+/// really was in, and everything in front of the next one is not yet
+/// acknowledged. Replaying to the same target twice therefore produces the
+/// same bytes -- the cut is a pure function of the archive.
+pub fn recover(
+    root: &Path,
+    db: &str,
+    table: &str,
+    from_seq: u64,
+    target: Target,
+) -> Result<Recovered> {
+    let segs = segments(root, db, table)?;
+    let dropped = horizon(&archive_dir(root, db, table))?;
+    if dropped >= from_seq && from_seq != 0 {
+        return Err(Error::storage(format!(
+            "the WAL archive of `{db}.{table}` no longer reaches back to the backup: \
+             retention has dropped everything up to recovery LSN {dropped}, and the backup \
+             needs {from_seq} onwards. Recovering from it would silently skip the records \
+             in between"
+        )));
+    }
+    let mut out = Writer::with_capacity(4096);
+    format::write_header(&mut out);
+    let mut rec = Recovered { bytes: Vec::new(), records: 0, applied: Span::default() };
+    for seg in &segs {
+        // Every tick in it predates the backup, so all of it is already in the
+        // parts the backup restored.
+        if seg.span.last_seq != 0 && seg.span.last_seq < from_seq {
+            continue;
+        }
+        let buf = std::fs::read(&seg.path).map_err(|e| store::io_err("read", &seg.path, e))?;
+        let cut = cut_segment(&buf, from_seq, target).map_err(|e| store::prefix(&seg.path, e))?;
+        out.raw(&buf[cut.from..cut.to]);
+        rec.records += cut.records;
+        for (seq, ms) in cut.ticks {
+            rec.applied.observe(seq, ms);
+        }
+        if cut.stopped {
+            break;
+        }
+    }
+    rec.bytes = out.finish();
+    Ok(rec)
+}
+
+/// Where one segment's kept bytes start and stop.
+struct Cut {
+    from: usize,
+    to: usize,
+    records: u64,
+    /// The ticks inside `[from, to)`, in order.
+    ticks: Vec<(u64, u64)>,
+    /// A tick failed the target, so nothing after this segment is wanted.
+    stopped: bool,
+}
+
+/// One pass over a segment, finding both cuts.
+///
+/// `from` is just past the last tick that predates the backup and `to` just
+/// past the last one the target keeps -- so the copied range is exactly the
+/// records that became durable inside the window, framing intact, with no
+/// record re-encoded.
+fn cut_segment(buf: &[u8], from_seq: u64, target: Target) -> Result<Cut> {
+    let mut r = Reader::new(buf);
+    format::read_header(&mut r)?;
+    let head = r.pos();
+    let mut cut =
+        Cut { from: head, to: head, records: 0, ticks: Vec::new(), stopped: false };
+    let mut pending = 0u64;
+    while !r.is_empty() {
+        let at = r.pos();
+        let body = match format::read_framed(&mut r) {
+            Ok(b) => b,
+            // The last segment of a crashed database can end mid-record, and
+            // the records behind the tear were never acknowledged.
+            Err(_) if is_tail(buf, at) => break,
+            Err(e) => return Err(record_err(at, 0, e)),
+        };
+        match body.first() {
+            Some(&TAG_TICK) => {
+                let Some((seq, ms)) = tick_of(body) else { continue };
+                if seq < from_seq {
+                    // Everything to here is inside the backup already.
+                    cut.from = r.pos();
+                    cut.to = r.pos();
+                    cut.records = 0;
+                    cut.ticks.clear();
+                    pending = 0;
+                } else if target.keeps(seq, ms) {
+                    cut.to = r.pos();
+                    cut.records += std::mem::take(&mut pending);
+                    cut.ticks.push((seq, ms));
+                } else {
+                    cut.stopped = true;
+                    break;
+                }
+            }
+            Some(&t) if t & !STAGED == TAG_INSERT || t & !STAGED == TAG_DELETE => pending += 1,
+            _ => {}
+        }
+    }
+    Ok(cut)
+}
+
+/// Resume the recovery LSN counter past whatever the log at `path` has
+/// already archived. Costs a `stat` on a database that has never archived.
+fn resume_commit(path: &Path) {
+    if let Some(dir) = archive_dir_for(path) {
+        if let Some(span) = newest_seal(&dir) {
+            observe_commit(span.last_seq);
+        }
+    }
+}
+
+/// The `(recovery LSN, millis)` a [`TAG_TICK`] body carries.
+fn tick_of(body: &[u8]) -> Option<(u64, u64)> {
+    let mut r = Reader::new(body);
+    (r.u8().ok()? == TAG_TICK).then(|| Some((r.varint().ok()?, r.varint().ok()?))).flatten()
 }
 
 /// Write a record's tag, and the sequence number a staged one carries in front
@@ -1024,6 +1950,13 @@ fn decode_entry<'a>(body: &'a [u8], schema: &Schema) -> Result<Entry<'a>> {
         TAG_FENCE => {
             br.varint()?;
             Entry::Fence
+        }
+        TAG_TICK => {
+            let seq = br.varint()?;
+            // Read to prove the frame is the shape it claims; the trailing
+            // check below is what turns that into a rejection.
+            br.varint()?;
+            Entry::Tick(seq)
         }
         _ => {
             // The sequence number sits between the tag and the payload, so the
@@ -1296,12 +2229,33 @@ mod tests {
     fn damage_to_the_final_record_is_treated_as_a_tear() {
         let s = Scratch::new("wal-tailrot");
         let (path, want, _) = populated(&s, 5);
+        // One more record with no tick behind it, which is what an append
+        // interrupted before its `fsync` looks like -- and what makes the last
+        // frame in the file a mutation rather than a durability stamp.
+        {
+            let mut w = Wal::open(&path).unwrap();
+            w.append_delete(0xBAD).unwrap();
+        }
         let mut bytes = std::fs::read(&path).unwrap();
         let last = bytes.len() - 1;
         bytes[last] ^= 0x80;
         std::fs::write(&path, &bytes).unwrap();
         let back = Wal::replay(&path, &schema()).unwrap();
-        assert_eq!(back, want[..want.len() - 1]);
+        assert_eq!(back, want, "the damaged final record must be dropped, no error");
+    }
+
+    /// The same, one frame later: the tick is the last thing in a log whose
+    /// writer got as far as `sync`, so damage to *it* is a tear too -- and the
+    /// records it stamped are still acknowledged and must all come back.
+    #[test]
+    fn damage_to_the_trailing_tick_costs_only_the_stamp() {
+        let s = Scratch::new("wal-tickrot");
+        let (path, want, _) = populated(&s, 5);
+        let mut bytes = std::fs::read(&path).unwrap();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0x80;
+        std::fs::write(&path, &bytes).unwrap();
+        assert_eq!(Wal::replay(&path, &schema()).unwrap(), want);
     }
 
     #[test]
@@ -2115,6 +3069,309 @@ mod tests {
         }
     }
 
+    // ---- ticks and the archive ---------------------------------------------
+
+    /// Retention and the recovery-LSN counter are process-global by design --
+    /// they describe a data directory, and there is one writer per directory.
+    /// `cargo test` puts several of those directories in one process, so the
+    /// tests that lean on either one take this first. Nothing outside the test
+    /// harness needs it.
+    static ARCHIVE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn exclusive() -> std::sync::MutexGuard<'static, ()> {
+        ARCHIVE.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+
+    /// A tick per `fsync`, not per record, and none at all when there is
+    /// nothing behind it: an idle table `sync`ed in a loop must not grow a log.
+    #[test]
+    fn a_tick_stamps_a_group_not_a_record() {
+        let s = Scratch::new("wal-tick");
+        let path = s.join("wal.log");
+        let mut w = Wal::open(&path).unwrap();
+        for i in 0..5u64 {
+            w.append_delete(i).unwrap();
+        }
+        w.sync().unwrap();
+        let after = w.len();
+        w.sync().unwrap();
+        w.sync().unwrap();
+        assert_eq!(w.len(), after, "a sync with nothing behind it must write nothing");
+
+        let ticks: Vec<(u64, u64)> = ticks_in(&std::fs::read(&path).unwrap());
+        assert_eq!(ticks.len(), 1, "one fsync, one tick: {ticks:?}");
+        assert!(ticks[0].0 > 0 && ticks[0].1 > 0);
+        // ...and it is bookkeeping to everything that reads records.
+        assert_eq!(Wal::replay(&path, &schema()).unwrap().len(), 5);
+
+        w.append_delete(99).unwrap();
+        w.sync().unwrap();
+        let ticks = ticks_in(&std::fs::read(&path).unwrap());
+        assert_eq!(ticks.len(), 2);
+        assert!(ticks[1].0 > ticks[0].0, "recovery LSNs are strictly increasing: {ticks:?}");
+        assert!(ticks[1].1 >= ticks[0].1, "and the clock column never goes backwards");
+    }
+
+    fn ticks_in(buf: &[u8]) -> Vec<(u64, u64)> {
+        let mut out = Vec::new();
+        walk(buf, |b| {
+            if let Some(t) = tick_of(b) {
+                out.push(t);
+            }
+        })
+        .unwrap();
+        out
+    }
+
+    /// The layout the whole archive hangs off. A log that is not a table's log
+    /// inside a data directory has no database to recover and archives
+    /// nothing -- which is what keeps every fixture above from writing one.
+    #[test]
+    fn only_a_table_log_under_a_data_root_has_an_archive() {
+        let s = Scratch::new("wal-archdir");
+        assert_eq!(archive_dir_for(&s.join("bare.log")), None);
+        let p = table_log(&s, "t");
+        assert_eq!(
+            archive_dir_for(&p),
+            Some(s.path().join(ARCHIVE_DIR).join("db").join("t")),
+            "the archive hangs off the root that holds the CATALOG"
+        );
+        std::fs::remove_file(s.join(store::CATALOG_FILE)).unwrap();
+        assert_eq!(archive_dir_for(&p), None, "no CATALOG, no database, no archive");
+    }
+
+    /// A checkpoint retires the log into the archive, and the segments chain
+    /// by stream position with no gap.
+    #[test]
+    fn truncating_archives_the_log_and_chains_the_stream() {
+        let _x = exclusive();
+        let s = Scratch::new("wal-archive");
+        let p = table_log(&s, "t");
+        let mut want = Vec::new();
+        for gen in 0..4u64 {
+            let mut w = Wal::open(&p).unwrap();
+            w.append_delete(gen).unwrap();
+            w.sync().unwrap();
+            want.push(WalRecord::Delete(gen));
+            w.truncate().unwrap();
+            assert_eq!(w.len(), format::HEADER_LEN as u64, "generation {gen}");
+        }
+        let segs = segments(s.path(), "db", "t").unwrap();
+        assert_eq!(segs.len(), 4);
+        assert_eq!(segs[0].origin, 0);
+        for (i, w) in segs.windows(2).enumerate() {
+            assert_eq!(w[0].end, w[1].origin, "segments {i} and {} must meet", i + 1);
+            assert!(w[0].span.last_seq < w[1].span.first_seq, "and their stamps must too");
+        }
+        // The whole stream replays to exactly what was written, in order.
+        let rec = recover(s.path(), "db", "t", 0, Target::Latest).unwrap();
+        assert_eq!(rec.records, 4);
+        assert_eq!(Wal::replay_bytes(&rec.bytes, &schema(), 0, None).unwrap(), want);
+    }
+
+    /// The cut is a pure function of the archive, on both axes, and it always
+    /// lands on a tick -- so every recovered state is one the database really
+    /// was in.
+    #[test]
+    fn a_recovery_cut_is_exact_on_both_axes() {
+        let _x = exclusive();
+        let s = Scratch::new("wal-cut");
+        let p = table_log(&s, "t");
+        let mut stamps = Vec::new();
+        for gen in 0..5u64 {
+            let mut w = Wal::open(&p).unwrap();
+            w.append_delete(gen).unwrap();
+            w.sync().unwrap();
+            stamps.push(w.span.last_seq);
+            w.truncate().unwrap();
+        }
+        for (i, &seq) in stamps.iter().enumerate() {
+            let rec = recover(s.path(), "db", "t", 0, Target::Lsn(seq)).unwrap();
+            assert_eq!(rec.records as usize, i + 1, "up to LSN {seq}");
+            assert_eq!(rec.applied.last_seq, seq);
+            // Twice is the same bytes: nothing here reads a clock.
+            let again = recover(s.path(), "db", "t", 0, Target::Lsn(seq)).unwrap();
+            assert_eq!(rec.bytes, again.bytes);
+            // ...and starting *after* a stamp drops exactly what it covered.
+            let from = recover(s.path(), "db", "t", seq + 1, Target::Latest).unwrap();
+            assert_eq!(from.records as usize, stamps.len() - i - 1, "from LSN {}", seq + 1);
+        }
+        // A target before anything archived yields an empty log, not an error:
+        // "no records after this point" is an answer.
+        let none = recover(s.path(), "db", "t", 0, Target::Lsn(0)).unwrap();
+        assert_eq!(none.records, 0);
+        assert_eq!(none.bytes.len(), format::HEADER_LEN);
+    }
+
+    /// Retention is the difference between a feature and an outage. What it
+    /// drops has to be *recorded*, or the recovery that needed it would replay
+    /// a shorter history and say nothing.
+    #[test]
+    fn retention_drops_the_oldest_and_records_the_horizon() {
+        let _x = exclusive();
+        let s = Scratch::new("wal-retain");
+        let p = table_log(&s, "t");
+        let keep = archive_retention();
+        set_archive_retention(1);
+        let mut first = 0u64;
+        for gen in 0..6u64 {
+            let mut w = Wal::open(&p).unwrap();
+            w.append_insert(&rows(&[gen * 10, gen * 10 + 1])).unwrap();
+            w.sync().unwrap();
+            if gen == 0 {
+                first = w.span.last_seq;
+            }
+            w.truncate().unwrap();
+        }
+        set_archive_retention(keep);
+
+        let segs = segments(s.path(), "db", "t").unwrap();
+        assert!(segs.len() < 6, "a 1-byte budget must drop almost everything: {}", segs.len());
+        assert!(!segs.is_empty(), "the newest segment carries the numbering and never goes");
+        assert!(segs[0].origin > 0, "the survivors start after the hole retention made");
+
+        let dir = archive_dir(s.path(), "db", "t");
+        assert!(horizon(&dir).unwrap() >= first, "the horizon must record what went");
+        let e = recover(s.path(), "db", "t", first, Target::Latest)
+            .expect_err("a recovery that needs a dropped segment must refuse");
+        assert!(e.to_string().contains("retention has dropped"), "{e}");
+        // ...while one that starts after the horizon is still served.
+        let ok = recover(s.path(), "db", "t", horizon(&dir).unwrap() + 1, Target::Latest).unwrap();
+        assert!(ok.records > 0);
+    }
+
+    /// The crash window: the link is published and the seal is not. That link
+    /// is not a short segment -- it is not a segment -- and the retry takes its
+    /// position back rather than chaining past it, so nothing lands twice.
+    #[test]
+    fn an_interrupted_archive_is_superseded_not_chained() {
+        let _x = exclusive();
+        let s = Scratch::new("wal-halfarch");
+        let p = table_log(&s, "t");
+        let mut w = Wal::open(&p).unwrap();
+        w.append_delete(1).unwrap();
+        w.sync().unwrap();
+        w.truncate().unwrap();
+        let dir = archive_dir(s.path(), "db", "t");
+        let seg = segments(s.path(), "db", "t").unwrap().remove(0);
+
+        // Put the log back the way a crash between the link and the seal would
+        // have left it, and take the seal away.
+        std::fs::copy(&seg.path, &p).unwrap();
+        std::fs::remove_file(dir.join(seg_name(seg.origin, SEAL_EXT))).unwrap();
+        assert!(segments(s.path(), "db", "t").unwrap().is_empty(), "an unsealed link is not one");
+
+        let mut w = Wal::open(&p).unwrap();
+        w.append_delete(2).unwrap();
+        w.sync().unwrap();
+        w.truncate().unwrap();
+        let segs = segments(s.path(), "db", "t").unwrap();
+        assert_eq!(segs.len(), 1, "the retry must reuse the position: {segs:?}");
+        assert_eq!(segs[0].origin, seg.origin);
+        let rec = recover(s.path(), "db", "t", 0, Target::Latest).unwrap();
+        assert_eq!(
+            Wal::replay_bytes(&rec.bytes, &schema(), 0, None).unwrap(),
+            vec![WalRecord::Delete(1), WalRecord::Delete(2)],
+            "the superseded records must appear exactly once"
+        );
+    }
+
+    /// A plain append is history the instant it is framed, so a crash before
+    /// its `fsync` leaves records that replay applies and no tick covers. The
+    /// checkpoint that retires them stamps them, or a recovery could not place
+    /// them and would leave them out -- silently.
+    #[test]
+    fn records_a_crash_left_unstamped_are_stamped_when_they_are_archived() {
+        let _x = exclusive();
+        let s = Scratch::new("wal-unstamped");
+        let p = table_log(&s, "t");
+        {
+            let mut w = Wal::open(&p).unwrap();
+            w.append_delete(7).unwrap(); // ...and no `sync`: the process dies here
+        }
+        assert_eq!(Wal::replay(&p, &schema()).unwrap(), vec![WalRecord::Delete(7)]);
+
+        // A read-only session's exit checkpoint: it retires the log without
+        // ever having logged anything of its own.
+        Wal::open(&p).unwrap().truncate().unwrap();
+        let segs = segments(s.path(), "db", "t").unwrap();
+        assert_eq!(segs.len(), 1);
+        assert!(!segs[0].span.is_empty(), "the segment must carry a tick to be placeable");
+        let rec = recover(s.path(), "db", "t", 0, Target::Latest).unwrap();
+        assert_eq!(
+            Wal::replay_bytes(&rec.bytes, &schema(), 0, None).unwrap(),
+            vec![WalRecord::Delete(7)],
+            "an unstamped record must not be dropped by the recovery"
+        );
+    }
+
+    /// A hole is the failure a recovery must never paper over.
+    #[test]
+    fn a_missing_segment_is_a_hole_with_a_named_range() {
+        let _x = exclusive();
+        let s = Scratch::new("wal-hole");
+        let p = table_log(&s, "t");
+        for gen in 0..3u64 {
+            let mut w = Wal::open(&p).unwrap();
+            w.append_delete(gen).unwrap();
+            w.sync().unwrap();
+            w.truncate().unwrap();
+        }
+        let segs = segments(s.path(), "db", "t").unwrap();
+        let dir = archive_dir(s.path(), "db", "t");
+        for ext in [SEG_EXT, SEAL_EXT] {
+            std::fs::remove_file(dir.join(seg_name(segs[1].origin, ext))).unwrap();
+        }
+        let e = segments(s.path(), "db", "t").expect_err("a hole must be reported");
+        assert!(e.to_string().contains("hole"), "{e}");
+        assert!(e.to_string().contains(&segs[1].origin.to_string()), "{e}");
+        assert!(recover(s.path(), "db", "t", 0, Target::Latest).is_err());
+    }
+
+    /// The other end of the same contract: a segment that is sealed and short
+    /// would stop a recovery early and report success.
+    #[test]
+    fn a_segment_shorter_than_its_seal_is_reported() {
+        let _x = exclusive();
+        let s = Scratch::new("wal-short");
+        let p = table_log(&s, "t");
+        let mut w = Wal::open(&p).unwrap();
+        w.append_insert(&rows(&[1, 2, 3])).unwrap();
+        w.sync().unwrap();
+        w.truncate().unwrap();
+        let seg = segments(s.path(), "db", "t").unwrap().remove(0);
+        let bytes = std::fs::read(&seg.path).unwrap();
+        std::fs::write(&seg.path, &bytes[..bytes.len() - 4]).unwrap();
+        let e = segments(s.path(), "db", "t").expect_err("a short segment must be reported");
+        assert!(e.to_string().contains("report success"), "{e}");
+    }
+
+    /// The recovery LSN is what a backup's boundary is expressed in, so it can
+    /// never be handed out twice -- including across a restart that finds an
+    /// empty log because a checkpoint emptied it.
+    #[test]
+    fn the_recovery_lsn_resumes_across_a_restart() {
+        let _x = exclusive();
+        let s = Scratch::new("wal-resume");
+        let p = table_log(&s, "t");
+        let mut w = Wal::open(&p).unwrap();
+        w.append_delete(1).unwrap();
+        w.sync().unwrap();
+        let used = w.span.last_seq;
+        w.truncate().unwrap();
+        drop(w);
+
+        // The counter is process-global, so wind it back to what a fresh
+        // process would start from and prove the log gets it back.
+        NEXT_COMMIT.store(1, Ordering::Release);
+        let mut w = Wal::open(&p).unwrap();
+        assert!(commit_seq() > used, "an emptied log must resume from its newest segment");
+        w.append_delete(2).unwrap();
+        w.sync().unwrap();
+        assert!(w.span.last_seq > used, "and the next tick must be past it: {}", w.span.last_seq);
+    }
+
     /// The batched append exists to remove a syscall per record, not to change
     /// the format. A byte comparison is the only assertion that can prove it:
     /// a replay comparison would pass over a frame the batch had merged.
@@ -2150,11 +3407,16 @@ mod tests {
                 Some(q) => b.append_deletes_staged(q, &lanes).unwrap(),
                 None => b.append_deletes(&lanes).unwrap(),
             };
-            a.sync().unwrap();
-            b.sync().unwrap();
             assert_eq!(first_a, first_b, "the batch reports the first record's LSN");
             assert_eq!(a.len(), b.len());
+            // Compared before `sync`, which is where the durability tick goes:
+            // two ticks are two different recovery LSNs by construction, so
+            // syncing first would compare the stamps rather than the records.
+            // The bytes are already in the file -- an append is a `write_all`,
+            // not a buffer -- so there is nothing to flush first.
             assert_eq!(std::fs::read(&one).unwrap(), std::fs::read(&many).unwrap());
+            a.sync().unwrap();
+            b.sync().unwrap();
         }
         // Empty is a no-op that still reports where the next record will land.
         let path = s.join("empty.log");

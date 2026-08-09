@@ -41,11 +41,25 @@
 //! the switch that made the interleaved measurements has been deleted; only a
 //! difference this size or larger is meaningful.
 
+use crate::catalog::Catalog;
 use crate::common::{Error, Result};
 use crate::sql::ast::{BinaryOp, JoinOp, UnaryOp};
 use crate::types::{DataType, Schema, Value};
 
 use super::logical::{BoundExpr, CmpOp, LogicalPlan, ZoneFilter};
+
+/// Statistics and the cost model, in `src/planner/stats.rs`.
+///
+/// Declared here rather than in `planner/mod.rs` for the same reason
+/// `lib.rs` declares `backup` out of place: the module belongs beside its
+/// siblings on disk and this is the only file that has to change to put it
+/// there. Move the declaration to `pub mod stats;` in `planner/mod.rs`
+/// whenever that file is next touched -- the path attribute is the only thing
+/// holding the module one level too deep in the tree.
+#[path = "stats.rs"]
+pub mod stats;
+
+use stats::{Estimator, Side};
 
 /// How deep a plan or expression may nest before the optimizer refuses it.
 ///
@@ -72,12 +86,37 @@ fn too_deep(what: &str) -> Error {
     ))
 }
 
+/// The five rewrites that need nothing but the plan.
+///
+/// Kept as the plain entry point because most callers have no catalog in hand
+/// and every one of these passes is correct without one. A query planned
+/// through here keeps FROM-clause join order, which is what the whole engine
+/// did before [`optimize_costed`] existed.
 pub fn optimize(plan: LogicalPlan) -> Result<LogicalPlan> {
     let plan = fold_constants(plan)?;
     let plan = normalize_predicates(plan)?;
     let plan = push_down_filters(plan)?;
     let plan = extract_zone_filters(plan)?;
     prune_projections(plan)
+}
+
+/// [`optimize`], and then join reordering against real statistics.
+///
+/// The catalog is the whole difference: cardinality is a property of the data,
+/// not of the plan, so this is the only entry point that can choose a join
+/// order. It is separate from [`optimize`] rather than an added parameter
+/// because three of the four call sites in this crate plan a *mutation*, which
+/// is single-table by construction and has no order to choose.
+///
+/// Reordering runs **last**, after pushdown and projection pruning, for two
+/// reasons. Every predicate it can price has already been sunk into the scan
+/// it belongs to, so a leaf's estimated size is the size it will actually be;
+/// and a plan the search declines to change comes out of here byte-identical
+/// to what [`optimize`] would have produced, which is the property the
+/// single-table and already-optimal cases depend on.
+pub fn optimize_costed(plan: LogicalPlan, catalog: &Catalog) -> Result<LogicalPlan> {
+    let plan = optimize(plan)?;
+    reorder_joins(plan, &mut Estimator::new(catalog))
 }
 
 // -------------------------------------------------------------- 1. folding
@@ -1488,6 +1527,649 @@ fn prune_at(plan: LogicalPlan, depth: usize) -> Result<LogicalPlan> {
         },
         other => map_children_res(other, |c| prune_at(c, depth))?,
     })
+}
+
+// ------------------------------------------------------- 6. join reordering
+
+/// Relations in one inner-join cluster past which the search gives up.
+///
+/// Not a cost ceiling -- the greedy pass is `O(n^3)` and would happily do
+/// sixty -- but a statement about what the estimates are worth. Estimation
+/// error compounds once per join, so by the twelfth relation the number being
+/// minimized is mostly the accumulated product of guesses, and reordering on
+/// it is a coin flip dressed as a decision. Past this the plan is left exactly
+/// as it was written.
+const MAX_CLUSTER: usize = 12;
+
+/// Relations up to which the search is exhaustive rather than greedy.
+///
+/// Left-deep dynamic programming over subsets is `O(2^n · n)` transitions:
+/// 2048 at eight relations, each a handful of floating-point operations over
+/// numbers already in the [`Estimator`]'s cache. Above it, greedy from every
+/// starting relation -- `O(n^3)`, and most of the win for a fraction of the
+/// enumeration, which is the standard result and holds here.
+///
+/// The whole pass is measured in microseconds against queries measured in
+/// milliseconds. Interleaved A/B in one binary behind a temporary switch, the
+/// sides alternating which ran first, best-of-400 x 9 rounds, `EXPLAIN` only
+/// so nothing but planning is timed, on a 200k/50k/50/50/5 fixture:
+///
+/// ```text
+///                          off       on
+///   SELECT 1              2.58 us   2.62 us   1.02x
+///   point lookup          5.75      5.79      1.01x
+///   single table + WHERE  8.50      8.67      1.02x
+///   GROUP BY              8.58      8.71      1.01x
+///   two-table join        9.88     10.08      1.02x
+///   LEFT JOIN            10.33     10.54      1.02x
+///   three-table join     14.58     19.58      1.34x
+///   three-table, already 14.42     16.71      1.16x
+///     in the best order
+///   four-table join      19.38     25.79      1.33x
+///   five-table join      24.75     33.75      1.36x
+/// ```
+///
+/// Everything a reorder cannot touch is 1.01-1.02x, which is the noise floor
+/// on this machine, and a second run reproduced all ten rows. A five-relation
+/// cluster costs 9-12 us depending on load, of which roughly a quarter is the
+/// survey and search and the rest is rebuilding the tree. The queries those
+/// plans go on to run take 8 to 23 ms.
+const MAX_EXHAUSTIVE: usize = 8;
+
+/// Reorder inner-join clusters by estimated cost.
+///
+/// It rewrites nothing it cannot improve: a cluster whose written order
+/// already costs the least of every order considered is left untouched, down
+/// to the identity of its `Schema`s. That is deliberate, and it is why a
+/// single-table query, a two-table join and an already-good order all come out
+/// of here exactly as they went in.
+///
+/// ## What it is worth
+///
+/// The point is not that a well-written query gets faster -- it does not. It
+/// is that a badly-written one stops being punished, so the spelling of the
+/// `FROM` clause stops being a performance decision. Interleaved A/B in one
+/// binary behind a temporary switch, the sides alternating which ran first,
+/// best-of-21 x 5 rounds, 200k/50k/50/50/5 rows on 14 cores, every pair of
+/// spellings verified to return identical values:
+///
+/// ```text
+///                            off        on     speedup
+///   three-way, worst    12.227 ms   8.301 ms    1.47x
+///   three-way, middle   12.153      8.033       1.51x
+///   three-way, best      8.163      8.333       0.98x
+///   four-way, worst     17.569      8.634       2.03x
+///   four-way, best       8.791      8.725       1.01x
+///   five-way, worst     23.070      8.819       2.62x
+///   five-way, best       9.045      8.885       1.02x
+///
+///   worst / best ratio    off     on
+///     three-way          1.50x   1.00x
+///     four-way           2.00x   0.99x
+///     five-way           2.55x   0.99x
+/// ```
+///
+/// The right-hand column is the whole result: three spellings of one query
+/// that cost 1.50x, 2.00x and 2.55x apart now cost the same, because they are
+/// the same plan. The shapes with nothing to gain measure 0.98x to 1.02x, and
+/// so do the ones this must not touch -- a single-table scan, a point lookup,
+/// a `GROUP BY`, a two-table join and a `LEFT JOIN` are 0.93x to 1.01x, which
+/// on a machine that swings 30% is "unchanged".
+///
+/// A second run an hour later, on a machine 25% slower in absolute terms,
+/// reproduced every ratio: 1.44x / 2.01x / 2.53x on the badly-written
+/// spellings, and 1.45x / 2.01x / 2.54x collapsing to 1.01x / 1.00x / 1.01x.
+/// The absolute milliseconds moved; the ratios did not, which is the only
+/// reason to believe either set.
+///
+/// ## What is safe to move, and what is not
+///
+/// Inner joins only. `INNER JOIN` is associative and commutative, so any
+/// permutation of a cluster's relations produces the same rows given the same
+/// predicates -- and every predicate is preserved, re-attached to the lowest
+/// node that can evaluate it. An outer join is neither: `(a LEFT JOIN b) LEFT
+/// JOIN c` and `a LEFT JOIN (b LEFT JOIN c)` disagree about the rows `b` fails
+/// to match. A cluster therefore **stops** at one, and that outer join's whole
+/// subtree becomes a single leaf of the cluster above it -- safe, and it still
+/// lets the relation it produces move as a unit.
+///
+/// `CROSS JOIN` is excluded as well, though it is commutative. A written cross
+/// join is either deliberate or a `WHERE`-clause join the binder could not
+/// see, and in both cases its estimate is a product this pass has no business
+/// acting on.
+///
+/// ## Why the output is a projection over a left-deep tree
+///
+/// A join's output schema is its left input's columns followed by its right
+/// input's, so any reordering permutes the columns everything above the
+/// cluster reads. Two ways to fix that: rewrite every column reference above
+/// the cluster, or put the columns back. This puts them back, with a
+/// projection of bare column references -- which `exec::operators::project`
+/// compiles to `Step::Take`, a *move* of each column buffer out of the input
+/// block. One `Vec<Column>` shuffle per block, nothing per row, and no risk of
+/// missing a reference in a node type somebody adds later.
+fn reorder_joins(plan: LogicalPlan, est: &mut Estimator<'_>) -> Result<LogicalPlan> {
+    reorder_at(plan, est, 0)
+}
+
+fn reorder_at(plan: LogicalPlan, est: &mut Estimator<'_>, depth: usize) -> Result<LogicalPlan> {
+    if depth > MAX_PLAN_DEPTH {
+        return Err(too_deep("plan"));
+    }
+    if !matches!(plan, LogicalPlan::Join { op: JoinOp::Inner, .. }) {
+        return map_children_res(plan, |c| reorder_at(c, est, depth + 1));
+    }
+    // The **topmost** inner join of a run is where a cluster is surveyed, and
+    // the recursion below it goes through the cluster's leaves rather than its
+    // own children. Doing it the other way round -- children first, as every
+    // other pass here does -- was wrong in a way worth recording: rebuilding a
+    // nested cluster leaves a projection on top of it, the projection is not a
+    // join, and so the cluster above it saw a two-relation join it declined to
+    // touch. A five-table chain written worst-first stayed at 1.57x while the
+    // three-table one converged, which is exactly the shape that gives it
+    // away.
+    let plan = cluster_leaves(plan, &mut |leaf| reorder_at(leaf, est, depth + 1))?;
+    match survey(&plan, est) {
+        Some(order) => rebuild(plan, &order),
+        None => Ok(plan),
+    }
+}
+
+/// Apply `f` to every leaf of the inner-join cluster rooted here.
+///
+/// A leaf is anything that is not an inner join: an outer join, an aggregate,
+/// a union, a scan. Estimation still happens bottom-up, because a leaf's row
+/// count is what the cluster above prices it by -- reordering *inside* a leaf
+/// cannot change that count, but it can change the plan the count belongs to.
+fn cluster_leaves(
+    plan: LogicalPlan,
+    f: &mut dyn FnMut(LogicalPlan) -> Result<LogicalPlan>,
+) -> Result<LogicalPlan> {
+    match plan {
+        LogicalPlan::Join { left, right, op: JoinOp::Inner, on, residual, schema } => {
+            Ok(LogicalPlan::Join {
+                left: Box::new(cluster_leaves(*left, f)?),
+                right: Box::new(cluster_leaves(*right, f)?),
+                op: JoinOp::Inner,
+                on,
+                residual,
+                schema,
+            })
+        }
+        leaf => f(leaf),
+    }
+}
+
+/// One relation of a cluster, as the search sees it.
+struct Leaf<'p> {
+    /// The subplan itself, kept so a column's statistics are resolved against
+    /// the *relation* that owns it rather than against whatever join node the
+    /// predicate happened to be written on. Without it, every equi-pair above
+    /// the bottom join lost its left-hand NDV: `Estimator::col_ndv` follows a
+    /// column down through projections and filters and stops at a join, which
+    /// is exactly what the left input of a left-deep tree is.
+    plan: &'p LogicalPlan,
+    /// First column of this relation in the cluster's concatenated space.
+    start: usize,
+    width: usize,
+    rows: f64,
+    /// Cost of producing those rows, before any join.
+    cost: f64,
+}
+
+/// One equi-join predicate, in the cluster's concatenated column space.
+struct Edge {
+    /// The two relations this predicate connects.
+    lrel: usize,
+    rrel: usize,
+    /// Distinct values behind each endpoint, or `None` where nothing bounds
+    /// it. Resolved once, here, because the search asks for them `O(2^n · n)`
+    /// times and the answer cannot change while it runs.
+    lndv: Option<f64>,
+    rndv: Option<f64>,
+}
+
+/// Everything the search needs, read out of the plan without consuming it.
+struct Survey<'p> {
+    leaves: Vec<Leaf<'p>>,
+    edges: Vec<Edge>,
+}
+
+/// Cost the written order, look for a cheaper one, answer with it.
+///
+/// `None` means "leave the plan alone": a cluster too small to have a choice,
+/// too big to estimate honestly, or already optimal.
+fn survey(plan: &LogicalPlan, est: &mut Estimator<'_>) -> Option<Vec<usize>> {
+    // Counted structurally, before a single statistic is looked up. Two
+    // relations have exactly one distinct join and the operator already
+    // chooses which side to build from, so there is nothing here to decide --
+    // and this is what makes sure there is nothing to pay either.
+    //
+    // **Measured, and the reason the check is here rather than after
+    // `collect`:** with the size test after the survey, a two-table join cost
+    // 8.62 us to plan against 7.38 us with the pass off -- 1.17x, for an
+    // answer that was always "leave it alone". The us was the zone-map fold
+    // over the 196 granules of the larger side, done to compute an NDV that
+    // was then discarded. With the test here it is 1.00x. A single-table
+    // query never reaches this function at all; `reorder_at` returns first.
+    let n = cluster_size(plan, MAX_CLUSTER);
+    if !(3..=MAX_CLUSTER).contains(&n) {
+        return None;
+    }
+    let mut s = Survey { leaves: Vec::with_capacity(n), edges: Vec::new() };
+    collect(plan, est, &mut s)?;
+    debug_assert_eq!(s.leaves.len(), n);
+    // A join's output *is* its two inputs' columns concatenated -- except that
+    // it is not always what the node says. `USING` merges the two copies of a
+    // key in the binder's **scope**, and a join built above a merged scope gets
+    // a `Schema` one field narrower per merged key than the block the operator
+    // will actually produce. `SELECT * FROM a JOIN b USING(k) JOIN c USING(k)`
+    // is the shape: five declared fields over a six-column block.
+    //
+    // The rewrite restores the cluster's columns through a projection built
+    // from this schema, so a schema that does not describe the block would
+    // drop the last column and rename the rest -- which is exactly what it did
+    // before this check existed: `column z is #5 but this block is only 5
+    // wide`, on a query that answers correctly today. Refuse the cluster
+    // instead. It is the narrow case (nested `USING`, not `ON`), and the cost
+    // of refusing is the plan the engine already produces.
+    if plan.schema().len() != s.leaves.iter().map(|l| l.width).sum::<usize>() {
+        return None;
+    }
+    // The written order is the incumbent. The search is allowed to replace it
+    // at *equal* cost, and that is on purpose: costing is commutative, so many
+    // spellings of one join really do cost the same, and a canonical answer
+    // among them is what makes `EXPLAIN` a function of the data rather than of
+    // the FROM clause. What protects the already-good plan is not a tie rule
+    // but the last line of this function -- an order the search agrees with is
+    // never rebuilt, so it keeps its `Schema`s and gets no projection.
+    let written: Vec<usize> = (0..n).collect();
+    let mut best = (cost_order(&s, &written), written.clone());
+    if n <= MAX_EXHAUSTIVE {
+        exhaustive(&s, &mut best);
+    } else {
+        greedy(&s, &mut best);
+    }
+    (best.1 != written).then_some(best.1)
+}
+
+/// Relations in the inner-join cluster rooted here, stopping early once `cap`
+/// is exceeded so a pathological FROM list costs a bounded walk.
+fn cluster_size(plan: &LogicalPlan, cap: usize) -> usize {
+    let LogicalPlan::Join { left, right, op: JoinOp::Inner, .. } = plan else { return 1 };
+    let l = cluster_size(left, cap);
+    if l > cap {
+        return l;
+    }
+    l + cluster_size(right, cap)
+}
+
+/// Take the cluster apart without consuming it. `None` for a shape the search
+/// will not touch.
+fn collect<'p>(plan: &'p LogicalPlan, est: &mut Estimator<'_>, s: &mut Survey<'p>) -> Option<()> {
+    let LogicalPlan::Join { left, right, op: JoinOp::Inner, on, .. } = plan else {
+        // A leaf: anything that is not an inner join, including an outer join
+        // whose subtree moves as one relation.
+        let start = s.leaves.last().map_or(0, |l| l.start + l.width);
+        let rows = est.rows(plan);
+        let width = plan.schema().len();
+        s.leaves.push(Leaf { plan, start, width, rows, cost: stats::scan_cost(rows) });
+        // Bounding the count here, rather than only in `survey`, keeps a
+        // pathological FROM list from allocating past the point the search
+        // would refuse it anyway.
+        return (s.leaves.len() <= MAX_CLUSTER).then_some(());
+    };
+    let first = s.leaves.len();
+    collect(left, est, s)?;
+    let lbase = s.leaves[first].start;
+    // Where the right input's columns start: the left input contributed every
+    // column collected since `first`.
+    let rbase = lbase + s.leaves[first..].iter().map(|l| l.width).sum::<usize>();
+    collect(right, est, s)?;
+    for &(l, r) in on {
+        let (l, r) = (lbase + l, rbase + r);
+        let (lrel, rrel) = (leaf_of(s, l)?, leaf_of(s, r)?);
+        let (lp, lstart) = (s.leaves[lrel].plan, s.leaves[lrel].start);
+        let (rp, rstart) = (s.leaves[rrel].plan, s.leaves[rrel].start);
+        let lndv = est.col_ndv(lp, l - lstart);
+        let rndv = est.col_ndv(rp, r - rstart);
+        s.edges.push(Edge { lrel, rrel, lndv, rndv });
+    }
+    Some(())
+}
+
+/// Which leaf owns concatenated-space column `c`.
+fn leaf_of(s: &Survey<'_>, c: usize) -> Option<usize> {
+    s.leaves.iter().position(|l| l.start <= c && c < l.start + l.width)
+}
+
+// -------------------------------------------------------------- the search
+
+/// Cost of a left-deep tree over `order`.
+///
+/// The same function prices the written order and every candidate, so a
+/// systematic scale error in the estimates cancels out of the comparison.
+/// What does not cancel is error that grows with depth, which is what
+/// [`MAX_CLUSTER`] exists to bound.
+fn cost_order(s: &Survey<'_>, order: &[usize]) -> f64 {
+    let mut acc = 0u32;
+    let mut side = Side { rows: 1.0, cost: 0.0 };
+    for (i, &rel) in order.iter().enumerate() {
+        let leaf = &s.leaves[rel];
+        if i == 0 {
+            side = Side { rows: leaf.rows, cost: leaf.cost };
+            acc = 1 << rel;
+            continue;
+        }
+        side = step(s, acc, side, rel);
+        acc |= 1 << rel;
+    }
+    side.cost
+}
+
+/// Join everything in `acc` (already costed as `side`) with relation `rel`.
+fn step(s: &Survey<'_>, acc: u32, side: Side, rel: usize) -> Side {
+    let leaf = &s.leaves[rel];
+    let mut out = side.rows * leaf.rows;
+    for e in &s.edges {
+        let far = if (acc >> e.lrel) & 1 == 1 && e.rrel == rel {
+            Some((e.lndv, e.rndv))
+        } else if (acc >> e.rrel) & 1 == 1 && e.lrel == rel {
+            Some((e.rndv, e.lndv))
+        } else {
+            None
+        };
+        let Some((acc_ndv, rel_ndv)) = far else { continue };
+        let a = acc_ndv.map(|v| v.min(side.rows));
+        let b = rel_ndv.map(|v| v.min(leaf.rows));
+        let div = match (a, b) {
+            (Some(x), Some(y)) => x.max(y),
+            (Some(x), None) | (None, Some(x)) => x,
+            (None, None) => continue,
+        };
+        out /= div.max(1.0);
+    }
+    // No connecting predicate is a cross product, and it is priced as one --
+    // the product is left standing as the output size. That is what stops the
+    // search from reordering a chain into a cartesian explosion: an
+    // unconstrained pair never looks cheap.
+    let out = out.max(1.0);
+    let next = Side { rows: leaf.rows, cost: leaf.cost };
+    Side { rows: out, cost: stats::join_cost(side, next, out) }
+}
+
+/// Left-deep dynamic programming over every subset of the cluster.
+///
+/// `best[mask]` is the cheapest left-deep tree covering exactly the relations
+/// in `mask`, together with the relation joined last -- which is all that is
+/// needed to walk the answer back out, because a left-deep tree's prefix is
+/// itself the best tree for `mask` without that relation.
+fn exhaustive(s: &Survey<'_>, out: &mut (f64, Vec<usize>)) {
+    let n = s.leaves.len();
+    let full = (1usize << n) - 1;
+    // (cost, rows, last relation). One `Vec` of at most 256 entries, once per
+    // cluster, at plan time.
+    let mut best: Vec<Option<(Side, usize)>> = vec![None; full + 1];
+    for i in 0..n {
+        let l = &s.leaves[i];
+        best[1 << i] = Some((Side { rows: l.rows, cost: l.cost }, i));
+    }
+    for mask in 1..=full {
+        let Some((side, _)) = best[mask] else { continue };
+        // A relation with no predicate connecting it to what is already joined
+        // can only be added as a cross product. Considered only when nothing
+        // else can be, so a genuinely disconnected FROM list still gets an
+        // order rather than no plan.
+        let connected: Vec<usize> = (0..n)
+            .filter(|&j| mask >> j & 1 == 0 && touches(s, mask, j))
+            .collect();
+        let candidates: Vec<usize> = if connected.is_empty() {
+            (0..n).filter(|&j| mask >> j & 1 == 0).collect()
+        } else {
+            connected
+        };
+        for j in candidates {
+            let cand = step(s, mask as u32, side, j);
+            let slot = mask | 1 << j;
+            if best[slot].is_none_or(|(b, last)| beats(s, (cand, j), (b, last))) {
+                best[slot] = Some((cand, j));
+            }
+        }
+    }
+    let Some((side, _)) = best[full] else { return };
+    // `>` not `>=`: the table covers the written order too, so its answer is
+    // never more expensive, and taking it on a tie is what makes the result
+    // canonical. [`greedy`] deliberately does the opposite; see there.
+    if side.cost > out.0 {
+        return;
+    }
+    let mut order = vec![0usize; n];
+    let mut mask = full;
+    for slot in (0..n).rev() {
+        let (_, last) = best[mask].expect("every reachable mask was filled");
+        order[slot] = last;
+        mask ^= 1 << last;
+    }
+    *out = (side.cost, order);
+}
+
+/// Greedy from every starting relation, keeping the best run.
+///
+/// The classic "smallest intermediate first" heuristic, run `n` times so the
+/// choice of first relation is searched rather than assumed -- which is where
+/// a single greedy run usually goes wrong, because the first relation is the
+/// one decision it never revisits.
+///
+/// **Ties go to the written order here**, the opposite of [`exhaustive`], and
+/// for a reason: greedy does not enumerate every order, so an answer that
+/// merely *ties* the written one is not evidence that the written one was
+/// beatable -- it is one heuristic run agreeing with it. Only a strict
+/// improvement is worth a rewrite. The cost is that a cluster of nine or more
+/// relations does not converge on one plan across spellings the way a smaller
+/// one does; the alternative is churning plans on the strength of a search
+/// that did not look everywhere.
+fn greedy(s: &Survey<'_>, out: &mut (f64, Vec<usize>)) {
+    let n = s.leaves.len();
+    let mut order = Vec::with_capacity(n);
+    for start in 0..n {
+        order.clear();
+        order.push(start);
+        let mut mask = 1u32 << start;
+        let l = &s.leaves[start];
+        let mut side = Side { rows: l.rows, cost: l.cost };
+        for _ in 1..n {
+            let mut pick: Option<(usize, Side)> = None;
+            let any = (0..n).any(|j| mask >> j & 1 == 0 && touches(s, mask as usize, j));
+            for j in 0..n {
+                if mask >> j & 1 == 1 || (any && !touches(s, mask as usize, j)) {
+                    continue;
+                }
+                let cand = step(s, mask, side, j);
+                if pick.is_none_or(|(last, b)| beats(s, (cand, j), (b, last))) {
+                    pick = Some((j, cand));
+                }
+            }
+            let Some((j, cand)) = pick else { break };
+            order.push(j);
+            mask |= 1 << j;
+            side = cand;
+        }
+        if order.len() == n && side.cost < out.0 {
+            *out = (side.cost, order.clone());
+        }
+    }
+}
+
+/// Is `(cost, last relation)` a better way to cover a set of relations than
+/// the one already recorded?
+///
+/// Cheaper wins. **A tie is broken on the relation, never on where it was
+/// written**, and that is what makes the plan a function of the data rather
+/// than of the FROM clause. Costing is commutative -- the operator builds on
+/// whichever side is smaller -- so `dim JOIN geo` and `geo JOIN dim` really do
+/// cost the same, and without a stable rule the search returns whichever
+/// spelling it happened to reach first. Two users with the same data and the
+/// same query then read two different `EXPLAIN`s, and a plan nobody can diff
+/// is a plan nobody can debug.
+///
+/// The rule is "the larger relation is the one joined last", falling back to
+/// the wider one, both of which are properties of the relation itself. It
+/// costs nothing: it only ever fires where the two costs are already equal.
+fn beats(s: &Survey<'_>, cand: (Side, usize), cur: (Side, usize)) -> bool {
+    if cand.0.cost != cur.0.cost {
+        return cand.0.cost < cur.0.cost;
+    }
+    let (a, b) = (&s.leaves[cand.1], &s.leaves[cur.1]);
+    (a.rows, a.width) > (b.rows, b.width)
+}
+
+/// Does relation `j` share an equi-predicate with anything in `mask`?
+fn touches(s: &Survey<'_>, mask: usize, j: usize) -> bool {
+    s.edges.iter().any(|e| {
+        (e.lrel == j && mask >> e.rrel & 1 == 1) || (e.rrel == j && mask >> e.lrel & 1 == 1)
+    })
+}
+
+// ------------------------------------------------------------- the rewrite
+
+/// A cluster taken apart: the relations, and every predicate between them
+/// expressed in the concatenated column space they share.
+struct Parts {
+    leaves: Vec<LogicalPlan>,
+    starts: Vec<usize>,
+    /// Equi-pairs, as concatenated-space column indices.
+    on: Vec<(usize, usize)>,
+    /// Non-equi remainders, with their columns already in that space.
+    residuals: Vec<BoundExpr>,
+}
+
+/// Rebuild the cluster as a left-deep tree over `order`, then put the columns
+/// back.
+fn rebuild(plan: LogicalPlan, order: &[usize]) -> Result<LogicalPlan> {
+    // Taken before the tree is consumed: the projection on top has to restore
+    // exactly these fields, with these names and these types, or a query above
+    // the join stops resolving.
+    let out_schema = plan.schema().clone();
+    let mut p = Parts {
+        leaves: Vec::with_capacity(order.len()),
+        starts: Vec::with_capacity(order.len()),
+        on: Vec::new(),
+        residuals: Vec::new(),
+    };
+    take(plan, &mut p);
+    debug_assert_eq!(p.leaves.len(), order.len());
+
+    // Concatenated-space columns produced so far, in the order they will
+    // appear in the tree being built.
+    let mut have: Vec<usize> = Vec::with_capacity(out_schema.len());
+    let mut used = vec![false; p.on.len()];
+    let mut placed = vec![false; p.residuals.len()];
+    let mut acc: Option<LogicalPlan> = None;
+
+    for &rel in order {
+        let (start, width) = (p.starts[rel], p.leaves[rel].schema().len());
+        let leaf = std::mem::replace(&mut p.leaves[rel], LogicalPlan::Empty {
+            schema: Schema::new_unchecked(Vec::new()),
+        });
+        let Some(left) = acc.take() else {
+            have.extend(start..start + width);
+            acc = Some(leaf);
+            continue;
+        };
+        let pos = |have: &[usize], c: usize| have.iter().position(|&h| h == c);
+        let mut on = Vec::new();
+        for (i, &(l, r)) in p.on.iter().enumerate() {
+            if used[i] {
+                continue;
+            }
+            let inside = |c: usize| (start..start + width).contains(&c);
+            let pair = match (pos(&have, l), pos(&have, r)) {
+                (Some(a), _) if inside(r) => Some((a, r - start)),
+                (_, Some(b)) if inside(l) => Some((b, l - start)),
+                _ => None,
+            };
+            if let Some(pair) = pair {
+                used[i] = true;
+                on.push(pair);
+            }
+        }
+        // Everything the new node can see, as a map from concatenated-space
+        // column to its index in this node's own output.
+        let map = |have: &[usize], c: usize| {
+            pos(have, c).or_else(|| {
+                (start..start + width).contains(&c).then(|| have.len() + (c - start))
+            })
+        };
+        let mut conds = Vec::new();
+        for (i, r) in p.residuals.iter().enumerate() {
+            if placed[i] || !r.referenced_columns().iter().all(|&c| map(&have, c).is_some()) {
+                continue;
+            }
+            placed[i] = true;
+            let mut e = r.clone();
+            e.remap_columns(&|c| map(&have, c))?;
+            conds.push(e);
+        }
+        let schema = left.schema().concat(leaf.schema());
+        have.extend(start..start + width);
+        acc = Some(LogicalPlan::Join {
+            left: Box::new(left),
+            right: Box::new(leaf),
+            op: JoinOp::Inner,
+            on,
+            residual: BoundExpr::join_conjuncts(conds),
+            schema,
+        });
+    }
+    let root = acc.expect("a cluster always has at least one relation");
+    debug_assert!(used.iter().all(|&u| u), "an equi-pair was dropped");
+    debug_assert!(placed.iter().all(|&p| p), "a residual was dropped");
+
+    // Put the columns back. `have[i]` is the concatenated-space column sitting
+    // at position `i` of the tree just built, so the projection reads position
+    // `have.iter().position(|&h| h == c)` for original column `c`.
+    let exprs = (0..out_schema.len())
+        .map(|c| {
+            let f = out_schema.field(c);
+            BoundExpr::Column {
+                index: have.iter().position(|&h| h == c).expect("every column was produced"),
+                ty: f.ty.clone(),
+                name: f.name.clone(),
+            }
+        })
+        .collect();
+    Ok(LogicalPlan::Project { input: Box::new(root), exprs, schema: out_schema })
+}
+
+/// Consume the cluster, recording each relation and each predicate between
+/// them in the concatenated column space.
+///
+/// Mirrors [`collect`]'s traversal exactly -- left before right, depth first
+/// -- because the search's leaf indices are positions in that walk.
+fn take(plan: LogicalPlan, p: &mut Parts) {
+    match plan {
+        LogicalPlan::Join { left, right, op: JoinOp::Inner, on, residual, .. } => {
+            let first = p.leaves.len();
+            take(*left, p);
+            let lbase = p.starts[first];
+            let rbase: usize =
+                lbase + p.leaves[first..].iter().map(|l| l.schema().len()).sum::<usize>();
+            take(*right, p);
+            p.on.extend(on.into_iter().map(|(l, r)| (lbase + l, rbase + r)));
+            if let Some(mut e) = residual {
+                // The residual is written against the join's own concatenated
+                // schema, which starts at `lbase` in the cluster's.
+                let _ = e.remap_columns(&|c| Some(lbase + c));
+                p.residuals.push(e);
+            }
+        }
+        leaf => {
+            let start = p.starts.last().map_or(0, |&s| s)
+                + p.leaves.last().map_or(0, |l| l.schema().len());
+            p.starts.push(start);
+            p.leaves.push(leaf);
+        }
+    }
 }
 
 // ------------------------------------------------------------------ helpers
