@@ -166,7 +166,7 @@ fn granule_body(g: &Granule, ncols: usize) -> Vec<u8> {
 /// and `FixedString(n)` need no separate encoding, and a corrupt file is
 /// diagnosable with `strings(1)`.
 fn put_column(w: &mut Writer, c: &PackedColumn) {
-    w.str(&c.ty.to_string());
+    w.display(&c.ty);
     w.varint(c.len() as u64);
     w.u64(c.max_lane());
     let lanes = c.lanes();
@@ -269,7 +269,7 @@ fn put_opt_index(w: &mut Writer, v: Option<usize>) {
 ///   * a duplicate origin (which would make two entries name one file, and so
 ///     duplicate rows on reload) is refused the same way -- `taken` lets each
 ///     file be claimed once, and the loser is rewritten.
-pub fn write_table(dir: &Path, table: &Table) -> Result<()> {
+pub fn write_table(dir: &Path, table: &Table, wal_committed: u64) -> Result<()> {
     if !store::is_safe_name(&table.def.name) {
         return Err(crate::common::Error::storage(format!(
             "table name `{}` cannot be a directory name",
@@ -321,14 +321,14 @@ pub fn write_table(dir: &Path, table: &Table) -> Result<()> {
         }
     }
 
-    // Everything already in the log is now inside the parts above.
-    let wal_len = std::fs::metadata(tdir.join(store::WAL_FILE))
-        .map(|m| m.len())
-        .unwrap_or(format::HEADER_LEN as u64);
-
+    // Everything already in the log is now inside the parts above. The
+    // watermark is a parameter rather than a `stat` of the log: the caller
+    // rolls the log first and hands over the stream position the roll
+    // produced, which is the authority for that number and cannot race with a
+    // writer the way a `stat` could.
     store::commit(
         &tdir.join(store::TABLE_FILE),
-        &table_doc(&table.def, &names, wal_len),
+        &table_doc(&table.def, &names, wal_committed),
     )?;
 
     for (k, (_, old)) in on_disk.iter().enumerate() {
@@ -383,7 +383,7 @@ pub fn put_table_def(w: &mut Writer, def: &TableDef) {
     w.varint(def.schema.len() as u64);
     for f in def.schema.fields() {
         w.str(&f.name);
-        w.str(&f.ty.to_string());
+        w.display(&f.ty);
         match f.default_sql() {
             Some(d) => {
                 w.u8(1);
@@ -417,7 +417,7 @@ pub fn put_block(w: &mut Writer, b: &Block) {
     w.varint(b.width() as u64);
     w.varint(b.rows() as u64);
     for c in &b.columns {
-        w.str(&c.ty.to_string());
+        w.display(&c.ty);
         match &c.data {
             ColumnData::U64(v) => w.u64_slice(v),
             ColumnData::I64(v) => {
@@ -550,14 +550,14 @@ mod tests {
     fn write_table_commits_parts_and_collects_the_old_ones() {
         let s = Scratch::new("wt-commit");
         let t = sample_table("t", &[600, 400, 200]);
-        write_table(s.path(), &t).unwrap();
+        write_table(s.path(), &t, 0).unwrap();
         let tdir = s.join("t");
         assert_eq!(store::list_part_files(&tdir).unwrap().len(), 3);
         assert!(tdir.join(store::TABLE_FILE).exists());
 
         // A second commit with fewer parts must leave exactly the new ones.
         let t2 = sample_table("t", &[100]);
-        write_table(s.path(), &t2).unwrap();
+        write_table(s.path(), &t2, 0).unwrap();
         let files = store::list_part_files(&tdir).unwrap();
         assert_eq!(files.len(), 1, "superseded parts must be collected: {files:?}");
         assert_eq!(files[0].0, 4, "sequence numbers are never reused");
@@ -569,13 +569,13 @@ mod tests {
     fn an_unchanged_part_keeps_its_file() {
         let s = Scratch::new("wt-incremental");
         let t = sample_table("t", &[600, 400]);
-        write_table(s.path(), &t).unwrap();
+        write_table(s.path(), &t, 0).unwrap();
         let tdir = s.join("t");
         let first = store::list_part_files(&tdir).unwrap();
         let bytes: Vec<Vec<u8>> =
             first.iter().map(|(_, n)| std::fs::read(tdir.join(n)).unwrap()).collect();
 
-        write_table(s.path(), &t).unwrap();
+        write_table(s.path(), &t, 0).unwrap();
         assert_eq!(store::list_part_files(&tdir).unwrap(), first, "a part was renumbered");
         for ((_, n), was) in first.iter().zip(&bytes) {
             assert_eq!(&std::fs::read(tdir.join(n)).unwrap(), was, "{n} was rewritten");
@@ -590,12 +590,12 @@ mod tests {
     fn a_part_whose_file_vanished_is_rewritten_not_named() {
         let s = Scratch::new("wt-vanished");
         let t = sample_table("t", &[600, 400]);
-        write_table(s.path(), &t).unwrap();
+        write_table(s.path(), &t, 0).unwrap();
         let tdir = s.join("t");
         let files = store::list_part_files(&tdir).unwrap();
         std::fs::remove_file(tdir.join(&files[0].1)).unwrap();
 
-        write_table(s.path(), &t).unwrap();
+        write_table(s.path(), &t, 0).unwrap();
         let img = reader::read_table_image(&tdir).unwrap();
         assert_eq!(img.parts.len(), 2, "the commit lost a part");
         for n in &img.part_files {
@@ -619,7 +619,7 @@ mod tests {
         a.set_origin(1);
         b.set_origin(1);
         let t = Table::from_parts(table_def("t"), vec![a, b], 1 << 20);
-        write_table(s.path(), &t).unwrap();
+        write_table(s.path(), &t, 0).unwrap();
 
         let img = reader::read_table_image(&tdir).unwrap();
         assert_eq!(img.part_files.len(), 2);
@@ -631,7 +631,7 @@ mod tests {
     fn write_table_of_an_empty_table_commits_nothing_but_the_definition() {
         let s = Scratch::new("wt-empty");
         let t = Table::new(table_def("t"), 1 << 20);
-        write_table(s.path(), &t).unwrap();
+        write_table(s.path(), &t, 0).unwrap();
         let img = reader::read_table_image(&s.join("t")).unwrap();
         assert!(img.parts.is_empty());
         assert_eq!(img.def.name, "t");
@@ -641,10 +641,10 @@ mod tests {
     fn stray_files_in_a_table_directory_are_left_alone() {
         let s = Scratch::new("wt-stray");
         let t = sample_table("t", &[100]);
-        write_table(s.path(), &t).unwrap();
+        write_table(s.path(), &t, 0).unwrap();
         let stray = s.join("t").join("notes.txt");
         std::fs::write(&stray, b"hand written").unwrap();
-        write_table(s.path(), &t).unwrap();
+        write_table(s.path(), &t, 0).unwrap();
         assert!(stray.exists(), "the GC must only touch files it named");
     }
 

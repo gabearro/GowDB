@@ -584,8 +584,11 @@ fn wal(catalog: &Catalog) -> Result<Vec<Vec<Value>>> {
     let mut out = Vec::new();
     for (db, name) in roster(catalog)? {
         let tdir = root.join(&db).join(&name);
-        let log = tdir.join(crate::persist::store::WAL_FILE);
-        let wal_bytes = std::fs::metadata(&log).map_or(0, |m| m.len());
+        // The stream position the log has reached, and the position of its
+        // first replayable record -- both from the active segment's name and
+        // length, so a table with a 64 MiB archive still costs one `stat`.
+        let (stream_end, live_floor) =
+            crate::persist::wal::live_extent_of(root, &db, &name).unwrap_or((0, 0));
         // The `TABLE` file's own header, not `read_table_image`: the watermark
         // is in the first few bytes and reading the image would decode every
         // part file to find it.
@@ -604,22 +607,49 @@ fn wal(catalog: &Catalog) -> Result<Vec<Vec<Value>>> {
             .map_or(0, |d| d.as_secs());
         let segs = crate::persist::wal::segments(root, &db, &name).unwrap_or_default();
         let archive_bytes: u64 = segs.iter().map(|s| s.end - s.origin).sum();
-        let first = segs.first().map_or(0, |s| s.span.first_seq);
         let last = segs.last().map_or(0, |s| s.span.last_seq);
         let horizon = crate::persist::wal::archive_horizon(root, &db, &name).unwrap_or(0);
-        // An empty log is a header and nothing else; anything longer is a
-        // record the archive will not hold until the next checkpoint.
-        let empty = crate::persist::format::HEADER_LEN as u64;
-        let lags = !segs.is_empty() && wal_bytes > empty;
+        // The first recovery LSN the archive can still serve, which is one
+        // past what pruning has discarded -- the same expression
+        // `wal::archive_end` uses, so this column and the refusal an operator
+        // reads when they aim below it are the same number. Taking it from the
+        // oldest segment's own span instead would be off by one *and* would
+        // make this column a copy of `horizon_seq`: a segment's `first_seq` is
+        // the tick immediately before it, which is exactly the horizon.
+        //
+        // With one exception, and it is deliberate: an archive retention has
+        // emptied reads 0 here while `archive_end` still says `horizon + 1`,
+        // so a refusal in that state names a number this column does not show.
+        // 0 is the honest answer for a window with nothing in it -- `segments`
+        // and `archive_last_seq` are 0 beside it, and `horizon_seq` is what
+        // says how far the loss reaches -- but the two are not one number
+        // there, and a reader of this line should not think they are.
+        let first = if segs.is_empty() { 0 } else { horizon + 1 };
+        // The live segment holds a record the archive will not have until the
+        // next checkpoint. Exact rather than approximate: `live_floor` is the
+        // segment's own first record position, so a log that was rolled a
+        // microsecond ago answers "no".
+        //
+        // Deliberately the *same* predicate as `wal::archive_lags`, with no
+        // extra clause of its own. It carried a `!segs.is_empty()` guard the
+        // function does not have, which made a table with records in its first
+        // segment and nothing sealed yet read 0 here while a
+        // `RESTORE ... UNTIL TIMESTAMP` refused it for lagging -- a column and
+        // a refusal, in the same process, disagreeing about one fact.
+        // Bytes in the *live* segment, not a stream position: the log never
+        // restarts now, so an absolute figure would only grow. `wal_committed`
+        // beside it is a stream position, and the two are deliberately
+        // different quantities -- `replay_bytes` is the one that compares them.
+        let wal_bytes = stream_end.saturating_sub(live_floor);
+        let lags = stream_end > live_floor;
         out.push(vec![
             text(&db),
             text(&name),
             Value::UInt(wal_bytes),
             Value::UInt(committed),
-            // What a crash right now would have to replay. `committed` is 0 on
-            // a table that has never been checkpointed, and the log's own
-            // header is not a record, so the floor is the header length.
-            Value::UInt(wal_bytes.saturating_sub(committed.max(empty))),
+            // What a crash right now would have to replay: everything past the
+            // watermark the last checkpoint recorded.
+            Value::UInt(stream_end.saturating_sub(committed.max(live_floor))),
             Value::DateTime(checkpointed as i64),
             num(segs.len()),
             Value::UInt(archive_bytes),

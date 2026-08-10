@@ -43,9 +43,10 @@
 //!     (mid-rename), a log has been truncated (mid-checkpoint), one table's
 //!     commit marker is down and the next one's is not (mid-commit). These are
 //!     deterministic and reproduce every time;
-//!   * **offline truncation** -- copy a crashed directory and cut `wal.log`
-//!     back to every byte offset in turn. That is a crash at *every* point in
-//!     the append path, exhaustively, with no scheduler involved.
+//!   * **offline truncation** -- copy a crashed directory and cut its newest
+//!     log segment back to every byte offset in turn. That is a crash at
+//!     *every* point in the append path, exhaustively, with no scheduler
+//!     involved.
 //!
 //! ## Runtime
 //!
@@ -335,7 +336,7 @@ fn every_acknowledged_insert_survives_a_kill() {
     // `BufWriter` in `main.rs`, which is what forces the flush.
     const PAD_ROWS: u64 = 96;
 
-    let mut best_acked = 0u64;
+    let (mut best_acked, mut killed) = (0u64, 0u64);
     for trial in 0..trials {
         let dir = Scratch::new("ack");
         let pad = "p".repeat(900);
@@ -396,6 +397,7 @@ fn every_acknowledged_insert_survives_a_kill() {
         let _ = child.wait();
         pump.join().expect("pump");
 
+        killed += live as u64;
         let seen = acked.load(Ordering::Relaxed);
         let n_acked = (seen + 1).max(0) as u64;
         best_acked = best_acked.max(n_acked);
@@ -414,7 +416,8 @@ fn every_acknowledged_insert_survives_a_kill() {
         "no insert was ever observed acknowledged -- the ack channel is not working, \
          so this test proves nothing"
     );
-    eprintln!("  deepest observed acknowledgement: {best_acked} inserts");
+    eprintln!("  {killed}/{trials} trials were killed mid-stream; deepest observed \
+acknowledgement: {best_acked} inserts");
 }
 
 /// Kill inside a flush and inside a compaction.
@@ -481,6 +484,7 @@ fn kill_during_flush_and_compaction() {
         );
     }
     assert!(killed > 0, "every trial finished before its kill");
+    eprintln!("  {killed}/{trials} trials were killed mid-flush or mid-compaction");
 }
 
 /// Kill while the checkpoint is deleting durable records.
@@ -501,20 +505,19 @@ fn kill_during_checkpoint_log_truncation() {
         let dir = Scratch::new("ckpt");
         setup(&dir, T_DDL);
         let script = write_script(&dir, "w.sql", &insert_script(N));
-        let wal = dir.path().join("default").join("t").join("wal.log");
-        let mut high = 0u64;
+        let wal = wal_dir(&dir, "t");
         let live = kill_when(
             spawn(&dir, &script),
             || {
-                let n = std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0);
-                high = high.max(n);
-                // Shrunk from its high-water mark: `Wal::truncate` has run and
-                // the process is inside `save_catalog`.
-                // 2048 is well above the 12-byte header and well below the
-                // ~6 KiB the 150 records here occupy (~42 bytes each,
-                // measured), so the gate cannot fire on a log that has not
-                // been written to yet and cannot fail to fire on one that has.
-                high > 2048 && n < high
+                // A second segment appeared: `Wal::roll` has published the
+                // successor and the process is inside `save_catalog`.
+                //
+                // The old trigger was "the log shrank", and it stopped
+                // existing with the layout: a roll does not empty a file, it
+                // seals one where it stands and starts another. Same window,
+                // same instant, read from the directory instead of from a
+                // length.
+                segments(&wal) > 1
             },
             Duration::from_secs(60),
         );
@@ -531,7 +534,8 @@ fn kill_during_checkpoint_log_truncation() {
             N - ids.len() as u64
         );
     }
-    assert!(killed > 0, "the log never shrank -- the trigger never fired");
+    assert!(killed > 0, "no segment was ever rolled -- the trigger never fired");
+    eprintln!("  {killed}/{trials} trials were killed the instant a segment was sealed");
 }
 
 /// Kill in the one-instruction window between the temp file and the rename.
@@ -626,12 +630,13 @@ fn kill_during_ddl() {
         t0.elapsed()
     };
 
+    let mut killed = 0u64;
     for trial in 0..trials {
         let dir = Scratch::new("ddl");
         setup(&dir, T_DDL);
         let script = write_script(&dir, "w.sql", &body);
         let at = base.mul_f64(0.05 + rng.frac() * 1.1);
-        kill_after(spawn(&dir, &script), at);
+        killed += kill_after(spawn(&dir, &script), at) as u64;
 
         // `SHOW TABLES` lists what the catalog claims; every one of them must
         // then answer. One process for the whole check, not one per table:
@@ -654,6 +659,7 @@ fn kill_during_ddl() {
             "trial {trial} (kill at {at:?}): the catalog lists {names:?} but one does not open"
         );
     }
+    eprintln!("  {killed}/{trials} trials were killed mid-DDL");
 }
 
 /// A single-table transaction is all or nothing across a crash.
@@ -729,6 +735,7 @@ fn single_table_transaction_is_all_or_nothing() {
         );
     }
     assert!(killed > 0, "every trial finished before its kill");
+    eprintln!("  {killed}/{trials} trials were killed inside a single-table transaction");
 }
 
 /// A crash inside a `COMMIT` over twelve tables commits all of them or none.
@@ -777,11 +784,7 @@ fn a_crash_inside_a_multi_table_commit_is_all_or_nothing() {
     body.push_str("COMMIT;\n");
     let script = write_script(&dir, "w.sql", &body);
 
-    let wal = |k: usize| {
-        std::fs::metadata(dir.path().join("default").join(format!("t{k}")).join("wal.log"))
-            .map(|m| m.len())
-            .unwrap_or(0)
-    };
+    let wal = |k: usize| wal_bytes(&dir, &format!("t{k}"));
     let mut staged = 0u64;
     let live = kill_when(
         spawn(&dir, &script),
@@ -878,6 +881,364 @@ fn a_script_that_ends_inside_a_transaction() {
     );
 }
 
+// ------------------------------------------------- the roll, and what it seals
+
+/// Run `body` against a freshly built directory and `kill -9` it at `at`,
+/// halving the delay and starting over until the kill actually lands on a live
+/// process.
+///
+/// The existing tests that needed this retried into a *second* directory and
+/// then made their assertions against the first, whose child had run to
+/// completion -- so on a warm machine the retry restored the `killed > 0`
+/// accounting without restoring the coverage. This rebuilds the same directory
+/// each time, so the state finally examined is always the state a kill left.
+/// Returns whether a kill landed, and where.
+fn kill_live(dir: &Scratch, ddl: &str, body: &str, at: Duration) -> (bool, Duration) {
+    let mut at = at;
+    for _ in 0..7 {
+        let _ = std::fs::remove_dir_all(dir.path());
+        std::fs::create_dir_all(dir.path()).unwrap();
+        setup(dir, ddl);
+        let script = write_script(dir, "w.sql", body);
+        if kill_after(spawn(dir, &script), at) {
+            return (true, at);
+        }
+        at /= 2;
+    }
+    (false, at)
+}
+
+/// `n` transactions, each of which forces a **segment roll** at its `COMMIT`.
+///
+/// The shape is the engine's own default and not a contrivance: an unkeyed
+/// `MergeTree` folds a `DELETE` to parts at commit (`apply_sweep` ->
+/// `mark_fold` -> `fold_to_parts`), and a fold rolls the log. So each
+/// transaction inserts the row under test, inserts a scratch row, deletes the
+/// scratch row, and commits -- and the log grows a segment per transaction.
+/// Measured: 10 transactions, 11 segments.
+///
+/// That makes the roll a *per-transaction* window rather than a per-checkpoint
+/// one, which is what lets a timing sweep land inside it at all.
+fn roll_script(n: u64) -> String {
+    let mut s = String::with_capacity(n as usize * 160);
+    for i in 0..n {
+        let scratch = 1_000_000 + i;
+        s.push_str(&format!(
+            "BEGIN;\nINSERT INTO t VALUES ({i},'r{i}');\n\
+             INSERT INTO t VALUES ({scratch},'x');\n\
+             DELETE FROM t WHERE id = {scratch};\nCOMMIT;\n"
+        ));
+    }
+    s
+}
+
+/// Ids below the scratch range, which is what the prefix oracle applies to.
+fn live_ids(ids: &[u64]) -> Vec<u64> {
+    ids.iter().copied().filter(|&i| i < 1_000_000).collect()
+}
+
+/// Kill inside a segment roll, over and over, at a swept fraction of the run.
+///
+/// The roll is the operation that decides what the archive holds forever: it
+/// appends a tick, `fsync`s, and publishes the successor by
+/// `store::atomic_write`. Three windows, and the middle one is the interesting
+/// one -- the sealed segment's `fsync` has returned but the successor does not
+/// exist yet, so the sealed segment is still the newest file and therefore
+/// still *active*. That state has to be indistinguishable from "no roll was
+/// attempted", or a checkpoint that crashed halfway loses whatever it had
+/// already folded.
+///
+/// The scratch row is the other half of the assertion: it is inserted and
+/// deleted inside the same transaction, so it may never survive at all. A
+/// crash that resurrected it would mean a staging group was released without
+/// its commit marker.
+#[test]
+fn kill_during_a_segment_roll() {
+    let s0 = seed("kill_during_a_segment_roll");
+    let mut rng = Rng::new(s0 ^ 0x9E37_79B9);
+    let trials = 10 * scale();
+    const N: u64 = 40;
+
+    let body = roll_script(N);
+    let base = {
+        let dir = Scratch::new("cal-roll");
+        setup(&dir, T_DDL);
+        let script = write_script(&dir, "w.sql", &body);
+        let t0 = Instant::now();
+        assert!(spawn(&dir, &script).wait().expect("wait").success());
+        t0.elapsed()
+    };
+    eprintln!("  calibrated {N} roll-per-commit transactions at {} ms", base.as_millis());
+
+    let (mut killed, mut deepest) = (0u64, 0usize);
+    for trial in 0..trials {
+        let dir = Scratch::new("roll");
+        let frac = 0.02 + rng.frac() * 1.1;
+        let (live, at) = kill_live(&dir, T_DDL, &body, base.mul_f64(frac));
+        killed += live as u64;
+
+        let all = recovered(&dir, "t")
+            .unwrap_or_else(|e| panic!("trial {trial} (kill at {at:?}): reopen failed: {e}"));
+        let ids = live_ids(&all);
+        assert_prefix(&ids, N, 0, &format!("trial {trial}, kill at {at:?} ({frac:.3})"));
+        assert_eq!(
+            all.len(),
+            ids.len(),
+            "trial {trial} (kill at {at:?}): a row that was inserted and deleted inside one \
+             transaction survived the crash -- a staging group was released without its \
+             commit marker. Recovered {all:?}"
+        );
+        // Every segment the run sealed has to still be a chain: a reopen that
+        // succeeds has already proved there is no hole, and the count is how
+        // much of the roll path the trial actually exercised.
+        deepest = deepest.max(segments(&wal_dir(&dir, "t")));
+    }
+    assert!(killed > 0, "every trial finished before its kill -- the sweep tested nothing");
+    eprintln!("  {killed}/{trials} killed mid-roll; deepest segment chain seen: {deepest}");
+}
+
+/// Kill in the one window a roll cannot make atomic: between the sealed
+/// segment's `fsync` and the successor's rename.
+///
+/// `store::atomic_write` writes `.seg_<n>.gwal.tmp-<pid>-<k>` beside the
+/// segments, `fsync`s it, renames it into place and `fsync`s the directory. The
+/// parent polls the **log** directory for that temp file and kills inside it,
+/// so the trigger is exact rather than a fraction of a runtime.
+///
+/// Either outcome is correct -- the successor exists, or it does not and the
+/// old segment simply carries on as the active one -- but a temp file left
+/// behind must not be mistaken for a segment, and the records the sealed
+/// segment holds must be there either way.
+#[test]
+fn kill_inside_the_successor_segments_publish() {
+    seed("kill_inside_the_successor_segments_publish");
+    let trials = 4 * scale();
+    const N: u64 = 40;
+
+    let mut fired = 0u64;
+    for trial in 0..trials {
+        let dir = Scratch::new("publish");
+        setup(&dir, T_DDL);
+        let script = write_script(&dir, "w.sql", &roll_script(N));
+        let wal = wal_dir(&dir, "t");
+        let live = kill_when(
+            spawn(&dir, &script),
+            || {
+                std::fs::read_dir(&wal).is_ok_and(|rd| {
+                    rd.flatten().any(|e| e.file_name().to_string_lossy().contains(".tmp-"))
+                })
+            },
+            Duration::from_secs(60),
+        );
+        fired += live as u64;
+
+        let all = recovered(&dir, "t").unwrap_or_else(|e| {
+            panic!("trial {trial}: a kill inside the successor's publish wedged the log: {e}")
+        });
+        let ids = live_ids(&all);
+        assert_prefix(&ids, N, 0, &format!("trial {trial}, killed mid-publish (live={live})"));
+        assert_eq!(
+            all.len(),
+            ids.len(),
+            "trial {trial}: a scratch row from an incomplete transaction survived: {all:?}"
+        );
+        // A leftover temp file is debris, not a segment: it must not be
+        // chained to, replayed, or allowed to wedge the log. The reopen above
+        // proves recovery ignored it; this proves the log still *works*
+        // afterwards, which is the failure mode debris would actually cause.
+        // (The count itself is not assertable: the trigger can fire on the
+        // very first segment's own creation, before any record exists, and
+        // then a read-only reopen legitimately leaves the directory with no
+        // `.gwal` in it at all.)
+        let (ok, _) = cli(&dir, &["-q", "INSERT INTO t VALUES (999999,'after')"]);
+        assert!(ok, "trial {trial}: the log would not take a write after the kill");
+        let after = recovered(&dir, "t")
+            .unwrap_or_else(|e| panic!("trial {trial}: reopen after the recovery write: {e}"));
+        assert!(
+            after.contains(&999_999),
+            "trial {trial}: a write accepted after the crash did not survive: {after:?}"
+        );
+        assert!(
+            segments(&wal) >= 1,
+            "trial {trial}: the log directory holds no segment after a write"
+        );
+    }
+    eprintln!("  {fired}/{trials} trials caught the successor's publish window");
+}
+
+/// A crash must never resurrect a transaction that was **rolled back**.
+///
+/// The workload alternates: even transactions commit, odd ones insert a row
+/// with a distinctive id and `ROLLBACK`. `rewind_to` truncates the log back to
+/// the transaction's start LSN, and the claim is that a `kill -9` at any point
+/// afterwards can never bring those rows back -- not through replay, not
+/// through a later commit marker recycling the sequence number, and not
+/// through the exit checkpoint.
+///
+/// This is the second half of the durability contract and it is the half a
+/// prefix oracle cannot see: a rolled-back row is not "missing", it is
+/// *forbidden*.
+#[test]
+fn a_rolled_back_transaction_is_never_resurrected_by_a_crash() {
+    let s0 = seed("a_rolled_back_transaction_is_never_resurrected_by_a_crash");
+    let mut rng = Rng::new(s0 ^ 0x1234_5678);
+    let trials = 10 * scale();
+    const TXNS: u64 = 30;
+    const ROWS: u64 = 6;
+
+    // Committed rows are `t*ROWS + j`; rolled-back rows are the same numbers
+    // offset into a range nothing else uses, so a single `SELECT` separates
+    // them and the prefix oracle still applies to the committed half.
+    const GHOST: u64 = 500_000;
+    let body = {
+        let mut s = String::new();
+        for t in 0..TXNS {
+            s.push_str("BEGIN;\n");
+            let base = if t % 2 == 0 { t / 2 * ROWS } else { GHOST + t * ROWS };
+            for j in 0..ROWS {
+                s.push_str(&format!("INSERT INTO t VALUES ({},'r');\n", base + j));
+            }
+            s.push_str(if t % 2 == 0 { "COMMIT;\n" } else { "ROLLBACK;\n" });
+        }
+        s
+    };
+    let committed = TXNS / 2 * ROWS;
+
+    let base = {
+        let dir = Scratch::new("cal-rb");
+        setup(&dir, T_DDL);
+        let script = write_script(&dir, "w.sql", &body);
+        let t0 = Instant::now();
+        assert!(spawn(&dir, &script).wait().expect("wait").success());
+        t0.elapsed()
+    };
+
+    let mut killed = 0u64;
+    for trial in 0..trials {
+        let dir = Scratch::new("rb");
+        let (live, at) = kill_live(&dir, T_DDL, &body, base.mul_f64(0.02 + rng.frac() * 1.1));
+        killed += live as u64;
+
+        let all = recovered(&dir, "t")
+            .unwrap_or_else(|e| panic!("trial {trial} (kill at {at:?}): reopen failed: {e}"));
+        let ghosts: Vec<u64> = all.iter().copied().filter(|&i| i >= GHOST).collect();
+        assert!(
+            ghosts.is_empty(),
+            "trial {trial} (kill at {at:?}): {} row(s) from a ROLLED BACK transaction survived \
+             the crash: {ghosts:?}",
+            ghosts.len()
+        );
+        let ids: Vec<u64> = all.into_iter().filter(|&i| i < GHOST).collect();
+        assert_prefix(&ids, committed, 0, &format!("trial {trial}, kill at {at:?}"));
+        assert_eq!(
+            ids.len() as u64 % ROWS,
+            0,
+            "trial {trial} (kill at {at:?}): recovered {} rows -- a {ROWS}-row transaction \
+             committed in part",
+            ids.len()
+        );
+    }
+    assert!(killed > 0, "every trial finished before its kill");
+    eprintln!("  {killed}/{trials} trials were killed around a ROLLBACK");
+}
+
+/// The two-phase path, swept by timing rather than by one exact trigger.
+///
+/// `a_crash_inside_a_multi_table_commit_is_all_or_nothing` hits the prepared-
+/// and-undecided window once, deterministically, which is the sharpest single
+/// point. This is the complement: many transactions over three tables, killed
+/// at a swept fraction, so the kill lands in the staging, the prepares, the
+/// decision, the post-commit folds and the exit checkpoint in turn.
+///
+/// Two claims per trial. The three tables must hold the **same** number of
+/// rows -- a transaction may be lost right up until its decision is `fsync`ed
+/// and must be present from then on, but never a prefix of itself. And that
+/// number must be a whole multiple of the per-transaction row count.
+#[test]
+fn kill_across_a_two_phase_commit_sweep() {
+    let s0 = seed("kill_across_a_two_phase_commit_sweep");
+    let mut rng = Rng::new(s0 ^ 0x0BAD_C0DE);
+    let trials = 10 * scale();
+    const TABLES: usize = 3;
+    const TXNS: u64 = 20;
+    const PER: u64 = 5;
+
+    let ddl: Vec<String> = (0..TABLES)
+        .map(|k| format!("CREATE TABLE t{k} (id UInt64, s String) ENGINE = MergeTree ORDER BY id"))
+        .collect();
+    let ddl = ddl.join(";");
+    let body = {
+        let mut s = String::new();
+        for t in 0..TXNS {
+            s.push_str("BEGIN;\n");
+            for k in 0..TABLES {
+                for j in 0..PER {
+                    let id = t * PER + j;
+                    s.push_str(&format!("INSERT INTO t{k} VALUES ({id},'r{id}');\n"));
+                }
+            }
+            s.push_str("COMMIT;\n");
+        }
+        s
+    };
+
+    let base = {
+        let dir = Scratch::new("cal-2pc");
+        setup(&dir, &ddl);
+        let script = write_script(&dir, "w.sql", &body);
+        let t0 = Instant::now();
+        assert!(spawn(&dir, &script).wait().expect("wait").success());
+        t0.elapsed()
+    };
+
+    let probe = (0..TABLES).map(|k| format!("SELECT count() FROM t{k}")).collect::<Vec<_>>();
+    let probe = probe.join(";");
+    let mut killed = 0u64;
+    for trial in 0..trials {
+        let dir = Scratch::new("2pc");
+        let (live, at) = kill_live(&dir, &ddl, &body, base.mul_f64(0.02 + rng.frac() * 1.1));
+        killed += live as u64;
+
+        let (ok, out) = cli(&dir, &["-q", &probe, "--format", "tsv", "--no-header"]);
+        assert!(ok, "trial {trial} (kill at {at:?}): the directory would not reopen");
+        let counts: Vec<u64> =
+            out.split_ascii_whitespace().map(|s| s.parse().expect("a count")).collect();
+        assert_eq!(counts.len(), TABLES, "trial {trial}: {} counts came back", counts.len());
+        assert!(
+            counts.iter().all(|&c| c == counts[0]),
+            "trial {trial} (kill at {at:?}): a transaction over {TABLES} tables committed a \
+             PREFIX of itself: {counts:?}"
+        );
+        assert_eq!(
+            counts[0] % PER,
+            0,
+            "trial {trial} (kill at {at:?}): every table holds {} rows, not a whole number of \
+             {PER}-row transactions",
+            counts[0]
+        );
+        assert!(
+            counts[0] <= TXNS * PER,
+            "trial {trial}: {} rows recovered but only {} were ever sent",
+            counts[0],
+            TXNS * PER
+        );
+
+        // And every id below the count is present exactly once: the counts
+        // agreeing would not by itself rule out three tables each holding a
+        // different, equally sized subset.
+        let (ok, out) = cli(
+            &dir,
+            &["-q", "SELECT id FROM t0 ORDER BY id", "--format", "tsv", "--no-header"],
+        );
+        assert!(ok, "trial {trial}: t0 would not answer");
+        let ids: Vec<u64> =
+            out.split_ascii_whitespace().map(|s| s.parse().expect("an id")).collect();
+        assert_prefix(&ids, TXNS * PER, 0, &format!("trial {trial}, t0, kill at {at:?}"));
+    }
+    assert!(killed > 0, "every trial finished before its kill");
+    eprintln!("  {killed}/{trials} trials were killed inside a three-table two-phase commit");
+}
+
 /// A crash in the middle of a log append, at **every** byte offset.
 ///
 /// Timing cannot sweep this: an append is a few hundred nanoseconds. Cutting a
@@ -905,7 +1266,7 @@ fn truncated_wal_recovers_a_prefix_at_every_offset() {
             s.execute(&format!("INSERT INTO t VALUES ({i},'r{i}')")).unwrap();
         }
     }
-    let wal_src = src.path().join("default").join("t").join("wal.log");
+    let wal_src = active_seg(&src, "t");
     let bytes = std::fs::read(&wal_src).expect("read wal");
     assert!(bytes.len() > 1000, "the log is empty -- the fixture wrote nothing to it");
 
@@ -919,8 +1280,7 @@ fn truncated_wal_recovers_a_prefix_at_every_offset() {
         // The LOCK file is a lock, not state; copying it is harmless, but the
         // stale `.tmp-` files a copy might pick up are not, so copy_tree skips
         // them.
-        std::fs::write(dst.path().join("default").join("t").join("wal.log"), &bytes[..len])
-            .unwrap();
+        std::fs::write(active_seg(&dst, "t"), &bytes[..len]).unwrap();
 
         let mut s = match Session::open(dst.path()) {
             Ok(s) => s,
@@ -929,7 +1289,11 @@ fn truncated_wal_recovers_a_prefix_at_every_offset() {
             // not allowed, and neither is a panic, which would fail here.
             Err(_) => continue,
         };
-        let rs = s.query("SELECT id FROM t ORDER BY id").expect("query after truncation");
+        // A refusal is allowed here for the same reason it is allowed at
+        // `open`: cutting a log below the point its `fsync` returned for is
+        // lost acknowledged data, and the table is quarantined rather than
+        // answering short. What may never happen is a wrong answer.
+        let Ok(rs) = s.query("SELECT id FROM t ORDER BY id") else { continue };
         let ids: Vec<u64> = rs
             .to_values()
             .iter()
@@ -950,6 +1314,27 @@ fn truncated_wal_recovers_a_prefix_at_every_offset() {
             "wal cut to {len}: recovered {} rows, more than the {N} written",
             ids.len()
         );
+        // **The floor, and it is the half this sweep was missing.** Checking
+        // only that the answer is a *prefix* is one-sided: the empty answer is
+        // a prefix of everything, so "recovery lost the lot and said Ok" passed
+        // this loop for as long as it existed. It was hiding a real one --
+        // `Wal::open` rewrote a segment shorter than its 64-byte header from
+        // scratch and `replay_entries` skipped it, so any cut below 64 bytes
+        // replayed zero records with `Ok`.
+        //
+        // Every insert here is its own statement, so every one is `fsync`ed;
+        // the second-to-last of those returned before the last one started, so
+        // rows `0..N-1` are provably on the platter and no cut may drop them
+        // quietly. Only the final group commit is forgivable, which is exactly
+        // as wrong as one un-returned `fsync` can leave the stamp.
+        assert!(
+            ids.len() as u64 >= N - 1,
+            "wal cut to {len} of {}: recovered {} of {N} rows and reported SUCCESS. All but \
+             the last were acknowledged by an `fsync` that returned, so this is silently \
+             dropped committed data -- the answer had to be a refusal",
+            bytes.len(),
+            ids.len()
+        );
         widest = widest.max(ids.len());
     }
     assert_eq!(widest as u64, N, "the untruncated copy did not recover every row");
@@ -957,6 +1342,44 @@ fn truncated_wal_recovers_a_prefix_at_every_offset() {
 }
 
 /// Copy a data directory, skipping the lock file and any temp files.
+/// A table's log directory. The log is `<root>/.wal/<db>/<table>/seg_*.gwal`:
+/// numbered segments, outside the table directory so a `DROP TABLE` cannot
+/// take the archive with it.
+fn wal_dir(dir: &Scratch, table: &str) -> PathBuf {
+    dir.path().join(".wal").join("default").join(table)
+}
+
+fn segments(dir: &Path) -> usize {
+    std::fs::read_dir(dir)
+        .map(|rd| {
+            rd.flatten().filter(|e| e.file_name().to_string_lossy().ends_with(".gwal")).count()
+        })
+        .unwrap_or(0)
+}
+
+/// The active segment: the highest-numbered one, which is the only file a
+/// writer appends to.
+fn active_seg(dir: &Scratch, table: &str) -> PathBuf {
+    let d = wal_dir(dir, table);
+    let mut names: Vec<String> = std::fs::read_dir(&d)
+        .map(|rd| {
+            rd.flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .filter(|n| n.ends_with(".gwal"))
+                .collect()
+        })
+        .unwrap_or_default();
+    names.sort();
+    d.join(names.pop().unwrap_or_else(|| "none.gwal".into()))
+}
+
+/// Bytes of log a table holds, across every segment.
+fn wal_bytes(dir: &Scratch, table: &str) -> u64 {
+    std::fs::read_dir(wal_dir(dir, table))
+        .map(|rd| rd.flatten().map(|e| e.metadata().map_or(0, |m| m.len())).sum())
+        .unwrap_or(0)
+}
+
 fn copy_tree(from: &Path, to: &Path) {
     std::fs::create_dir_all(to).unwrap();
     for e in std::fs::read_dir(from).unwrap().flatten() {

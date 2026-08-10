@@ -5,12 +5,19 @@
 //!     CATALOG                     databases -> table definitions
 //!     <db>/<table>/
 //!       TABLE                     this table's definition + the parts that
-//!                                 are currently live + the WAL prefix they
-//!                                 already cover
+//!                                 are currently live + the stream position
+//!                                 they already cover
 //!       part_000001.gpart         one immutable part per file
 //!       part_000002.gpart
-//!       wal.log                   framed log of writes not yet in a part
+//!     .wal/<db>/<table>/
+//!       seg_<origin:020>.gwal     numbered log segments; the highest-origin
+//!                                 one is live and every other one is the
+//!                                 archive a point-in-time recovery reads
 //! ```
+//!
+//! The log lives outside the table's own directory on purpose: `DROP TABLE`
+//! removes that directory, and a recovery to just before a drop is the
+//! commonest reason the archive exists. See [`wal`].
 //!
 //! ## Three rules the whole module is built around
 //!

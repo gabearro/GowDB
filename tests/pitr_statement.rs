@@ -308,16 +308,13 @@ fn the_statement_refuses_a_recovery_across_a_hole_in_the_archive() {
     let (arc, marks) = staged(&s);
     let db = s.db();
 
-    let dir = wal::archive_dir(&db, "default", "t");
     let mut segs = wal::segments(&db, "default", "t").expect("segments");
     assert!(segs.len() >= 4, "the fixture must archive several segments: {}", segs.len());
     // Out with a middle one, exactly as a half-finished `scp` of the archive
-    // or an over-eager cleanup script would take it.
+    // or an over-eager cleanup script would take it. One unlink and the
+    // segment is gone: there is no sidecar to take with it.
     let victim = segs.remove(segs.len() / 2);
     std::fs::remove_file(&victim.path).expect("remove the segment");
-    let _ = std::fs::remove_file(dir.join(
-        victim.path.file_name().unwrap().to_string_lossy().replace(".gwal", ".gseal"),
-    ));
 
     let e = restore(&db, &arc, &s.at("x"), &format!("LSN {}", marks.last().unwrap())).refused();
     assert!(e.contains("hole"), "{e}");
@@ -365,7 +362,7 @@ fn until_is_not_a_way_into_the_open_database() {
     left.sort();
     assert_eq!(
         left,
-        [".wal-archive", "CATALOG", "LOCK", "default"],
+        [".wal", "CATALOG", "LOCK", "default"],
         "a refused restore left something in the live data directory"
     );
 
@@ -425,4 +422,275 @@ fn a_target_that_is_not_a_target_is_refused_before_anything_is_written() {
     )
     .ok();
     assert_eq!(ids(&s.at("plain")), ["1", "2", "3"]);
+}
+
+// ------------------------------------------------- the log outlives the table
+
+/// **The commonest recovery there is: somebody dropped the table.**
+///
+/// The log lives at `<data>/.wal/<db>/<table>` rather than inside the table's
+/// own directory precisely so that a `DROP TABLE` -- which removes that
+/// directory outright -- cannot take the history with it. This is the test
+/// that the arrangement actually pays off through the statement, and it pins
+/// two things a drop must do to the log on its way past.
+///
+/// The first is that the drop **seals** it. A recovery reads sealed segments
+/// only, because the live one may end in an interrupted append, and nothing
+/// will ever roll a dead table's log again -- so records written and dropped
+/// inside one checkpoint interval would be on disk, intact, and permanently
+/// unreachable, with `UNTIL LATEST` reporting success and handing back a
+/// database missing them. That is a silent loss produced by a successful
+/// recovery, which is the one outcome this feature exists to rule out.
+///
+/// The second is that it stops lagging. `archive_lags` walks log directories,
+/// not the catalog, so an unsealed dead log answers "still holds un-archived
+/// records" for ever, and every `UNTIL TIMESTAMP` past it is refused with
+/// advice -- checkpoint the database -- that no amount of checkpointing can
+/// satisfy. A wedge with a remedy that does not work is worse than no remedy.
+#[test]
+fn a_dropped_tables_history_is_still_recoverable_through_the_statement() {
+    let s = Scratch::new("dropped");
+    let db = s.db();
+    step(&db, DDL);
+    step(&db, "INSERT INTO t VALUES (1,'a')");
+    let arc = s.s("base.gbak");
+    step(&db, &format!("BACKUP TO '{arc}'"));
+
+    // Both inserts and the drop in *one* invocation, so the drop lands before
+    // any checkpoint has retired what they logged. That ordering is the whole
+    // fixture: split across processes, the exit checkpoint would seal them and
+    // the bug would not reproduce.
+    step(&db, "INSERT INTO t VALUES (2,'b'); INSERT INTO t VALUES (3,'c'); DROP TABLE t");
+    assert!(sql(&db, "SELECT count() FROM t").code != 0, "the table must really be gone");
+
+    let latest = s.at("latest");
+    let r = restore(&db, &arc, &latest, "LATEST").ok();
+    assert_eq!(
+        ids(&latest),
+        ["1", "2", "3"],
+        "the rows written before the drop are gone from the recovery"
+    );
+    assert_eq!(r.row()[4], "2", "both logged inserts had to be replayed: {:?}", r.row());
+
+    // A moment past everything the archive holds is answerable rather than
+    // wedged: with the dead log sealed there is nothing left lagging.
+    let far = s.at("far");
+    restore(&db, &arc, &far, "TIMESTAMP '2999-01-01 00:00:00'").ok();
+    assert_eq!(ids(&far), ["1", "2", "3"]);
+
+    // ...and it is still answerable after another checkpoint, which is what
+    // distinguishes "sealed" from "we happened to catch it before the drop".
+    step(&db, "CREATE TABLE u (id UInt64, v String) ENGINE = MergeTree ORDER BY id");
+    let again = s.at("again");
+    restore(&db, &arc, &again, "TIMESTAMP '2999-01-01 00:00:00'").ok();
+    assert_eq!(ids(&again), ["1", "2", "3"]);
+}
+
+/// A table recreated under a dropped one's name must not inherit its history.
+///
+/// The same arrangement that makes the test above work creates this hazard:
+/// `CREATE TABLE t` after `DROP TABLE t` opens the *dead* table's log
+/// directory. A fresh table has no commit record, so a watermark defaulting to
+/// the start of the stream would replay the corpse into a schema that need not
+/// even match it. `CREATE TABLE` stamps the position the stream has already
+/// reached, which is what makes the answer zero rather than "whatever decodes".
+#[test]
+fn a_table_recreated_over_a_dropped_ones_log_starts_empty() {
+    let s = Scratch::new("recreate");
+    let db = s.db();
+    step(&db, DDL);
+    step(&db, "INSERT INTO t VALUES (1,'a'),(2,'b'),(3,'c')");
+    // A different shape entirely, so a replayed record could not even be
+    // mistaken for a row of this table.
+    step(&db, "DROP TABLE t; CREATE TABLE t (k String, n Int64) ENGINE = MergeTree ORDER BY k");
+
+    let count = |q: &str| sql(&db, q).ok().col().join("");
+    assert_eq!(count("SELECT count() FROM t"), "0", "the previous incarnation replayed");
+    // Again in a fresh process: the first answer came from memory, this one
+    // comes from the loader, which is where the replay would happen.
+    assert_eq!(count("SELECT count() FROM t"), "0", "the previous incarnation replayed on open");
+    assert_eq!(sql(&db, "SELECT k, n FROM t").ok().col(), Vec::<String>::new());
+
+    // The new table still takes writes, and they survive a reopen -- a
+    // watermark parked past the end of the stream would swallow them too.
+    step(&db, "INSERT INTO t VALUES ('x', 7)");
+    assert_eq!(sql(&db, "SELECT k, n FROM t").ok().col(), ["x\t7"]);
+}
+
+// ----------------------------------------------------------------- retention
+
+/// Retention is a window, and its edge has to be a refusal rather than a
+/// smaller answer.
+///
+/// `wal_archive_retention` is a byte budget over archived segments, so setting
+/// it small drops the oldest ones and moves the horizon up past the backup.
+/// A recovery that would have to replay through what went must refuse and say
+/// so: rolling forward across the hole would hand back a database missing
+/// whatever those segments held, with a success report on top. `system.wal` is
+/// where an operator reads the same numbers *before* they need them, so it has
+/// to agree with the refusal.
+#[test]
+fn retention_moves_the_window_and_a_recovery_behind_it_is_refused() {
+    let s = Scratch::new("retention");
+    let (arc, marks) = staged(&s);
+    let db = s.db();
+
+    let wal = |cols: &str| sql(&db, &format!("SELECT {cols} FROM system.wal")).ok().row();
+    let before = wal("segments, archive_first_seq, archive_last_seq, horizon_seq");
+    assert!(before[0].parse::<u64>().expect("a count") >= 4, "fixture: {before:?}");
+    assert_eq!(before[3], "0", "nothing has been pruned yet");
+    assert_eq!(before[1], "1", "so the archive still serves from the very first LSN");
+    assert_eq!(before[2], marks.last().unwrap().to_string(), "...up to the last write");
+
+    // ...and every one of those LSNs really is answerable while the window
+    // still covers them.
+    restore(&db, &arc, &s.at("wide"), &format!("LSN {}", marks[0])).ok();
+    assert_eq!(ids(&s.at("wide")), ["1", "2", "3", "4"]);
+
+    // One byte of budget: every archived segment is over it, so they all go as
+    // the next one is created.
+    step(&db, "SET wal_archive_retention = 1; INSERT INTO t VALUES (7,'g')");
+    let after = wal("segments, archive_first_seq, archive_last_seq, horizon_seq");
+    assert_eq!(after[0], "0", "retention kept a segment it had no budget for: {after:?}");
+    let horizon: u64 = after[3].parse().expect("a horizon");
+    assert!(horizon >= *marks.last().unwrap(), "the horizon must follow the files: {after:?}");
+    assert_eq!(after[1], "0", "an empty archive spans nothing");
+
+    // The recovery that needed them refuses, names the horizon, and writes
+    // nothing -- rather than replaying what survives and calling it a
+    // recovery.
+    let e = restore(&db, &arc, &s.at("gone"), "LATEST").refused();
+    assert!(e.contains("begins at recovery LSN"), "{e}");
+    assert!(e.contains("not in the backup"), "the refusal must say what is missing: {e}");
+    assert!(!s.at("gone").exists(), "a refused recovery must write nothing");
+    for until in [&format!("LSN {}", marks[0]), "TIMESTAMP '2999-01-01 00:00:00'"] {
+        let e = restore(&db, &arc, &s.at("gone2"), until).refused();
+        assert!(!e.trim().is_empty(), "UNTIL {until} was refused with no reason");
+        assert!(!s.at("gone2").exists(), "UNTIL {until} wrote a directory");
+    }
+
+    // The backup itself is still restorable, and that is not an oversight:
+    // `RESTORE` with no `UNTIL` rolls nothing forward, so it needs no archive
+    // at all. Retention takes away the recoveries that read the log, not the
+    // backup's own instant.
+    let plain = s.at("plain");
+    let r = restore(&db, &arc, &plain, "").ok();
+    assert_eq!(r.row()[4], "0", "a plain restore replays nothing: {:?}", r.row());
+    assert_eq!(ids(&plain), ["1", "2", "3"]);
+
+    // The live database is untouched by any of it and still holds everything.
+    assert_eq!(ids(&db), ["1", "2", "3", "4", "5", "6", "7"]);
+}
+
+/// `system.wal`'s archive columns are what an operator reads to find out
+/// whether a recovery is possible *before* attempting one, so they have to be
+/// the same numbers the recovery itself uses -- not a parallel calculation
+/// that can drift.
+///
+/// `archive_first_seq` in particular used to be the oldest segment's own
+/// `first_seq`, which is the tick immediately *before* that segment: off by
+/// one from the first LSN a recovery can serve, and provably equal to
+/// `horizon_seq` in every case where the archive is not empty. Two columns
+/// carrying one number is a column that answers no question.
+#[test]
+fn the_archive_columns_describe_the_window_a_recovery_actually_has() {
+    let s = Scratch::new("columns");
+    let (arc, marks) = staged(&s);
+    let db = s.db();
+    let row = sql(
+        &db,
+        "SELECT segments, archive_first_seq, archive_last_seq, horizon_seq, lags FROM system.wal",
+    )
+    .ok()
+    .row();
+    let n: u64 = row[0].parse().expect("segments");
+    let (first, last, horizon) = (
+        row[1].parse::<u64>().expect("first"),
+        row[2].parse::<u64>().expect("last"),
+        row[3].parse::<u64>().expect("horizon"),
+    );
+    assert!(n > 0 && first <= last, "{row:?}");
+    assert_eq!(first, horizon + 1, "the window starts one past what pruning discarded");
+    assert_ne!(first, horizon, "two columns carrying one number");
+    assert_eq!(last, *marks.last().unwrap(), "the window ends at the last archived write");
+    assert_eq!(row[4], "0", "a checkpointed database does not lag");
+
+    // The window has to *contain* the backup, or this archive could not be
+    // rolled forward at all -- which is the check `RESTORE` makes before it
+    // unpacks anything, expressed here as the two numbers an operator can read
+    // beforehand.
+    let base = backup::boundary_of(Path::new(&arc)).expect("boundary");
+    assert!(first <= base, "the archive starts after the backup: {first} > {base}");
+
+    // The far edge is answerable and one past it is not. Below the backup is a
+    // *different* refusal -- a backup cannot roll backwards -- so the low edge
+    // of the window is not a restore target for this archive, and asserting it
+    // were would be pinning the wrong constraint.
+    restore(&db, &arc, &s.at("hi"), &format!("LSN {last}")).ok();
+    assert_eq!(ids(&s.at("hi")), ids(&db), "the far edge is the live database");
+    let e = restore(&db, &arc, &s.at("past"), &format!("LSN {}", last + 1)).refused();
+    assert!(e.contains("past the end"), "{e}");
+    assert!(!s.at("past").exists());
+    let e = restore(&db, &arc, &s.at("under"), &format!("LSN {first}")).refused();
+    assert!(e.contains("older backup"), "below the backup is its own refusal: {e}");
+    assert!(!s.at("under").exists());
+}
+
+/// Retention that has moved past the backup for **one** table refuses the
+/// whole recovery, before it has written anything.
+///
+/// The directory-wide window (`archive_first_seq`) is the union: one table
+/// whose segments have all been pruned does not narrow it, so the global check
+/// sees a window that still covers the backup and lets the recovery start.
+/// What then refuses is the per-table check inside `wal::recover` -- correct,
+/// but by then the archive has been unpacked, and the operator is left with a
+/// half-written directory they have to delete before they can retry. The same
+/// question is now asked of every table in the manifest up front.
+///
+/// The fixture is two tables with very different write rates, which is the
+/// ordinary shape this arises in: `hot` outgrows the byte budget and loses its
+/// archive; `cold` was written once and keeps its single segment, so the
+/// window still looks wide enough.
+#[test]
+fn one_tables_retention_refuses_the_recovery_before_it_unpacks_anything() {
+    let s = Scratch::new("perTable");
+    let db = s.db();
+    step(&db, DDL);
+    step(&db, "CREATE TABLE cold (id UInt64, v String) ENGINE = MergeTree ORDER BY id");
+    step(&db, "INSERT INTO t VALUES (1,'a'); INSERT INTO cold VALUES (1,'a')");
+    let arc = s.s("base.gbak");
+    step(&db, &format!("BACKUP TO '{arc}'"));
+
+    // `hot` alone writes, so `cold`'s one segment stays and the union window
+    // keeps reaching back to the backup.
+    for id in 2..=8u32 {
+        step(&db, &format!("INSERT INTO t VALUES ({id},'x')"));
+    }
+    step(&db, "SET wal_archive_retention = 1; INSERT INTO t VALUES (9,'x')");
+
+    let wal_of = |t: &str| {
+        sql(&db, &format!("SELECT segments, horizon_seq FROM system.wal WHERE table = '{t}'"))
+            .ok()
+            .row()
+    };
+    assert_eq!(wal_of("t")[0], "0", "fixture: `t`'s archive should be gone");
+    assert_ne!(wal_of("cold")[0], "0", "fixture: `cold` should still have its segment");
+    let first = sql(&db, "SELECT archive_first_seq FROM system.wal WHERE table = 'cold'")
+        .ok()
+        .row()[0]
+        .clone();
+    assert_eq!(first, "1", "fixture: the surviving table still spans the backup");
+
+    let out = s.at("perTable");
+    let e = restore(&db, &arc, &out, "LATEST").refused();
+    assert!(e.contains("no longer reaches back to the backup"), "{e}");
+    assert!(e.contains("`d.t`") || e.contains(".t`"), "the refusal must name the table: {e}");
+    assert!(
+        !out.exists(),
+        "the refusal unpacked the archive first and left {} behind",
+        out.display()
+    );
+
+    // And the live database is untouched by the attempt.
+    assert_eq!(ids(&db).len(), 9);
 }

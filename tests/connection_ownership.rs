@@ -13,8 +13,17 @@ use granular::{Db, Session, Value};
 
 // ------------------------------------------------------------------ harness
 
+/// A scratch directory nobody else can be standing in.
+///
+/// The pid matters. These paths used to be `granular-w4-<name>` and nothing
+/// else, so two runs of this file at once -- which is ordinary when a full
+/// suite is running while someone re-runs one test -- shared every directory
+/// and deleted each other's data mid-test. It surfaced as a burst of seven
+/// failures, all `rename ... TABLE: Invalid argument`, in a file that passes
+/// alone every time: a test harness manufacturing a bug report about the
+/// engine.
 fn dir(name: &str) -> PathBuf {
-    let p = std::env::temp_dir().join(format!("granular-w4-{name}"));
+    let p = std::env::temp_dir().join(format!("granular-w4-{}-{name}", std::process::id()));
     let _ = std::fs::remove_dir_all(&p);
     std::fs::create_dir_all(&p).expect("create test data dir");
     p
@@ -367,8 +376,32 @@ fn wide_rows(from: u64, n: u64) -> String {
     sql
 }
 
+/// Bytes in the *active* segment of `default.t` -- what a crash right now
+/// would have to replay.
+///
+/// The log is a directory of numbered segments rather than one `wal.log`, and
+/// a fold seals the active one in place instead of emptying a file. The sealed
+/// segments stay on disk as the WAL archive (bounded separately by
+/// `wal_archive_retention`), so the quantity a fold is supposed to bound is
+/// the newest segment, not the sum.
 fn wal_bytes(d: &Path) -> u64 {
-    std::fs::metadata(d.join("default").join("t").join("wal.log")).map_or(0, |m| m.len())
+    match std::fs::metadata(newest_segment(d, "t")) {
+        Ok(m) => m.len(),
+        Err(_) => 0,
+    }
+}
+
+/// The active segment of `<db>.<table>`: the highest-numbered `.gwal`.
+fn newest_segment(d: &Path, table: &str) -> PathBuf {
+    let dir = d.join(".wal").join("default").join(table);
+    let Ok(rd) = std::fs::read_dir(&dir) else { return dir.join("none") };
+    let mut names: Vec<String> = rd
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.ends_with(".gwal"))
+        .collect();
+    names.sort();
+    dir.join(names.pop().unwrap_or_else(|| "none".into()))
 }
 
 fn part_files(d: &Path) -> usize {
@@ -379,7 +412,7 @@ fn part_files(d: &Path) -> usize {
         .unwrap_or(0)
 }
 
-/// Nothing auto-checkpointed: a writer that only ran `INSERT`s grew `wal.log`
+/// Nothing auto-checkpointed: a writer that only ran `INSERT`s grew its log
 /// without bound and wrote no part file at all, so disk-full arrived far ahead
 /// of the data volume and recovery had the whole history to replay.
 ///
@@ -684,8 +717,8 @@ fn scribble(p: &Path, off: u64, n: usize) {
     std::fs::write(p, b).unwrap();
 }
 
-/// A `wal.log` that will not replay must quarantine its own table, not refuse
-/// the whole database.
+/// A log segment that will not replay must quarantine its own table, not
+/// refuse the whole database.
 ///
 /// It used to be a bare `?` in the loader, so a bad checksum in a file no
 /// other table reads took every healthy table down with it -- including
@@ -696,7 +729,7 @@ fn a_damaged_wal_quarantines_one_table_and_leaves_the_rest() {
     let d = seed_two("quar-wal");
     // Inside the first record's *body*, past its length varint and checksum,
     // so this is damage the reader can prove rather than a torn tail.
-    scribble(&d.path().join("default").join("a").join("wal.log"), 24, 4);
+    scribble(&newest_segment(d.path(), "a"), 80, 4);
 
     let (c, out, err) = q(&d.s(), "SELECT count() FROM b");
     assert_eq!((c, out.trim()), (0, "3"), "a healthy table must still answer: {err}");
@@ -707,7 +740,7 @@ fn a_damaged_wal_quarantines_one_table_and_leaves_the_rest() {
 
     let (c, _, err) = q(&d.s(), "SELECT count() FROM a");
     assert_eq!(c, 1, "the damaged table must be refused");
-    assert!(err.contains("wal.log"), "the refusal must name the file to restore: {err}");
+    assert!(err.contains(".gwal"), "the refusal must name the file to restore: {err}");
     assert!(err.contains("No other table is affected"), "{err}");
 }
 

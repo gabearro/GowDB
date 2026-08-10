@@ -489,7 +489,7 @@ fn unaccounted_table_dirs(root: &Path) -> Vec<String> {
 }
 
 fn holds_table_data(dir: &Path) -> bool {
-    if dir.join(store::TABLE_FILE).exists() || dir.join(store::WAL_FILE).exists() {
+    if dir.join(store::TABLE_FILE).exists() {
         return true;
     }
     let Ok(rd) = std::fs::read_dir(dir) else { return false };
@@ -682,7 +682,7 @@ mod tests {
     /// the next checkpoint delete the survivors.
     #[test]
     fn a_missing_catalog_over_table_data_is_refused() {
-        for marker in [store::TABLE_FILE, store::WAL_FILE, "part_000003.gpart"] {
+        for marker in [store::TABLE_FILE, "part_000003.gpart"] {
             let s = Scratch::new("cat-lost-roster");
             let tdir = s.join("default").join("hits");
             std::fs::create_dir_all(&tdir).unwrap();

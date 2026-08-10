@@ -37,17 +37,18 @@ pub const MAGIC: [u8; 8] = *b"GRANULR\0";
 
 /// Bumped whenever the layout of anything above this module changes
 /// incompatibly. Readers accept `MIN_READ_VERSION..=FORMAT_VERSION`.
-pub const FORMAT_VERSION: u32 = 2;
+pub const FORMAT_VERSION: u32 = 3;
 
 /// Oldest layout this build can still read.
 ///
-/// v2 padded frame bodies and word arrays to 8 bytes so packed lanes can be
-/// read directly out of a mapping. There is no way to reinterpret a v1 file's
-/// unaligned words in place, and a reader that silently fell back to copying
-/// every column would quietly give up the property the version exists to
-/// provide -- so v1 is rejected rather than emulated. Rewrite such parts by
-/// reading them with a v1 build and re-inserting.
-pub const MIN_READ_VERSION: u32 = 2;
+/// v3 replaced the single `wal.log` per table with numbered segments under
+/// `<root>/.wal/<db>/<table>/`, each carrying a 56-byte header whose `durable`
+/// field records how far the segment has been acknowledged. There is no
+/// migration path and none is wanted: a v2 directory's log lives somewhere
+/// this build does not look, so half-reading one would report tables as empty
+/// that are not. It is refused instead, by [`Error::Version`] rather than by
+/// [`Error::Corruption`] -- nothing in such a directory is damaged.
+pub const MIN_READ_VERSION: u32 = 3;
 
 /// `MAGIC` + version word.
 pub const HEADER_LEN: usize = MAGIC.len() + 4;
@@ -162,6 +163,53 @@ impl Writer {
         self.bytes(s.as_bytes());
     }
 
+    /// A `Display` rendering, length-prefixed, without allocating.
+    ///
+    /// `w.str(&x.to_string())` is one `String` per call, and the callers here
+    /// are per *column* of every block written -- including every WAL record,
+    /// where the standing rule is that nothing is allocated per record. This
+    /// renders into a stack buffer and only reaches for the heap if the
+    /// rendering does not fit, so the type names stay defined in exactly one
+    /// place (`Display`) instead of being duplicated into a tag table that can
+    /// drift away from it.
+    ///
+    /// 96 bytes holds every type name the engine can produce with room to
+    /// spare; the spill is there so the property is "never allocates for
+    /// anything real", not "never allocates if I guessed right".
+    pub fn display(&mut self, v: &impl std::fmt::Display) {
+        use std::fmt::Write as _;
+        struct Stack {
+            buf: [u8; 96],
+            len: usize,
+            spill: Vec<u8>,
+        }
+        impl std::fmt::Write for Stack {
+            fn write_str(&mut self, s: &str) -> std::fmt::Result {
+                if !self.spill.is_empty() {
+                    self.spill.extend_from_slice(s.as_bytes());
+                } else if self.len + s.len() <= self.buf.len() {
+                    self.buf[self.len..self.len + s.len()].copy_from_slice(s.as_bytes());
+                    self.len += s.len();
+                } else {
+                    // Only reachable once: the spill is non-empty from here on,
+                    // because it is seeded with more than `buf` could hold.
+                    self.spill.reserve(self.len + s.len());
+                    self.spill.extend_from_slice(&self.buf[..self.len]);
+                    self.spill.extend_from_slice(s.as_bytes());
+                }
+                Ok(())
+            }
+        }
+        let mut s = Stack { buf: [0; 96], len: 0, spill: Vec::new() };
+        // `Display` for these types is infallible; the sink above never fails.
+        let _ = write!(s, "{v}");
+        if s.spill.is_empty() {
+            self.bytes(&s.buf[..s.len]);
+        } else {
+            self.bytes(&s.spill);
+        }
+    }
+
     /// Element count as a varint, then the words little-endian. Words stay
     /// fixed-width: these are bit-packed payloads with no small-value bias,
     /// and varints would both grow them and defeat a future zero-copy read.
@@ -233,6 +281,21 @@ impl Writer {
         self.buf.extend_from_slice(b);
     }
 
+    /// Empty the buffer but keep the allocation. The pair below is what lets
+    /// the write-ahead log frame every record in one buffer it owns for the
+    /// life of the log instead of one per record.
+    #[inline]
+    pub fn clear(&mut self) {
+        self.buf.clear();
+    }
+
+    /// Room for `n` more bytes, so a builder that knows its size up front pays
+    /// at most one growth.
+    #[inline]
+    pub fn reserve(&mut self, n: usize) {
+        self.buf.reserve(n);
+    }
+
     #[inline]
     pub fn pos(&self) -> usize {
         self.buf.len()
@@ -280,6 +343,14 @@ impl Writer {
     }
 
     #[inline]
+    /// The bytes so far, mutably. The one caller is the write-ahead log's
+    /// frame builder, which reserves room for the frame header in front of a
+    /// body and fills it in once the body's length is known -- the alternative
+    /// being a second buffer and a copy of every record.
+    pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        &mut self.buf
+    }
+
     pub fn as_slice(&self) -> &[u8] {
         &self.buf
     }
@@ -732,6 +803,72 @@ fn finish_frame<'a>(r: &mut Reader<'a>, len: u64, want: u64) -> Result<&'a [u8]>
 // header / footer
 // ---------------------------------------------------------------------------
 
+/// What a file with the wrong version word *is*, so the refusal can name it
+/// and give the remedy that fits it.
+///
+/// The two differ in one direction only, and it is the direction that loses
+/// data if it is got wrong. Too *old*: a data directory is recreated, an
+/// archive is kept and a fresh backup taken -- telling somebody to recreate an
+/// archive is telling them to delete their only copy. Too *new*: both remedies
+/// are "upgrade", and neither may be paired with advice to write anything with
+/// this build.
+#[derive(Clone, Copy)]
+pub enum Artifact {
+    Database,
+    Archive,
+}
+
+impl Artifact {
+    fn noun(self) -> &'static str {
+        match self {
+            Artifact::Database => "this database",
+            Artifact::Archive => "this archive",
+        }
+    }
+    /// Only ever reached for an *older* file: a newer one is never told to do
+    /// anything with this build.
+    fn remedy(self) -> &'static str {
+        match self {
+            Artifact::Database => "The data directory must be recreated with this build",
+            Artifact::Archive => {
+                "The archive is intact, not corrupt -- it simply cannot be restored by this \
+                 build; take a fresh backup with this one"
+            }
+        }
+    }
+}
+
+/// The refusal a version skew earns, in both directions.
+///
+/// Deliberately not an [`Error::Corruption`]. The bytes are intact and the
+/// operator must not go looking for damage, must not delete anything, and --
+/// where this is a table's own metadata -- must not have the table filed in a
+/// quarantine list as if it were rot. The message says which direction the
+/// skew runs, because the remedies are opposites: recreate, or upgrade.
+///
+/// Built once, here, for both directions and both artifacts. It used to be
+/// assembled for a data directory and then *rewritten* into an archive's terms
+/// by the backup reader, which worked in the older direction and produced two
+/// contradictory sentences in the newer one -- "upgrade granular" followed by
+/// "take a fresh backup with this build", the second of which is the advice
+/// that overwrites a good archive with one this build cannot fill.
+fn version_skew(found: u32, what: Artifact) -> Error {
+    let noun = what.noun();
+    Error::version(match found > FORMAT_VERSION {
+        true => format!(
+            "{noun} was written by on-disk format version {found}; this build reads and \
+             writes version {FORMAT_VERSION}. Upgrade granular rather than downgrading -- \
+             this build cannot read it and must not write to it"
+        ),
+        false => format!(
+            "{noun} was written by on-disk format version {found}; this build reads and \
+             writes version {FORMAT_VERSION}, and there is no migration path. Nothing here \
+             is damaged -- the write-ahead log layout changed. {}",
+            what.remedy()
+        ),
+    })
+}
+
 /// `MAGIC | u32 version`.
 pub fn write_header(w: &mut Writer) {
     w.raw(&MAGIC);
@@ -741,16 +878,18 @@ pub fn write_header(w: &mut Writer) {
 /// Verify magic and version, returning the file's format version so callers
 /// can branch on older-but-supported layouts.
 pub fn read_header(r: &mut Reader) -> Result<u32> {
+    read_header_of(r, Artifact::Database)
+}
+
+/// [`read_header`], saying what the file is so a skew earns the right remedy.
+pub fn read_header_of(r: &mut Reader, what: Artifact) -> Result<u32> {
     let m = r.take(MAGIC.len())?;
     if m != MAGIC {
         return Err(Error::corruption(format!("bad magic {m:02x?}, expected {MAGIC:02x?}")));
     }
     let v = r.u32()?;
     if v < MIN_READ_VERSION || v > FORMAT_VERSION {
-        return Err(Error::corruption(format!(
-            "unsupported format version {v}; this build reads \
-             {MIN_READ_VERSION}..={FORMAT_VERSION}"
-        )));
+        return Err(version_skew(v, what));
     }
     Ok(v)
 }
@@ -773,6 +912,11 @@ pub fn write_footer(w: &mut Writer, meta_offset: u64) {
 
 /// Parse the footer at the end of `buf`, returning the metadata offset.
 pub fn read_footer(buf: &[u8]) -> Result<u64> {
+    read_footer_of(buf, Artifact::Database)
+}
+
+/// [`read_footer`], saying what the file is so a skew earns the right remedy.
+pub fn read_footer_of(buf: &[u8], what: Artifact) -> Result<u64> {
     if buf.len() < FOOTER_LEN {
         return Err(Error::corruption(format!(
             "file of {} bytes is shorter than the {FOOTER_LEN}-byte footer",
@@ -799,10 +943,7 @@ pub fn read_footer(buf: &[u8]) -> Result<u64> {
         )));
     }
     if ver < MIN_READ_VERSION || ver > FORMAT_VERSION {
-        return Err(Error::corruption(format!(
-            "unsupported format version {ver} in footer; this build reads \
-             {MIN_READ_VERSION}..={FORMAT_VERSION}"
-        )));
+        return Err(version_skew(ver, what));
     }
     if off > (buf.len() - FOOTER_LEN) as u64 {
         return Err(Error::corruption(format!(
@@ -916,7 +1057,11 @@ mod tests {
         w.u32(FORMAT_VERSION + 7);
         let buf = w.finish();
         let e = read_header(&mut Reader::new(&buf)).unwrap_err();
-        assert!(e.to_string().contains("unsupported format version"));
+        // A *version* problem, not a corruption one: the bytes are intact and
+        // the operator's remedy is to upgrade, not to go looking for damage.
+        assert_eq!(e.code(), "FORMAT_VERSION", "{e}");
+        assert!(e.to_string().contains("Upgrade granular"), "{e}");
+        assert!(!e.to_string().contains("corrupt"), "{e}");
     }
 
     #[test]
@@ -925,7 +1070,7 @@ mod tests {
         w.raw(&MAGIC);
         w.u32(0);
         let buf = w.finish();
-        assert!(is_corrupt(&read_header(&mut Reader::new(&buf)).unwrap_err()));
+        assert_eq!(read_header(&mut Reader::new(&buf)).unwrap_err().code(), "FORMAT_VERSION");
     }
 
     #[test]

@@ -279,21 +279,31 @@ fn a_torn_roll_forward_leaves_a_directory_the_loader_refuses() {
         step(&db, &format!("INSERT INTO {t} VALUES (2)"));
     }
 
-    // Damage the *body* of t2's archived segment, leaving its seal intact: the
-    // archive still looks whole from the directory listing that `check_target`
-    // walks, and the failure happens inside the roll-forward loop, which is
-    // the window this test is about.
-    let seg = db.join(".wal-archive").join("default").join("t2");
-    let mut damaged = 0;
-    for e in std::fs::read_dir(&seg).expect("t2 has an archive").flatten() {
-        if e.path().extension().is_some_and(|x| x == "gwal") {
-            let mut bytes = std::fs::read(e.path()).unwrap();
-            bytes[..8].fill(0); // the magic
-            std::fs::write(e.path(), &bytes).unwrap();
-            damaged += 1;
-        }
+    // Damage the *body* of t2's oldest archived segment: the chain still
+    // meets, so the archive looks whole from the directory listing that
+    // `check_target` walks, and the failure happens inside the roll-forward
+    // loop, which is the window this test is about.
+    let seg = db.join(".wal").join("default").join("t2");
+    let mut segs: Vec<PathBuf> = std::fs::read_dir(&seg)
+        .expect("t2 has an archive")
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "gwal"))
+        .collect();
+    segs.sort();
+    // Every segment but the newest is archived; damage them all, so whichever
+    // one the recovery reaches fails.
+    assert!(segs.len() > 1, "no sealed segment to damage");
+    segs.pop();
+    for p in &segs {
+        let mut bytes = std::fs::read(p).unwrap();
+        // The last record's body, not the header: the segment's length and
+        // its chain position are untouched, so `check_target`'s walk still
+        // sees a whole archive and the failure lands inside the roll-forward.
+        let n = bytes.len();
+        bytes[n - 8..].fill(0xA5);
+        std::fs::write(p, &bytes).unwrap();
     }
-    assert!(damaged > 0, "no sealed segment to damage");
 
     let out = s.at("out");
     let r = sql(&db, &format!("RESTORE FROM '{arc}' TO '{}' UNTIL LATEST", out.to_string_lossy()));
@@ -337,17 +347,19 @@ fn a_filesystem_without_hard_links_still_inserts_selects_and_renames() {
     };
 
     go(&format!("CREATE TABLE t (id Int64, s String) {DDL}")).ok();
-    let ins = go("INSERT INTO t VALUES (1,'a')").ok();
-    assert!(
-        ins.err.contains("no hard links"),
-        "the operator is told the disk-space story changed, got:\n{}",
-        ins.err
-    );
+    go("INSERT INTO t VALUES (1,'a')").ok();
     go("INSERT INTO t VALUES (2,'b')").ok();
     // The statement that used to exit 1 on a directory an archive had poisoned.
     assert_eq!(go("SELECT s FROM t ORDER BY id").ok().lines(), ["a", "b"]);
-    // The checkpoint's link site, which only a RENAME reaches.
-    go("RENAME TABLE t TO t2").ok();
+    // The one remaining link site, which only a RENAME reaches -- the WAL no
+    // longer has one at all: a segment *is* its own archive file, so nothing
+    // is linked or copied to retire it, on any filesystem.
+    let ren = go("RENAME TABLE t TO t2").ok();
+    assert!(
+        ren.err.contains("no hard links"),
+        "the operator is told the disk-space story changed, got:\n{}",
+        ren.err
+    );
     assert_eq!(go("SELECT s FROM t2 ORDER BY id").ok().lines(), ["a", "b"]);
 
     // Copies, not links: every part file is its own inode. And the directory

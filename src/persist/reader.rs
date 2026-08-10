@@ -1236,7 +1236,13 @@ mod tests {
                 c[byte] ^= 1 << bit;
                 match part_from_bytes(&c) {
                     Ok(_) => panic!("flip at byte {byte} bit {bit} was accepted"),
-                    Err(e) => assert!(is_corrupt(&e), "byte {byte} bit {bit}: {e}"),
+                    // The version word is the one field where a flip has a
+                    // *diagnosis* rather than just a checksum: it is still
+                    // refused, and refused with the right story.
+                    Err(e) => assert!(
+                        is_corrupt(&e) || e.code() == "FORMAT_VERSION",
+                        "byte {byte} bit {bit}: {e}"
+                    ),
                 }
             }
         }
@@ -1248,8 +1254,8 @@ mod tests {
         let at = format::MAGIC.len();
         bytes[at..at + 4].copy_from_slice(&(format::FORMAT_VERSION + 1).to_le_bytes());
         let e = must_err(part_from_bytes(&bytes));
-        assert!(e.to_string().contains("unsupported format version"), "{e}");
-        assert!(is_corrupt(&e));
+        assert!(e.to_string().contains("Upgrade granular"), "{e}");
+        assert_eq!(e.code(), "FORMAT_VERSION", "{e}");
     }
 
     #[test]
@@ -1263,7 +1269,7 @@ mod tests {
         let ck = format::checksum(&bytes[start..start + 12]);
         bytes[start + 12..start + 20].copy_from_slice(&ck.to_le_bytes());
         let e = must_err(part_from_bytes(&bytes));
-        assert!(e.to_string().contains("unsupported format version"), "{e}");
+        assert_eq!(e.code(), "FORMAT_VERSION", "{e}");
     }
 
     #[test]
@@ -1649,7 +1655,7 @@ mod tests {
         let tsnap = t.snapshot();
         let before: Vec<Vec<(usize, Vec<Value>)>> =
             tsnap.parts().iter().map(|p| dump(p)).collect();
-        writer::write_table(s.path(), &t).unwrap();
+        writer::write_table(s.path(), &t, 0).unwrap();
 
         let mut back = read_table(s.path(), "hits").unwrap();
         assert_eq!(back.part_count(), 3);
@@ -1666,7 +1672,7 @@ mod tests {
     fn read_table_rejects_a_renamed_directory() {
         let s = Scratch::new("table-renamed");
         let t = sample_table("hits", &[100]);
-        writer::write_table(s.path(), &t).unwrap();
+        writer::write_table(s.path(), &t, 0).unwrap();
         std::fs::rename(s.join("hits"), s.join("clicks")).unwrap();
         let e = must_err(read_table(s.path(), "clicks"));
         assert!(e.to_string().contains("definition of table `hits`"), "{e}");
@@ -2018,7 +2024,7 @@ mod tests {
     fn damaged_table(tag: &str, which: usize) -> (Scratch, PathBuf, String) {
         let s = Scratch::new(tag);
         let t = sample_table("hits", &[1_500, 800, 2_000]);
-        writer::write_table(s.path(), &t).unwrap();
+        writer::write_table(s.path(), &t, 0).unwrap();
         let tdir = s.join("hits");
         let files = store::list_part_files(&tdir).unwrap();
         assert_eq!(files.len(), 3, "fixture must write three parts");
@@ -2075,7 +2081,7 @@ mod tests {
         // Put the file back the way `write_table` had it.
         let good = sample_table("hits", &[1_500, 800, 2_000]);
         let s2 = Scratch::new("repair-src");
-        writer::write_table(s2.path(), &good).unwrap();
+        writer::write_table(s2.path(), &good, 0).unwrap();
         std::fs::copy(s2.join("hits").join(&name), tdir.join(&name)).unwrap();
 
         let img = read_table_image(&tdir).unwrap();
@@ -2102,7 +2108,7 @@ mod tests {
     #[test]
     fn a_healthy_table_records_no_damage() {
         let s = Scratch::new("healthy-image");
-        writer::write_table(s.path(), &sample_table("hits", &[900])).unwrap();
+        writer::write_table(s.path(), &sample_table("hits", &[900]), 0).unwrap();
         let img = read_table_image(&s.join("hits")).unwrap();
         assert!(img.damaged.is_empty());
         assert_eq!(img.parts.len(), 1);

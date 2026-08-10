@@ -3,8 +3,8 @@
 //! Everything that *produces* an archive here goes through the shipped binary,
 //! because that is the half that has to be wired into the engine. A checkpoint
 //! is what retires a log, the CLI takes one on the way out, and if archiving
-//! were not reachable from that path every test below would find an empty
-//! `.wal-archive` and fail. The recovery itself is a function of the
+//! were not reachable from that path every test below would find nothing under
+//! `.wal` but a live segment and fail. The recovery itself is a function of the
 //! filesystem and is called directly (`granular::backup::restore_until`); its
 //! *result* is then read back through the binary, so a restored directory that
 //! the real loader cannot open is a failure here.
@@ -204,7 +204,13 @@ fn replaying_to_the_same_target_twice_gives_the_same_state() {
     assert_eq!(ids(&a), ["1", "2", "3", "4", "5"]);
     assert_eq!(ids(&b), ids(&a));
 
-    let log = |d: &Path| std::fs::read(d.join("default").join("t").join("wal.log")).unwrap();
+    let log = |d: &Path| {
+        let dir = d.join(".wal").join("default").join("t");
+        let mut names: Vec<_> =
+            std::fs::read_dir(&dir).unwrap().flatten().map(|e| e.file_name()).collect();
+        names.sort();
+        names.iter().map(|n| std::fs::read(dir.join(n)).unwrap()).collect::<Vec<_>>()
+    };
     assert_eq!(log(&a), log(&b), "the recovered log is a byte range of the archive, not a rebuild");
 }
 
@@ -349,9 +355,7 @@ fn a_gap_in_the_archive_is_refused_and_names_the_missing_range() {
     // or an over-eager cleanup script would.
     let victim = segs.remove(segs.len() / 2);
     std::fs::remove_file(&victim.path).expect("remove the segment");
-    let _ = std::fs::remove_file(dir.join(
-        victim.path.file_name().unwrap().to_string_lossy().replace(".gwal", ".gseal"),
-    ));
+    let _ = &dir;
 
     let e = wal::segments(&db, "default", "t").expect_err("a hole must be reported");
     let msg = e.to_string();
@@ -369,12 +373,17 @@ fn a_gap_in_the_archive_is_refused_and_names_the_missing_range() {
     assert!(!s.at("x").exists(), "a refused recovery must write nothing");
 }
 
-/// The crash window archiving has: the log is linked into the archive and the
-/// seal is not written yet. That link is not a short segment -- it is not a
-/// segment at all, because the seal is what publishes one, and the records it
-/// holds are still in the log the interrupted checkpoint never replaced.
+/// The crash window a roll has, and the reason it is benign.
+///
+/// A segment is sealed by its *successor's* arrival, so there is no state in
+/// which a segment has been retired and its replacement does not exist. Kill
+/// the process between the roll's `fsync` and the successor's publish and the
+/// old segment is still the highest-origin file, hence still the active one:
+/// appends resume into it, the records are in exactly one place, and the next
+/// checkpoint archives a superset. The old layout needed an idempotent
+/// open-time repair for this; here the state cannot be constructed.
 #[test]
-fn an_unsealed_link_is_not_part_of_the_archive_and_is_superseded() {
+fn a_roll_whose_successor_was_never_published_simply_carries_on() {
     let _x = exclusive();
     let s = Scratch::new("unsealed");
     let db = s.db();
@@ -384,41 +393,35 @@ fn an_unsealed_link_is_not_part_of_the_archive_and_is_superseded() {
     step(&db, &format!("BACKUP TO '{arc}'"));
     step(&db, "INSERT INTO t VALUES (2,'b')");
 
-    // The exact state a `kill -9` between `link` and the seal leaves: the link
-    // is there, the seal is not, and the log was never replaced -- so the
-    // records exist in both places and neither copy has been lost.
+    // Delete the successor the last checkpoint published: the state a crash
+    // between the sealing `fsync` and the `rename` would have left.
+    let dir = wal::archive_dir(&db, "default", "t");
     let segs = wal::segments(&db, "default", "t").expect("segments");
     let newest = segs.last().expect("a segment").clone();
-    let seal = PathBuf::from(newest.path.to_string_lossy().replace(".gwal", ".gseal"));
-    std::fs::copy(&newest.path, db.join("default").join("t").join("wal.log")).expect("un-truncate");
-    std::fs::remove_file(&seal).expect("remove the seal");
+    std::fs::remove_file(dir.join(format!("seg_{:020}.gwal", newest.end))).expect("un-publish");
     assert_eq!(
         wal::segments(&db, "default", "t").expect("segments").len(),
         segs.len() - 1,
-        "an unsealed link must not read as a segment"
+        "the newest file is the active log, not part of the archive"
     );
 
-    // Its records are still in the archive-less half of the world, so a
-    // recovery to the latest archived state simply does not have them yet.
+    // Its records are in the live log, not the archive, so a recovery to the
+    // latest archived state simply does not have them yet.
     let out = s.at("mid-crash");
     backup::restore_until(Path::new(&arc), &db, &out, Target::Latest).expect("recover");
-    assert_eq!(ids(&out), ["1"], "an unsealed link must contribute nothing");
+    assert_eq!(ids(&out), ["1"], "the live segment must contribute nothing");
 
-    // The next checkpoint takes that position back and archives the log as it
-    // now stands, which is a superset -- so nothing is written twice and
-    // nothing is lost.
+    // The next checkpoint seals that same segment and carries on, so nothing
+    // is written twice and nothing is lost.
     step(&db, "INSERT INTO t VALUES (3,'c')");
     let after = wal::segments(&db, "default", "t").expect("segments");
-    assert_eq!(
-        after.len(),
-        segs.len(),
-        "the retry must reuse the position, not chain past it: {after:?}"
-    );
+    assert_eq!(after.len(), segs.len(), "the roll must resume, not chain past: {after:?}");
     assert_eq!(after.last().unwrap().origin, newest.origin);
     let out = s.at("healed");
     backup::restore_until(Path::new(&arc), &db, &out, Target::Latest).expect("recover");
-    assert_eq!(ids(&out), ["1", "2", "3"], "the superseded records must appear exactly once");
+    assert_eq!(ids(&out), ["1", "2", "3"], "the records must appear exactly once");
 }
+
 
 /// The other half of that contract, and the one with teeth: a segment that
 /// *is* sealed and is shorter than its seal claims is damage, not a shorter
@@ -473,8 +476,10 @@ fn retention_prunes_the_oldest_segments_and_a_recovery_that_needed_them_refuses(
     drop(restore_default);
 
     let segs = wal::segments(&db, "default", "t").expect("segments");
+    // A 1-byte budget may now drop *every* archived segment: the stream
+    // numbering lives in the active segment's own header, so there is nothing
+    // left that the oldest survivor has to carry.
     assert!(segs.len() <= 2, "a 1-byte budget must keep almost nothing: {}", segs.len());
-    assert!(!segs.is_empty(), "the newest segment is never pruned -- it carries the numbering");
 
     let e = backup::restore_until(Path::new(&arc), &db, &s.at("x"), Target::Latest)
         .expect_err("a recovery that needs a pruned segment must refuse");
@@ -539,9 +544,9 @@ fn a_kill_during_archiving_never_leaves_the_archive_silently_short() {
         for seg in &segs {
             let len = std::fs::metadata(&seg.path).expect("segment").len();
             assert_eq!(
-                seg.end - seg.origin + granular::persist::format::HEADER_LEN as u64,
+                seg.end - seg.origin + granular::persist::wal::SEG_HEADER_LEN,
                 len,
-                "round {round}: {} is not the length its seal claims",
+                "round {round}: {} is not the length its chain position implies",
                 seg.path.display()
             );
             // The bug this test found: a writer killed between its append and

@@ -25,16 +25,13 @@ use crate::catalog::{Catalog, DEFAULT_DELTA_LIMIT};
 use crate::common::{lane_to_f64, lane_to_i64, Error, Result};
 use crate::types::{DataType, PhysicalType, TableDef, Value};
 
-use super::format;
-use super::wal::{Wal, WalRecord};
+use super::wal::{self, WalRecord};
 use super::{reader, writer};
 
 /// Root file listing every database and the definition of every table in it.
 pub const CATALOG_FILE: &str = "CATALOG";
 /// Per-table commit point: definition + live part files + WAL watermark.
 pub const TABLE_FILE: &str = "TABLE";
-/// Per-table write-ahead log.
-pub const WAL_FILE: &str = "wal.log";
 /// Part file extension. Deliberately distinctive: the GC in
 /// [`writer::write_table`] deletes by pattern, and must never match a file it
 /// did not create.
@@ -81,10 +78,10 @@ pub fn is_safe_name(name: &str) -> bool {
 /// Both are files this module writes at the root, and a database is a
 /// directory: on a fresh directory `mkdir` wins the race and `CATALOG` can
 /// never be written afterwards, which leaves every subsequent open failing
-/// with `Is a directory`. Two entries and no more -- `TABLE` and `wal.log`
-/// live one level *below* a table directory and provably cannot collide, and
-/// `.wal-archive` is already refused by the leading dot above. A longer list
-/// would only be false refusals.
+/// with `Is a directory`. Two entries and no more -- `TABLE` lives one level
+/// *below* a table directory and provably cannot collide, and the log root
+/// `.wal` is already refused by the leading dot above. A longer list would
+/// only be false refusals.
 pub const ROOT_RESERVED: [&str; 2] = [CATALOG_FILE, crate::session::LOCK_FILE];
 
 /// The existing sibling `name` would share a directory entry with, if any.
@@ -295,11 +292,14 @@ fn degrade(at: &Path, why: &str) {
 
 /// Link `from` to `to`, or copy it on a filesystem with no links.
 ///
-/// exFAT has none at all, and the engine links in exactly two places -- the
-/// incremental checkpoint and the sealed-segment archive. Before this, the
-/// first `INSERT` on such a volume poisoned the directory: the failed archive
-/// left the checkpoint unfinished, and *every* later statement, `SELECT`
-/// included, exited non-zero forever.
+/// exFAT has none at all. The engine now links in exactly *one* place -- the
+/// incremental checkpoint's part reuse. The other site was the write-ahead
+/// log's archiving step, where a checkpoint hard-linked the live log into the
+/// archive; segments removed it, because a segment joins the archive by
+/// ceasing to be the newest and there is nothing to link. Before any of this,
+/// the first `INSERT` on such a volume poisoned the directory: the failed
+/// archive left the checkpoint unfinished, and *every* later statement,
+/// `SELECT` included, exited non-zero forever.
 pub fn link_or_copy(from: &Path, to: &Path) -> std::io::Result<()> {
     let known = LINKS.load(Ordering::Relaxed);
     if known != LINKS_NONE {
@@ -377,7 +377,6 @@ pub fn save_catalog(catalog: &mut Catalog) -> Result<()> {
     fs::create_dir_all(&root).map_err(|e| io_err("create directory", &root, e))?;
 
     let mut roster: Vec<(String, Vec<TableDef>)> = Vec::new();
-    let mut checkpointed: Vec<PathBuf> = Vec::new();
     let mut live: Vec<(PathBuf, Vec<String>)> = Vec::new();
     for db in catalog.database_names() {
         if !is_safe_name(&db) {
@@ -414,8 +413,14 @@ pub fn save_catalog(catalog: &mut Catalog) -> Result<()> {
             if !t.def.engine.is_persistent() {
                 continue;
             }
-            writer::write_table(&ddir, t)?;
-            checkpointed.push(ddir.join(name));
+            // Roll the log *first*, and commit the parts with the stream
+            // position the roll produced. A roll destroys nothing -- the
+            // sealed segment stays exactly where it was -- so the "commit the
+            // parts before you discard the log" ordering this used to need has
+            // nothing left to protect, and the watermark stops being a number
+            // computed beside the log's real end and starts being it.
+            let committed = wal::roll_for_checkpoint(&wal::wal_dir(root.as_path(), &db, name))?;
+            writer::write_table(&ddir, t, committed)?;
             defs.push(t.def.clone());
         }
         // Every name the catalog holds, not just the persistent ones: a name
@@ -435,18 +440,6 @@ pub fn save_catalog(catalog: &mut Catalog) -> Result<()> {
         collect_dropped_tables(ddir, keep)?;
     }
 
-    // The committed parts cover everything the logs hold, so the logs can go.
-    // A log that is already just its header holds nothing, and reopening it to
-    // rewrite the header it already has -- plus the commit record, to record a
-    // watermark it already carries -- is write amplification charged to a
-    // database that was only read.
-    for tdir in &checkpointed {
-        let wal = tdir.join(WAL_FILE);
-        if fs::metadata(&wal).is_ok_and(|m| m.len() > format::HEADER_LEN as u64) {
-            Wal::open(&wal)?.truncate()?;
-            set_wal_committed(tdir, format::HEADER_LEN as u64)?;
-        }
-    }
     Ok(())
 }
 
@@ -492,11 +485,14 @@ fn collect_dropped_tables(ddir: &Path, keep: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// Whether `dir` is a table directory *we* wrote: it holds a commit record, or
-/// a log from a table that was created but never checkpointed. Anything else
-/// is someone else's directory and is not ours to delete.
+/// Whether `dir` is a table directory *we* wrote: it holds a commit record.
+/// Anything else is someone else's directory and is not ours to delete.
+///
+/// One marker rather than two, because the log moved out from under here --
+/// `CREATE TABLE` writes the commit record immediately, so there is no longer
+/// a window in which a table we created is identified only by its log.
 fn is_table_dir(dir: &Path) -> bool {
-    dir.join(TABLE_FILE).exists() || dir.join(WAL_FILE).exists()
+    dir.join(TABLE_FILE).exists()
 }
 
 /// Load every database, table, part and un-checkpointed WAL record under the
@@ -518,6 +514,7 @@ pub fn load_catalog(catalog: &mut Catalog) -> Result<()> {
         catalog.create_database(&db, true)?;
         for def in defs {
             let tdir = root.join(&db).join(&def.name);
+            let bare_name = def.name.clone();
             // Damage found on *this* table's metadata, quarantining it the way
             // a bad part file already does instead of refusing the whole
             // database. Empty on every healthy open, and this is the only
@@ -543,11 +540,19 @@ pub fn load_catalog(catalog: &mut Catalog) -> Result<()> {
                             why: e.to_string(),
                         });
                     }
+                    // "Replay nothing", not "replay from the beginning".
+                    // The log directory outlives `DROP TABLE` by design, so
+                    // position zero is no longer a safe default: a table
+                    // recreated under a dropped one's name would replay the
+                    // corpse's whole stream into a schema that need not match.
+                    // `CREATE TABLE` stamps this same number into a fresh
+                    // `TABLE` file, so a missing one can only be damage or a
+                    // directory this build did not write.
                     reader::TableImage {
                         def,
                         parts: Vec::new(),
                         part_files: Vec::new(),
-                        wal_committed: format::HEADER_LEN as u64,
+                        wal_committed: wal::stream_end(&root, &db, &bare_name),
                         damaged: Vec::new(),
                     }
                 }
@@ -571,7 +576,7 @@ pub fn load_catalog(catalog: &mut Catalog) -> Result<()> {
                     p.set_origin(parse_part_seq(name).unwrap_or(0));
                 }
             }
-            let bare = image.def.name.clone();
+            let bare = bare_name;
             let mut qualified = image.def.clone();
             qualified.name = format!("{db}.{bare}");
             catalog.create_table(qualified, true)?;
@@ -580,30 +585,24 @@ pub fn load_catalog(catalog: &mut Catalog) -> Result<()> {
             let t = catalog.table_by_path_mut(&path)?;
             t.set_parts(image.parts);
 
-            let wal = tdir.join(WAL_FILE);
+            let wal = wal::wal_dir(&root, &db, &bare);
             // Not replayed at all when the `TABLE` file is already the damage:
             // the image is the roster's bare definition, so replaying into it
             // would build a table holding the tail and none of the parts --
             // work whose only product is a table that is refused anyway.
             if broken.is_empty() && wal.exists() {
                 let schema = t.schema().clone();
-                let wal_len = fs::metadata(&wal).map(|m| m.len()).unwrap_or(0);
-                // A watermark past the end of the log means we crashed between
-                // truncating the log and recording that we had: the log is
-                // empty, the parts are complete, and the stale watermark must
-                // be repaired or the *next* records written would be skipped.
-                let stale = image.wal_committed > wal_len;
-                let from = image.wal_committed.min(wal_len);
+                let from = image.wal_committed;
                 // A log that will not replay quarantines its own table, the
                 // same as a part file that will not decode. This used to be a
                 // bare `?`: one table's bad checksum, in a file no other table
                 // reads, refused the entire database -- `SELECT count() FROM b`
                 // and `SELECT * FROM system.tables` included, so the operator
                 // could not even find out which table it was.
-                match Wal::replay_from(&wal, &schema, from) {
+                match wal::Wal::replay_from(&wal, &schema, from) {
                     Err(e) => {
                         broken.push(reader::DamagedPart {
-                            file: WAL_FILE.to_string(),
+                            file: crate::persist::wal::WAL_DIR.to_string(),
                             why: e.to_string(),
                         });
                     }
@@ -624,9 +623,6 @@ pub fn load_catalog(catalog: &mut Catalog) -> Result<()> {
                                     t.delete_key(&v)?;
                                 }
                             }
-                        }
-                        if stale {
-                            set_wal_committed(&tdir, wal_len.max(format::HEADER_LEN as u64))?;
                         }
                     }
                 }
@@ -674,6 +670,9 @@ fn value_from_lane(ty: &DataType, lane: u64) -> Result<Value> {
 pub(crate) fn prefix(path: &Path, e: Error) -> Error {
     match e {
         Error::Corruption(m) => Error::Corruption(format!("{}: {m}", path.display())),
+        // Named for the same reason and kept a *version* error: an operator
+        // who is told to recreate a data directory needs to know which one.
+        Error::Version(m) => Error::Version(format!("{}: {m}", path.display())),
         other => other,
     }
 }
@@ -701,7 +700,7 @@ mod tests {
         assert_eq!(parse_part_seq("part_1234567.gpart"), Some(1_234_567));
         for stray in [
             "TABLE",
-            "wal.log",
+            "seg_00000000000000000000.gwal",
             "part_.gpart",
             "part_00x1.gpart",
             "part_000001.gpart.tmp",
@@ -753,7 +752,7 @@ mod tests {
         let s = Scratch::new("badname");
         let mut t = sample_table("t", &[10]);
         t.def.name = "../escape".into();
-        let e = writer::write_table(s.path(), &t).unwrap_err();
+        let e = writer::write_table(s.path(), &t, 0).unwrap_err();
         assert_eq!(e.code(), "STORAGE_ERROR", "{e}");
         assert!(!s.path().parent().unwrap().join("escape").exists());
     }
@@ -1009,8 +1008,13 @@ mod tests {
         assert!(after[1].0 > before[0].0, "sequence numbers are never reused: {after:?}");
     }
 
+    /// The watermark a checkpoint records is *the same number* as the origin
+    /// of the segment it left behind, with nothing between them. That identity
+    /// is what removed `set_wal_committed` from the checkpoint path and the
+    /// stale-watermark repair from the load path, so it is worth pinning
+    /// directly rather than inferring from "the table still reads correctly".
     #[test]
-    fn checkpoint_truncates_the_log_and_clears_the_watermark() {
+    fn a_checkpoint_rolls_the_log_and_records_the_new_origin() {
         let s = Scratch::new("checkpoint-wal");
         let mut c = on_disk(&s);
         c.create_table(table_def("t"), false).unwrap();
@@ -1018,20 +1022,23 @@ mod tests {
         save_catalog(&mut c).unwrap();
 
         let tdir = s.join("default").join("t");
-        let mut w = Wal::open(&tdir.join(WAL_FILE)).unwrap();
+        let wdir = wal::wal_dir(s.path(), "default", "t");
+        let mut w = wal::Wal::open(&wdir).unwrap();
         w.append_delete(7).unwrap();
         w.sync().unwrap();
-        let grown = fs::metadata(tdir.join(WAL_FILE)).unwrap().len();
-        assert!(grown > format::HEADER_LEN as u64);
+        assert!(w.pending() > 0);
+        drop(w);
 
         save_catalog(&mut c).unwrap();
-        assert_eq!(
-            fs::metadata(tdir.join(WAL_FILE)).unwrap().len(),
-            format::HEADER_LEN as u64,
-            "a checkpoint must reclaim the log"
-        );
         let img = reader::read_table_image(&tdir).unwrap();
-        assert_eq!(img.wal_committed, format::HEADER_LEN as u64);
+        let w = wal::Wal::open(&wdir).unwrap();
+        assert_eq!(
+            img.wal_committed,
+            w.origin(),
+            "the watermark must be the active segment's origin exactly"
+        );
+        assert!(w.is_empty(), "the fresh segment holds no record");
+        assert_eq!(w.pending(), 0);
     }
 
     #[test]
@@ -1045,7 +1052,6 @@ mod tests {
         save_catalog(&mut c).unwrap();
 
         // Simulate writes that reached the log but not a part.
-        let tdir = s.join("default").join("t");
         let extra = Block::new(vec![
             Column::u64s(DataType::UInt64, vec![9_000_001, 9_000_002]),
             Column::strs(DataType::String, vec!["new-a".into(), "new-b".into()]),
@@ -1053,7 +1059,7 @@ mod tests {
             Column::f64s(DataType::Float64, vec![0.5, 1.5]),
         ])
         .unwrap();
-        let mut w = Wal::open(&tdir.join(WAL_FILE)).unwrap();
+        let mut w = wal::Wal::open(&wal::wal_dir(s.path(), "default", "t")).unwrap();
         w.append_insert(&extra).unwrap();
         w.append_delete(keys[0]).unwrap();
         w.sync().unwrap();
@@ -1087,14 +1093,16 @@ mod tests {
         ])
         .unwrap();
         // The write path: log first, then apply.
-        let mut w = Wal::open(&tdir.join(WAL_FILE)).unwrap();
+        let wdir = wal::wal_dir(s.path(), "default", "t");
+        let mut w = wal::Wal::open(&wdir).unwrap();
         w.append_insert(&row).unwrap();
         w.sync().unwrap();
+        drop(w);
         c.table_mut(&ObjectName::bare("t")).unwrap().insert(row.clone()).unwrap();
-        save_catalog(&mut c).unwrap(); // covers the record, truncates the log
+        save_catalog(&mut c).unwrap(); // covers the record, rolls the log
 
         // A second record arrives after the checkpoint and is not applied.
-        let mut w = Wal::open(&tdir.join(WAL_FILE)).unwrap();
+        let mut w = wal::Wal::open(&wdir).unwrap();
         w.append_insert(&row).unwrap();
         w.sync().unwrap();
 
@@ -1107,35 +1115,42 @@ mod tests {
         );
     }
 
+    /// The old layout could leave a watermark past the end of the log -- the
+    /// LSN restarted at every truncation, so a crash between the truncate and
+    /// the rewrite left a number from the previous generation -- and
+    /// `load_catalog` silently clamped it. Under a stream LSN that state
+    /// cannot arise, and a watermark past the stream end can only mean
+    /// segments are missing, which is a hole. So it is *reported* rather than
+    /// clamped: replaying nothing and calling it success is the failure this
+    /// whole change exists to remove.
     #[test]
-    fn a_stale_watermark_is_repaired_on_load() {
+    fn a_watermark_past_the_stream_end_is_reported_not_clamped() {
         let s = Scratch::new("wal-stale");
         let mut c = on_disk(&s);
         c.create_table(table_def("t"), false).unwrap();
         c.table_mut(&ObjectName::bare("t")).unwrap().insert(sample_block(50)).unwrap();
         save_catalog(&mut c).unwrap();
 
-        // Crash shape: the watermark names a log longer than the one on disk.
+        // Something in the log, so there is a stream for the watermark to
+        // point past the end of.
+        let mut w = wal::Wal::open(&wal::wal_dir(s.path(), "default", "t")).unwrap();
+        w.append_delete(1).unwrap();
+        w.sync().unwrap();
+        drop(w);
         let tdir = s.join("default").join("t");
-        Wal::open(&tdir.join(WAL_FILE)).unwrap();
         set_wal_committed(&tdir, 1_000_000).unwrap();
 
         let mut c2 = on_disk(&s);
         load_catalog(&mut c2).unwrap();
-        let img = reader::read_table_image(&tdir).unwrap();
-        assert_eq!(
-            img.wal_committed,
-            format::HEADER_LEN as u64,
-            "a watermark past the end of the log must be repaired"
+        // Quarantined, not clamped, and not silently empty.
+        let e = match c2.table_by_path_mut("default.t") {
+            Err(e) => e,
+            Ok(_) => panic!("a watermark past the stream end must be refused"),
+        };
+        assert!(
+            e.to_string().contains("1000000"),
+            "the refusal must name the watermark it could not reach: {e}"
         );
-
-        // ...and records written after the repair are still replayed.
-        let mut w = Wal::open(&tdir.join(WAL_FILE)).unwrap();
-        w.append_delete(1).unwrap();
-        w.sync().unwrap();
-        let mut c3 = on_disk(&s);
-        load_catalog(&mut c3).unwrap();
-        assert!(c3.table_by_path_mut("default.t").is_ok());
     }
 
     // ---- adversarial review additions ------------------------------------
@@ -1210,12 +1225,15 @@ mod tests {
         save_catalog(&mut c).unwrap();
         assert!(stray.join("readme.txt").exists(), "a foreign directory must survive");
 
-        // ...while a table directory that never got as far as a commit record
-        // is ours, and goes.
+        // ...while a table directory the catalog does not name, but which
+        // holds our commit record, is ours and goes. (A log-only directory is
+        // no longer a case: the log lives under `.wal`, and `CREATE TABLE`
+        // writes the commit record before anything can be logged.)
         let half = s.join("default").join("halfborn");
-        Wal::open(&half.join(WAL_FILE)).unwrap();
+        fs::create_dir_all(&half).unwrap();
+        fs::write(half.join(TABLE_FILE), b"x").unwrap();
         save_catalog(&mut c).unwrap();
-        assert!(!half.exists(), "a log-only directory of an unknown table must be collected");
+        assert!(!half.exists(), "a directory of an unknown table must be collected");
         assert!(s.join("default").join("t").exists(), "the live table must be untouched");
     }
 

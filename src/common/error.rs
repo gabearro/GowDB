@@ -17,8 +17,18 @@ pub enum Error {
     Storage(String),
     /// I/O or on-disk format problem.
     Io(String),
-    /// On-disk data failed its checksum or version check.
+    /// On-disk data failed its checksum.
     Corruption(String),
+    /// On-disk data is intact but was written by a format version this build
+    /// does not read.
+    ///
+    /// Distinct from [`Error::Corruption`] because it is the opposite
+    /// diagnosis and calls for the opposite response: nothing is damaged, no
+    /// file should be deleted, and quarantining the table would file a version
+    /// skew as rot. It also has to be a variant rather than a message, because
+    /// [`super::store::load_catalog`] branches on it -- version skew refuses
+    /// the open, damage quarantines one table.
+    Version(String),
 }
 
 impl Error {
@@ -40,6 +50,9 @@ impl Error {
     pub fn corruption(msg: impl Into<String>) -> Self {
         Error::Corruption(msg.into())
     }
+    pub fn version(msg: impl Into<String>) -> Self {
+        Error::Version(msg.into())
+    }
 
     /// ClickHouse-style short code, handy for tests and for a wire protocol.
     pub fn code(&self) -> &'static str {
@@ -51,6 +64,7 @@ impl Error {
             Error::Storage(_) => "STORAGE_ERROR",
             Error::Io(_) => "IO_ERROR",
             Error::Corruption(_) => "CHECKSUM_MISMATCH",
+            Error::Version(_) => "FORMAT_VERSION",
         }
     }
 }
@@ -65,6 +79,7 @@ impl fmt::Display for Error {
             Error::Storage(m) => write!(f, "storage error: {m}"),
             Error::Io(m) => write!(f, "io error: {m}"),
             Error::Corruption(m) => write!(f, "corruption: {m}"),
+            Error::Version(m) => write!(f, "unsupported on-disk format: {m}"),
         }
     }
 }

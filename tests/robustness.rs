@@ -1514,7 +1514,7 @@ fn check_decode<T>(
         Ok(Ok(_)) => fp.of(tag, None),
         Ok(Err(e)) => {
             assert!(
-                is_corrupt(&e),
+                is_corrupt(&e) || e.code() == "FORMAT_VERSION",
                 "{tag} rejected a damaged image with {} ({e}), not Corruption",
                 e.code()
             );
@@ -1798,7 +1798,11 @@ fn a_forged_commit_record_can_never_name_a_path_body() {
                 );
                 assert!(!parts[0].contains('/'), "commit record accepted a path: `{name}`");
             }
-            Err(e) => assert!(is_corrupt(&e), "`{name}` rejected with {}: {e}", e.code()),
+            Err(e) => assert!(
+                is_corrupt(&e) || e.code() == "FORMAT_VERSION",
+                "`{name}` rejected with {}: {e}",
+                e.code()
+            ),
         }
     }
 }
@@ -1811,10 +1815,10 @@ fn a_forged_commit_record_can_never_name_a_path_body() {
 /// inserts and deletes, and return its bytes together with what a healthy
 /// replay yields.
 fn fixture_wal(dir: &Scratch, n: usize) -> (PathBuf, Vec<u8>, Vec<WalRecord>) {
-    let path = dir.join("wal.log");
+    let path = seg_of(&dir.join("wal"));
     let schema = fixture_schema();
     {
-        let mut w = Wal::open(&path).expect("open");
+        let mut w = Wal::open(&dir.join("wal")).expect("open");
         for i in 0..n {
             if i % 3 == 2 {
                 w.append_delete(i as u64 * 7).expect("delete");
@@ -1825,8 +1829,32 @@ fn fixture_wal(dir: &Scratch, n: usize) -> (PathBuf, Vec<u8>, Vec<WalRecord>) {
         w.sync().expect("sync");
     }
     let bytes = std::fs::read(&path).expect("read");
-    let healthy = Wal::replay(&path, &schema).expect("healthy replay");
+    let healthy = Wal::replay(&dir.join("wal"), &schema).expect("healthy replay");
     (path, bytes, healthy)
+}
+
+/// The active segment inside a log directory, creating the directory's first
+/// segment if it is not there yet.
+fn seg_of(dir: &Path) -> PathBuf {
+    let _ = Wal::open(dir);
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .expect("log directory")
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.ends_with(".gwal"))
+        .collect();
+    names.sort();
+    dir.join(names.pop().expect("a segment"))
+}
+
+/// Replay the log a segment file belongs to.
+fn replay_seg(seg: &Path, schema: &granular::types::Schema) -> granular::Result<Vec<WalRecord>> {
+    Wal::replay(seg.parent().expect("a log directory"), schema)
+}
+
+/// Open the log a segment file belongs to.
+fn open_seg(seg: &Path) -> granular::Result<Wal> {
+    Wal::open(seg.parent().expect("a log directory"))
 }
 
 #[test]
@@ -1842,21 +1870,127 @@ fn wal_truncation_always_yields_a_prefix_body() {
     let schema = fixture_schema();
 
     // The claim in `wal.rs`: a crash during `write` leaves a partial record at
-    // the end, that is not corruption, and replay stops cleanly at it. So
-    // *every* suffix truncation must succeed and return a prefix of the
-    // healthy replay -- not merely "not error", a prefix, because returning
-    // the wrong records would be worse than refusing.
+    // the end, that is not corruption, and replay stops cleanly at it.
+    //
+    // The contract is now "a prefix, **or a refusal**", and the difference is
+    // the whole point of the segment header's durability stamp. Cutting a
+    // *synced* log is not a crash shape -- an `fsync` that returned means the
+    // bytes are on the platter -- so below the stamp it is lost acknowledged
+    // data and is reported. Above it, it is an interrupted append and is
+    // silently dropped, exactly as before. What may never happen is the third
+    // outcome: a short record list with `Ok`.
+    // The one place the boundary is not the stamp is *below the header*: a
+    // segment is published whole by a write-fsync-rename, so no crash can leave
+    // one shorter than its 64 bytes, and a file that short is damage rather than
+    // a torn tail. That used to be answered with an empty log and `Ok`, which
+    // is the forbidden third outcome reached without forging a checksum, so it
+    // is asserted here in both directions.
+    let head = granular::persist::wal::SEG_HEADER_LEN as usize;
     for n in 0..=bytes.len() {
         tick(3, n as u64);
         std::fs::write(&path, &bytes[..n]).unwrap();
-        let got = Wal::replay(&path, &schema)
-            .unwrap_or_else(|e| panic!("a {n}-byte prefix of the log was rejected: {e}"));
+        let got = match replay_seg(&path, &schema) {
+            Ok(got) => {
+                assert!(n >= head, "a {n}-byte segment replayed as an empty log instead of \
+                                    being reported as the damage it is");
+                got
+            }
+            Err(e) => {
+                assert!(n < head, "a {n}-byte prefix of the log was rejected: {e}");
+                continue;
+            }
+        };
         assert!(
             got.len() <= healthy.len() && got[..] == healthy[..got.len()],
             "a {n}-byte prefix replayed {} records that are not a prefix of the {} healthy ones",
             got.len(),
             healthy.len()
         );
+    }
+}
+
+/// **The defect this format version exists to remove**, end to end through
+/// `Session` rather than through the `Wal` type.
+///
+/// Framing is `varint len | u64 sum | body`. The old classifier decided
+/// "torn tail versus bit rot" by reading that length and asking whether the
+/// frame reached the end of the data -- and a corrupted length can always
+/// claim to. So a torn *middle* read as a torn tail: replay stopped there,
+/// every acknowledged record after it was discarded, `count()` came back
+/// short, exit 0, no quarantine, and the next exit checkpoint destroyed the
+/// evidence. Reproduced at 3 of 4 rows.
+///
+/// The outcome now must be one of two things and never the third: every row,
+/// or a refusal that names the file.
+#[test]
+fn a_corrupted_frame_length_never_silently_drops_the_records_behind_it() {
+    let dir = Scratch::new("wal-lenhole");
+    const N: u64 = 6;
+    {
+        // No exit checkpoint: `Session` has no `Drop` checkpoint, so the
+        // records stay in the live segment, which is the shape the defect
+        // needs.
+        let mut s = Session::open(dir.path()).unwrap();
+        s.execute("CREATE TABLE t (id UInt64, s String) ENGINE = MergeTree ORDER BY id")
+            .unwrap();
+        for i in 0..N {
+            s.execute(&format!("INSERT INTO t VALUES ({i},'row-{i}')")).unwrap();
+        }
+    }
+    let seg = {
+        let d = dir.path().join(".wal").join("default").join("t");
+        let mut names: Vec<String> = std::fs::read_dir(&d)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".gwal"))
+            .collect();
+        names.sort();
+        d.join(names.pop().unwrap())
+    };
+    let full = std::fs::read(&seg).unwrap();
+
+    // Every frame start in the segment, by walking the framing by hand.
+    let head = granular::persist::wal::SEG_HEADER_LEN as usize;
+    let mut starts = Vec::new();
+    let mut p = head;
+    while p < full.len() {
+        let at = p;
+        let (mut len, mut shift) = (0u64, 0u32);
+        loop {
+            let b = full[p];
+            p += 1;
+            len |= u64::from(b & 0x7f) << shift;
+            if b < 0x80 {
+                break;
+            }
+            shift += 7;
+        }
+        p += 8 + len as usize;
+        if p > full.len() {
+            break;
+        }
+        starts.push(at);
+    }
+    assert!(starts.len() > 4, "the fixture wrote nothing to the log");
+
+    // Every length varint that is not the last record's, and every bit in it.
+    for &at in &starts[..starts.len() - 1] {
+        for bit in 0..8 {
+            let mut c = full.clone();
+            c[at] ^= 1 << bit;
+            if c[at] == full[at] {
+                continue;
+            }
+            std::fs::write(&seg, &c).unwrap();
+            let Ok(mut s) = Session::open(dir.path()) else { continue };
+            let Ok(rs) = s.query("SELECT count() FROM t") else { continue };
+            assert_eq!(
+                rs.to_values()[0][0],
+                granular::Value::UInt(N),
+                "a flipped bit {bit} in the length field at {at} silently dropped records"
+            );
+        }
     }
 }
 
@@ -1878,14 +2012,14 @@ fn wal_trailing_zeros_are_a_hole_not_rot_body() {
     // ordinary crash shape into permanent, unopenable rot. Zeroing every
     // suffix is the exhaustive form of that check.
     // From the first byte a record can start at: zeroing the header is not a
-    // hole, it is a destroyed file, and `format::read_header` is right to
-    // refuse it. The claim under test is about record bytes.
-    for n in format::HEADER_LEN..bytes.len() {
+    // hole, it is a destroyed file, and `read_head` is right to refuse it. The
+    // claim under test is about record bytes.
+    for n in granular::persist::wal::SEG_HEADER_LEN as usize..bytes.len() {
         tick(3, n as u64);
         let mut c = bytes.clone();
         c[n..].fill(0);
         std::fs::write(&path, &c).unwrap();
-        let got = Wal::replay(&path, &schema)
+        let got = replay_seg(&path, &schema)
             .unwrap_or_else(|e| panic!("zeroing from byte {n} was reported as rot: {e}"));
         assert!(
             got.len() <= healthy.len() && got[..] == healthy[..got.len()],
@@ -1902,7 +2036,7 @@ fn wal_trailing_zeros_are_a_hole_not_rot_body() {
         // offset, and `wal_reopen_after_damage_is_append_clean` covers the
         // reopen contract against damage that is not a clean suffix of zeros.
         if n % 16 == 0 {
-            Wal::open(&path)
+            open_seg(&path)
                 .unwrap_or_else(|e| panic!("zeroing from byte {n} bricked the log: {e}"));
         }
     }
@@ -1935,12 +2069,16 @@ fn wal_damage_never_invents_a_record_body() {
         }
         std::fs::write(&path, &buf).unwrap();
 
-        let (res, peak) = peak_request(|| no_panic(|| Wal::replay(&path, &schema)));
+        let (res, peak) = peak_request(|| no_panic(|| replay_seg(&path, &schema)));
         assert!(peak <= ALLOC_CEILING, "replay asked for {peak} bytes");
         let sig = match res {
             Err(msg) => panic!("PANIC in Wal::replay: {msg}\n  seed 0x{seed:016x}"),
             Ok(Err(e)) => {
-                assert!(is_corrupt(&e), "replay rejected with {}: {e}", e.code());
+                assert!(
+                    is_corrupt(&e) || e.code() == "FORMAT_VERSION",
+                    "replay rejected with {}: {e}",
+                    e.code()
+                );
                 fp.of("wal", Some(&e))
             }
             Ok(Ok(got)) => {
@@ -1999,13 +2137,13 @@ fn wal_reopen_after_damage_is_append_clean_body() {
         // the next record would sit behind bytes that never parse and the
         // following replay would stop in front of it -- silently losing an
         // acknowledged write, which is the one failure a log may not have.
-        let Ok(mut w) = Wal::open(&path) else { continue };
-        let Ok(before) = Wal::replay(&path, &schema) else { continue };
+        let Ok(mut w) = open_seg(&path) else { continue };
+        let Ok(before) = replay_seg(&path, &schema) else { continue };
         w.append_delete(0xDEAD_BEEF).expect("append after reopen");
         w.sync().expect("sync after reopen");
         drop(w);
 
-        let after = Wal::replay(&path, &schema).unwrap_or_else(|e| {
+        let after = replay_seg(&path, &schema).unwrap_or_else(|e| {
             panic!("a record appended after reopen was unreadable (seed 0x{seed:016x}): {e}")
         });
         assert_eq!(
@@ -2031,7 +2169,7 @@ fn wal_staged_records_need_their_commit_marker_body() {
     arm_watchdog();
     let _quiet = Quiet::on();
     let dir = Scratch::new("wal-staged");
-    let path = dir.join("wal.log");
+    let path = seg_of(&dir.join("wal"));
     let schema = fixture_schema();
 
     // A staged group with no marker is a write that was logged and then failed
@@ -2039,7 +2177,7 @@ fn wal_staged_records_need_their_commit_marker_body() {
     // marker in and out of existence, and the record count may only ever step
     // by exactly the size of the group.
     {
-        let mut w = Wal::open(&path).unwrap();
+        let mut w = open_seg(&path).unwrap();
         w.append_insert(&fixture_block(3)).unwrap();
         let seq = w.begin();
         w.append_insert_staged(seq, &fixture_block(2)).unwrap();
@@ -2054,15 +2192,24 @@ fn wal_staged_records_need_their_commit_marker_body() {
 
     // 4 committed records: the leading insert, the two released by the marker,
     // and the trailing insert. The orphan is dropped by construction.
-    let full = Wal::replay(&path, &schema).unwrap();
+    let full = replay_seg(&path, &schema).unwrap();
     assert_eq!(full.len(), 4, "an uncommitted staged record was replayed: {full:?}");
 
     let mut seen = Vec::new();
+    let head = granular::persist::wal::SEG_HEADER_LEN as usize;
     for n in 0..=bytes.len() {
         tick(3, n as u64);
         std::fs::write(&path, &bytes[..n]).unwrap();
-        let got = Wal::replay(&path, &schema)
-            .unwrap_or_else(|e| panic!("prefix {n} of a staged log was rejected: {e}"));
+        // Below the header the file is damage, not a prefix -- see the note in
+        // `wal_truncation_always_yields_a_prefix`. The monotonicity claim below
+        // is about lengths that can actually occur.
+        let got = match replay_seg(&path, &schema) {
+            Ok(got) => got,
+            Err(e) => {
+                assert!(n < head, "prefix {n} of a staged log was rejected: {e}");
+                continue;
+            }
+        };
         // Every prefix must be explicable: no record may appear that the full
         // replay does not contain, in the same relative order.
         let mut it = full.iter();
@@ -2330,11 +2477,10 @@ fn wal_roundtrip_is_exact_for_random_blocks_body() {
         tick(5, seed);
         let mut r = Rng::new(seed);
         let (schema, block) = random_block(&mut r);
-        let path = dir.join(&format!("rt-{case}.log"));
-        let _ = std::fs::remove_file(&path);
+        let path = seg_of(&dir.join(&format!("rt-{case}")));
         let mut want = Vec::new();
         {
-            let mut w = Wal::open(&path).expect("open");
+            let mut w = open_seg(&path).expect("open");
             for i in 0..1 + r.below(4) {
                 if r.chance(3) {
                     let lane = r.next();
@@ -2348,7 +2494,7 @@ fn wal_roundtrip_is_exact_for_random_blocks_body() {
             }
             w.sync().expect("sync");
         }
-        let got = Wal::replay(&path, &schema).expect("replay");
+        let got = replay_seg(&path, &schema).expect("replay");
         assert_eq!(got.len(), want.len(), "record count (seed 0x{seed:016x})");
         for (i, (a, b)) in got.iter().zip(&want).enumerate() {
             match (a, b) {
@@ -2372,7 +2518,7 @@ fn wal_roundtrip_is_exact_for_random_blocks_body() {
                 _ => panic!("record {i} changed kind (seed 0x{seed:016x})"),
             }
         }
-        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 }
 

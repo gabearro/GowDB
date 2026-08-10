@@ -121,8 +121,25 @@ fn ddl(t: &str) -> String {
     format!("CREATE TABLE {t} (id UInt64, s String) ENGINE = MergeTree ORDER BY id PRIMARY KEY id")
 }
 
+/// A table's **active** log segment.
+///
+/// The log is a directory of numbered segments under `<root>/.wal/<db>/<t>`,
+/// and only the highest-numbered one is appended to; a checkpoint seals that
+/// one where it stands and starts the next. Every reading here -- "did the
+/// COMMIT write anything", "did the fold recycle the log" -- is about the file
+/// a writer is actually using, which is this one.
 fn wal_of(dir: &Path, t: &str) -> PathBuf {
-    dir.join("default").join(t).join("wal.log")
+    let d = dir.join(".wal").join("default").join(t);
+    let mut names: Vec<String> = std::fs::read_dir(&d)
+        .map(|rd| {
+            rd.flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .filter(|n| n.ends_with(".gwal"))
+                .collect()
+        })
+        .unwrap_or_default();
+    names.sort();
+    d.join(names.pop().unwrap_or_else(|| "none.gwal".into()))
 }
 
 /// `SELECT count(*)` from each of the three tables, in a **new** session over
@@ -349,6 +366,68 @@ fn recycling_the_coordinators_log_keeps_the_transaction() {
     let n = recovered(dir.path()).expect("reopen after the sweep");
     assert_atomic(n, 0, "after the coordinator's log was recycled");
     assert_eq!(n, [1, 1, 1], "the committed transaction was dropped by a later fold");
+}
+
+/// The state the sweep above leaves -- a segment whose header carries
+/// decisions forward -- has to survive being *checkpointed*, and then being
+/// opened again, and again.
+///
+/// The previous test reopens once, and once was not enough. A carried decision
+/// is the only thing that makes a segment header's `carry_len` non-zero, and
+/// every path that reads a header without the segment behind it read such a
+/// header as damage: the checkpoint could not measure the log, so it recorded
+/// a watermark of **0**, and the next open replayed the whole stream on top of
+/// the parts that already held it. Measured on the shipped binary: the
+/// coordinator went 1 -> 15 -> 17 -> 19 rows over successive opens, with a
+/// `DELETE`d row back among them, `system.wal` reporting `segments = 0`, and
+/// `RESTORE ... UNTIL LATEST` refusing the healthy database as corrupt.
+///
+/// So: reach that state, checkpoint it, and then assert the two things that
+/// were false -- the counts do not move across repeated opens, and the archive
+/// still describes itself.
+#[test]
+fn a_carried_decision_survives_the_checkpoint_that_measures_it() {
+    seed("a_carried_decision_survives_the_checkpoint_that_measures_it");
+    let dir = Scratch::new("carry-open");
+    {
+        let mut s = Session::open(dir.path()).unwrap();
+        s.execute(&ddl("a")).unwrap();
+        s.execute(&ddl("b")).unwrap();
+        // No PRIMARY KEY, so `ALTER ... DELETE` on it is a positional sweep:
+        // one table's parts written and one table's log rolled, with `a` and
+        // `b` still holding a prepare each. That roll is what carries.
+        s.execute("CREATE TABLE c (id UInt64, s String) ENGINE = MergeTree ORDER BY id")
+            .unwrap();
+        s.execute("INSERT INTO c VALUES (1,'sweep me')").unwrap();
+        s.execute("BEGIN").unwrap();
+        for t in TABLES {
+            s.execute(&format!("INSERT INTO {t} VALUES (7,'txn')")).unwrap();
+        }
+        s.execute("COMMIT").unwrap();
+        s.execute("ALTER TABLE c DELETE WHERE id = 1").unwrap();
+        // The checkpoint the CLI runs on the way out, which is where the
+        // watermark is recorded.
+        s.checkpoint().unwrap();
+    }
+    let carry = {
+        let seg = std::fs::read(wal_of(dir.path(), "c")).unwrap();
+        u32::from_le_bytes(seg[12..16].try_into().unwrap())
+    };
+    assert!(carry > 0, "the fixture carried no decision, so this proves nothing");
+
+    // Three opens, not one. Each is a fresh `Session` over the same directory,
+    // so a watermark that failed to advance shows up as growth.
+    let first = recovered(dir.path()).expect("reopen after the sweep");
+    assert_eq!(first, [1, 1, 1], "the transaction is in all three tables exactly once");
+    for i in 2..=3 {
+        assert_eq!(recovered(dir.path()).unwrap(), first, "open {i} replayed an already-folded log");
+    }
+
+    // ...and the archive can still be read, which is what a recovery does
+    // before it unpacks anything.
+    let segs = granular::persist::wal::segments(dir.path(), "default", "c")
+        .expect("a carried decision is not a hole in the archive");
+    assert!(!segs.is_empty(), "the sweep rolled, so `c` has an archive");
 }
 
 /// ...and the same thing once every log has been folded, which is the state a

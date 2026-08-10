@@ -446,7 +446,7 @@ struct Limits {
     /// The data directory, when there is one. Spill files go under
     /// `<root>/.spill` rather than into `env::temp_dir()`, so an operator who
     /// sized the data volume for the database sized it for the spill too. A
-    /// leading dot, like `.wal-archive`: `store::valid_name` already refuses
+    /// leading dot, like `.wal`: `store::valid_name` already refuses
     /// those as database names, so it can never collide with one.
     spill_root: Option<Arc<Path>>,
     /// `max_temporary_data_on_disk`, 0 for unlimited.
@@ -1002,9 +1002,10 @@ impl Session {
         // This checkpoint covers every table, so any pending per-table fold is
         // work that is about to be done twice.
         self.fold_due.clear();
-        // Drop the cached handles first: `save_catalog` truncates each log and
-        // resets its watermark, which would leave a cached `Wal`'s idea of the
-        // file length stale and make the next append land at the wrong offset.
+        // Drop the cached handles first: `save_catalog` rolls each log behind
+        // this session's back, which leaves a cached `Wal` holding the segment
+        // that was just sealed -- and an append into a segment that is no
+        // longer the newest is a record replay will never reach.
         self.wals.clear();
         crate::persist::save_catalog(&mut self.catalog)
     }
@@ -1392,11 +1393,72 @@ impl Session {
         let Some(root) = self.catalog.dir() else { return Ok(None) };
         if !self.wals.contains_key(path) {
             let (db, tbl) = path.split_once('.').unwrap_or(("default", path));
-            let p = root.join(db).join(tbl).join(crate::persist::store::WAL_FILE);
+            let p = crate::persist::wal::wal_dir(root, db, tbl);
             self.wals
                 .insert(path.to_string(), crate::persist::Wal::open(&p)?);
         }
         Ok(Some(self.wals.get_mut(path).expect("just inserted")))
+    }
+
+    /// Seal a dropped table's log, so what it still holds joins the archive.
+    ///
+    /// The log lives at `<root>/.wal/<db>/<table>` and deliberately outlives
+    /// `DROP TABLE`: "restore to the moment before the drop" is the commonest
+    /// point-in-time recovery there is, and it needs those records. What the
+    /// drop must not leave behind is an **active** segment holding them,
+    /// because two things follow from it and both are wrong.
+    ///
+    /// The first is a silent loss. [`crate::persist::wal::recover`] reads
+    /// sealed segments only -- the active one may end in an interrupted
+    /// append -- and nothing will ever roll a dead table's log again, so
+    /// records written and then dropped inside one checkpoint interval become
+    /// permanently unreachable. `RESTORE ... UNTIL LATEST` reports success and
+    /// hands back a database missing them.
+    ///
+    /// The second is a wedge. [`crate::persist::wal::archive_lags`] walks log
+    /// directories rather than the catalog, so the dead table answers "still
+    /// holds un-archived records" forever, and every `RESTORE ... UNTIL
+    /// TIMESTAMP` past it is refused with advice -- checkpoint first -- that
+    /// cannot ever help.
+    ///
+    /// One roll at the drop settles both: the records move into the archive,
+    /// where they are exactly as recoverable and no longer lag.
+    ///
+    /// **What it costs**, measured, because it is not free: two `fsync`-class
+    /// operations -- the successor segment's atomic publish -- for a table
+    /// whose log still holds records, and *nothing* for one whose does not.
+    /// On a loop that creates, writes to and drops a table 120 times that is
+    /// +15% against the same build without it (best-of-9, interleaved, A/A
+    /// floor 6%); on a loop that drops tables with empty logs it is inside the
+    /// noise. The trade is those two `fsync`s against the records being
+    /// unrecoverable, and a `DROP TABLE` already checkpoints, so it is not a
+    /// new order of cost on that path.
+    fn retire_log(&mut self, db: &str, table: &str) -> Result<()> {
+        if !self.wal_enabled {
+            return Ok(());
+        }
+        let Some(root) = self.catalog.dir().map(Path::to_path_buf) else { return Ok(()) };
+        // The handle goes either way: after the roll it names a segment that
+        // is no longer the newest, and an append into one of those is a record
+        // replay would never reach.
+        //
+        // Rolling *through* it when this session has one is the whole reason
+        // the cache is consulted here -- it is already open at the right
+        // segment, so the retire costs the fsyncs it cannot avoid and not a
+        // `read_dir` plus a rescan of the active segment on top. Which is the
+        // common shape: a table with anything worth sealing was written to by
+        // this session, and writing to it is what opened the handle.
+        match self.wals.remove(&format!("{db}.{table}")) {
+            Some(mut w) => w.roll(),
+            // Never written through this session, so open the directory only
+            // if something is actually there -- a `Memory` table or one that
+            // was created and dropped unused must not be given a log on its
+            // way out.
+            None => crate::persist::wal::roll_for_checkpoint(&crate::persist::wal::wal_dir(
+                &root, db, table,
+            ))
+            .map(drop),
+        }
     }
 
     /// Append a block to a table's log.
@@ -1426,9 +1488,13 @@ impl Session {
             }
         }
         // One `u64` compare per logged *block*, against an append and (outside
-        // a transaction) an fsync the same block already pays. `w.len()` is a
-        // field read, not a `stat`.
-        if t != 0 && w.len() >= t {
+        // a transaction) an fsync the same block already pays. `w.pending()`
+        // is a field subtraction, not a `stat` -- and it is `pending` rather
+        // than `len` because an LSN is a *stream* position now and never
+        // restarts, so a threshold compared against `len` would be permanently
+        // true after the first 64 MiB and would queue a fold on every
+        // statement forever.
+        if t != 0 && w.pending() >= t {
             self.mark_fold_due(path);
         }
         Ok(())
@@ -1459,7 +1525,7 @@ impl Session {
                 w.sync()?;
             }
         }
-        if t != 0 && w.len() >= t {
+        if t != 0 && w.pending() >= t {
             self.mark_fold_due(path);
         }
         Ok(())
@@ -1699,6 +1765,17 @@ impl Session {
         for e in tables {
             self.catalog.table_by_path_mut(&e.path)?.flush()?;
         }
+        // A table whose COMMIT folds writes no marker: the records its group
+        // staged are going into the parts instead, and replay drops the group
+        // by construction. Telling the log so is what keeps `Wal::roll`'s
+        // "no transaction spans a roll" guard from refusing the fold that
+        // immediately follows -- which is the default shape of an unkeyed
+        // DELETE or UPDATE inside a transaction.
+        for e in tables.iter().filter(|e| e.fold && e.seq.is_some()) {
+            if let Some(w) = self.wals.get_mut(&e.path) {
+                w.drop_group();
+            }
+        }
         // Across several tables this is a two-phase commit, because N markers
         // in N files fsynced one after another are N commit points, and a
         // crash between two of them left a *prefix* of the transaction durable
@@ -1837,31 +1914,43 @@ impl Session {
     /// rewriting the rest would make an unrelated table's size a cost of this
     /// statement.
     ///
-    /// The write ordering is `save_catalog`'s, and it is the ordering the
-    /// persist module docs prove: commit the parts with the log watermark they
-    /// cover, *then* truncate the log and reset the watermark. A crash in the
-    /// window replays a covered prefix (harmless, the watermark skips it) or
-    /// leaves a log shorter than the recorded watermark, which `load_catalog`
-    /// detects and repairs.
+    /// The write ordering is `save_catalog`'s: flush the delta, **roll the
+    /// log**, then commit the parts with the stream position the roll
+    /// produced.
+    ///
+    /// The roll comes first because it destroys nothing -- the sealed segment
+    /// stays exactly where it is -- so the "commit the parts before you
+    /// discard the log" rule the old ordering existed for has nothing left to
+    /// protect. What that buys is that the watermark and the fresh segment's
+    /// origin are the same number by construction rather than by arithmetic:
+    /// there is no `set_wal_committed` afterwards, and no stale-watermark
+    /// repair on the next open. A crash between the two leaves the old
+    /// watermark and no new parts, so replay replays everything from it --
+    /// correct, and the one case that exercises multi-segment replay.
     fn fold_to_parts(&mut self, path: &str) -> Result<()> {
         let Some(root) = self.catalog.dir().map(Path::to_path_buf) else { return Ok(()) };
-        let (db, tbl) = path.split_once('.').unwrap_or(("default", path));
-        let t = self.catalog.table_by_path_mut(path)?;
-        // A `Memory` table is defined to vanish on restart, so there is
-        // nothing to make durable and nowhere to write it.
-        if !t.def.engine.is_persistent() {
-            return Ok(());
+        let (db, _) = path.split_once('.').unwrap_or(("default", path));
+        {
+            let t = self.catalog.table_by_path_mut(path)?;
+            // A `Memory` table is defined to vanish on restart, so there is
+            // nothing to make durable and nowhere to write it.
+            if !t.def.engine.is_persistent() {
+                return Ok(());
+            }
+            t.flush()?;
         }
-        t.flush()?;
-        crate::persist::write_table(&root.join(db), t)?;
-        let tdir = root.join(db).join(tbl);
         // Through the cached handle rather than a fresh `Wal::open`, so the
-        // session's idea of the log's length stays correct; reopening behind
-        // the cache is what forces `Session::checkpoint` to drop it.
-        if let Some(w) = self.wal_for(path)? {
-            w.truncate()?;
-        }
-        crate::persist::store::set_wal_committed(&tdir, crate::persist::format::HEADER_LEN as u64)
+        // session's idea of the stream stays correct; reopening behind the
+        // cache is what forces `Session::checkpoint` to drop it.
+        let committed = match self.wal_for(path)? {
+            Some(w) => {
+                w.roll()?;
+                w.origin()
+            }
+            None => 0,
+        };
+        let t = self.catalog.table_by_path(path)?;
+        crate::persist::write_table(&root.join(db), t, committed)
     }
 
     /// Run `f` as one atomic statement.
@@ -2137,7 +2226,11 @@ impl Session {
             Statement::DropTable { name, if_exists } => {
                 self.guard_ddl_table(name)?;
                 let path = self.catalog.qualify(name);
+                let (db, tbl) = self.catalog.resolve(name);
                 self.catalog.drop_table(name, *if_exists)?;
+                // After the catalog agrees the table is gone, so `IF EXISTS`
+                // on a name that was never there touches no log.
+                self.retire_log(&db, &tbl)?;
                 // The constraints go with the table, and they go *now*: a
                 // table re-created under the same name has not declared them,
                 // and a stale entry would enforce a constraint the new table
@@ -2151,7 +2244,14 @@ impl Session {
                 ResultSet::empty()
             }
             Statement::DropDatabase { name, if_exists } => {
+                // Every table in it is being dropped, so every log in it needs
+                // sealing -- read the roster while the catalog still has one.
+                let doomed: Vec<String> =
+                    self.catalog.table_names_in(name).map(str::to_string).collect();
                 self.catalog.drop_database(name, *if_exists)?;
+                for t in &doomed {
+                    self.retire_log(name, t)?;
+                }
                 // The metadata table went with the database; the copy in
                 // memory has to go too, and there is nothing left to persist
                 // it to.
@@ -3111,7 +3211,7 @@ impl Session {
                 // of log against 16484 for the same inserts into a table with
                 // no UNIQUE. One `u64` load and one compare, beside the `fsync`
                 // on the line above.
-                let over = t != 0 && w.len() >= t;
+                let over = t != 0 && w.pending() >= t;
                 if over {
                     self.mark_fold_due(path);
                 }
@@ -3790,11 +3890,17 @@ impl Session {
             let dbdir = root.join(&to_db);
             std::fs::create_dir_all(&dbdir)
                 .map_err(|e| Error::Io(format!("cannot create {}: {e}", dbdir.display())))?;
+            // The stream position the *destination name's* log has already
+            // reached, for the same reason `CREATE TABLE` stamps one: a log
+            // directory outlives its table, so renaming onto a dropped name
+            // meets a stream that does not start at zero.
+            let end = crate::persist::wal::stream_end(&root, &to_db, &to_name);
             link_table_dir(
                 &root.join(&from_db).join(&from_name),
                 &dbdir.join(&to_name),
                 &def,
                 &snap,
+                end,
             )?;
         }
 
@@ -3995,6 +4101,24 @@ impl Session {
         let (db, tbl) = self.catalog.resolve(&c.name);
         self.guard_dir_name(Some(&db), &tbl)?;
         self.catalog.create_table(def, c.if_not_exists)?;
+        // Stamp a commit record immediately, carrying the stream position this
+        // table's log directory has *already* reached.
+        //
+        // The log lives at `<root>/.wal/<db>/<table>` and deliberately
+        // survives `DROP TABLE`, which is what makes "restore to just before
+        // the drop" work. So a table created under a dropped one's name would
+        // otherwise open with no `TABLE` file, default to a watermark of zero,
+        // and replay the previous incarnation's entire stream into a schema
+        // that need not match it. One `atomic_write` on a DDL statement closes
+        // that, and it also means a missing `TABLE` file can no longer mean
+        // "young table" -- only damage.
+        if let Some(root) = self.catalog.dir().map(Path::to_path_buf) {
+            let end = crate::persist::wal::stream_end(&root, &db, &tbl);
+            let t = self.catalog.table_by_path(&path)?;
+            if t.def.engine.is_persistent() {
+                crate::persist::write_table(&root.join(&db), t, end)?;
+            }
+        }
         // A re-created table must not inherit the constraints of the one that
         // had the name before it: a CREATE TABLE that declares none has
         // declared none.
@@ -5783,7 +5907,13 @@ fn round_trips(original: &Value, cast: &Value, old: &DataType) -> bool {
 /// Returns `false` if the parts cannot be linked (any part not yet written, or
 /// the source directory absent), in which case the caller lets the checkpoint
 /// write the new directory from scratch.
-fn link_table_dir(from: &Path, to: &Path, def: &TableDef, snap: &crate::storage::part::Snapshot) -> Result<bool> {
+fn link_table_dir(
+    from: &Path,
+    to: &Path,
+    def: &TableDef,
+    snap: &crate::storage::part::Snapshot,
+    wal_committed: u64,
+) -> Result<bool> {
     use crate::persist::{store, writer};
     let set = snap.set();
     let mut names = Vec::with_capacity(snap.len());
@@ -5816,11 +5946,17 @@ fn link_table_dir(from: &Path, to: &Path, def: &TableDef, snap: &crate::storage:
             Error::Io(format!("cannot link {} into {}: {e}", n, to.display()))
         })?;
     }
-    // The log is empty and its records are all inside the parts above: the
-    // caller checkpointed, and a checkpoint truncates.
+    // The table *directory* is fresh; the log stream under the destination
+    // name need not be. Logs live at `<root>/.wal/<db>/<table>` and outlive
+    // their tables, so a rename onto a name that was dropped meets a stream
+    // that has already run -- and a watermark of zero would ask replay to
+    // fold the dead incarnation's records into this one. The caller passes
+    // where that stream has reached, exactly as `CREATE TABLE` does. (The
+    // parts above cover everything: the caller checkpointed, so there is
+    // nothing left in the source's log either.)
     store::commit(
         &to.join(store::TABLE_FILE),
-        &writer::table_doc(def, &names, crate::persist::format::HEADER_LEN as u64),
+        &writer::table_doc(def, &names, wal_committed),
     )?;
     store::sync_dir(to)?;
     Ok(true)
@@ -6211,8 +6347,25 @@ mod tests {
         let mut db = Session::open(s.path()).unwrap();
         db.execute(KEYED).unwrap();
         db.execute("INSERT INTO t VALUES (1, 10)").unwrap();
-        let wal = s.join("default").join("t").join(crate::persist::store::WAL_FILE);
-        let before = std::fs::read(&wal).unwrap();
+        let wal = crate::persist::wal::wal_dir(s.path(), "default", "t");
+        // The *records*, not the whole file: the segment header carries a
+        // durability watermark that legitimately moves when a transaction
+        // syncs and is then rolled back. "No trace" is a claim about the log's
+        // contents and its length, and both are asserted.
+        let body = |d: &std::path::Path| -> Vec<(String, Vec<u8>)> {
+            let mut v: Vec<(String, Vec<u8>)> = std::fs::read_dir(d)
+                .unwrap()
+                .flatten()
+                .map(|e| {
+                    let b = std::fs::read(e.path()).unwrap();
+                    let head = crate::persist::wal::SEG_HEADER_LEN as usize;
+                    (e.file_name().to_string_lossy().into_owned(), b[head.min(b.len())..].to_vec())
+                })
+                .collect();
+            v.sort();
+            v
+        };
+        let before = body(&wal);
 
         db.execute("BEGIN").unwrap();
         for i in 2..40u64 {
@@ -6220,12 +6373,12 @@ mod tests {
         }
         db.execute("ALTER TABLE t DELETE WHERE id = 1").unwrap();
         assert!(
-            std::fs::read(&wal).unwrap().len() > before.len(),
+            body(&wal)[0].1.len() > before[0].1.len(),
             "the test needs the transaction to have logged something"
         );
         db.execute("ROLLBACK").unwrap();
 
-        assert_eq!(std::fs::read(&wal).unwrap(), before, "the log kept the aborted records");
+        assert_eq!(body(&wal), before, "the log kept the aborted records");
         assert_eq!(count(&mut db), 1);
         assert_eq!(v_of(&mut db, 1), Some(10));
 

@@ -108,11 +108,11 @@ pub struct Settings {
     /// Write-ahead log bytes, per table, that trigger an automatic fold into
     /// parts at the next statement boundary. 0 disables it, which is what the
     /// engine did unconditionally before this existed: nothing auto-
-    /// checkpointed, so a long-running writer grew `wal.log` without bound and
+    /// checkpointed, so a long-running writer grew its log without bound and
     /// wrote no part file at all until a DDL, a BACKUP, an import or process
     /// exit happened to call one.
     pub wal_fold_bytes: u64,
-    /// Archived write-ahead log bytes to keep under `<data>/.wal-archive`.
+    /// Archived write-ahead log bytes to keep under `<data>/.wal`.
     ///
     /// The value that governs is a process-wide static in `persist::wal` --
     /// the archive tick runs where no `Settings` is in scope -- and this field
@@ -166,7 +166,7 @@ enum Slot {
     CsvHeader,
     FoldBytes,
     /// The one slot that writes nothing on `Settings`. The archive's retention
-    /// budget is a *process* global (one `.wal-archive` directory per data
+    /// budget is a *process* global (one `.wal` directory per data
     /// directory, and the archiver that trims it has no session), so it lives
     /// in the static it has always lived in and this row is only the name that
     /// reaches it. Keeping it off `Settings` also keeps `Settings` the size it
@@ -288,7 +288,7 @@ pub static SPECS: &[Spec] = &[
         name: "wal_archive_retention",
         kind: Kind::Bytes,
         slot: Slot::WalRetention,
-        doc: "byte budget for the archived write-ahead log under <data>/.wal-archive, \
+        doc: "byte budget for the archived write-ahead log under <data>/.wal, \
               which is what BACKUP ... INCREMENTAL and RESTORE ... UNTIL roll forward \
               through. Segments older than the budget are trimmed as new ones arrive, \
               so this is the window a point-in-time recovery can reach back into. \

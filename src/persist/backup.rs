@@ -97,11 +97,11 @@
 //! falls on.
 //!
 //! The cut is not applied here. The recovered bytes are written out *as the
-//! restored table's `wal.log`*, and the ordinary loader replays them the way
-//! it replays any log a crash left behind -- so a restored-to-a-timestamp
-//! database goes through exactly the recovery path that runs a thousand times
-//! a day, rather than through a second one written for this feature that
-//! nothing else exercises.
+//! restored table's first log segment*, and the ordinary loader replays them
+//! the way it replays any log a crash left behind -- so a restored-to-a-
+//! timestamp database goes through exactly the recovery path that runs a
+//! thousand times a day, rather than through a second one written for this
+//! feature that nothing else exercises.
 //!
 //! What it refuses, loudly, rather than approximating: a target before the
 //! backup, a target past the end of the archive, an archive with a hole in it,
@@ -285,7 +285,7 @@ fn table_into(
     // checkpoint after a restore can reuse the files instead of rewriting
     // them. Dedupe is by content, so renaming costs nothing.
     let names: Vec<String> = (1..=n as u64).map(store::part_file_name).collect();
-    man.bytes(&writer::table_doc(s.def, &names, format::HEADER_LEN as u64));
+    man.bytes(&writer::table_doc(s.def, &names, 0));
     man.varint(n as u64);
     for i in 0..n {
         let body = writer::part_bytes_with(s.snap.part(i), set.deletes(i))?;
@@ -524,8 +524,12 @@ impl Chain {
 
 fn decode_manifest(buf: &[u8]) -> Result<Manifest> {
     let mut r = Reader::new(buf);
-    format::read_header(&mut r)?;
-    let at = format::read_footer(buf)?;
+    // Both version checks are told this is an archive, because the remedy for
+    // an old one is the opposite of a data directory's: keep the file you have
+    // and take a fresh backup. Telling an operator to recreate an archive is
+    // telling them to delete their only copy.
+    format::read_header_of(&mut r, format::Artifact::Archive)?;
+    let at = format::read_footer_of(buf, format::Artifact::Archive)?;
     if at < format::HEADER_LEN as u64 {
         return Err(Error::corruption(format!("manifest offset {at} overlaps the header")));
     }
@@ -802,7 +806,7 @@ fn unpack<'a>(
 /// one, read but never written, which is why this is allowed while that
 /// database is open. `into` is a **new** directory, exactly as for `restore`.
 ///
-/// The result is a checkpointed database directory plus one `wal.log` per
+/// The result is a checkpointed database directory plus one log segment per
 /// table holding the records between the backup and the target, so the
 /// ordinary loader finishes the job. Running it twice with the same target
 /// produces the same bytes: every cut is at a tick, and a tick is a fact about
@@ -827,8 +831,10 @@ pub fn restore_until(
             // Written after the parts and each table's own commit record: a
             // directory that holds a log and no commit record is one the
             // loader would replay from the beginning of time.
-            let tdir = into.join(db).join(&t.def.name);
-            store::atomic_write(&tdir.join(store::WAL_FILE), &rec.bytes)?;
+            let dir = wal::wal_dir(into, db, &t.def.name);
+            std::fs::create_dir_all(&dir)
+                .map_err(|e| store::io_err("create directory", &dir, e))?;
+            store::atomic_write(&dir.join(wal::recovered_seg_name()), &rec.bytes)?;
             rep.replayed += rec.records;
         }
     }
@@ -955,6 +961,29 @@ fn check_target(
             archive.display(),
             man.boundary
         )));
+    }
+    // The same question per table. `end` is the whole directory's window, so a
+    // *single* table whose retention has moved past the backup does not widen
+    // it and the check above sees nothing wrong. `wal::recover` asks this of
+    // each table it rolls -- and keeps asking, because a check the caller
+    // might skip is not a guarantee -- but by then the archive has been
+    // unpacked, and a refusal that leaves a half-written directory behind is a
+    // refusal the operator has to clean up before they can retry. Asking here
+    // is one header read per table, on a statement that is about to read every
+    // one of them anyway.
+    for (db, tables) in &man.dbs {
+        for t in tables {
+            let dropped = wal::archive_horizon(data_root, db, &t.def.name)?;
+            if man.boundary != 0 && dropped >= man.boundary {
+                return Err(Error::storage(format!(
+                    "the WAL archive of `{db}.{}` no longer reaches back to the backup: \
+                     retention has dropped everything up to recovery LSN {dropped}, and \
+                     the backup needs {} onwards. Recovering from it would silently skip \
+                     the records in between",
+                    t.def.name, man.boundary
+                )));
+            }
+        }
     }
     Ok(())
 }

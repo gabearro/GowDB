@@ -390,21 +390,38 @@ A table's durable state is `parts + log`.
   checkpointing loses nothing. `Session::open` replays each log from the
   watermark its last checkpoint recorded. DDL checkpoints immediately, so a
   table can never have a log the catalog doesn't know about.
-* **Torn tails are normal, torn middles are not.** A crash mid-append leaves a
-  partial record, or a run of zeros on filesystems that allocate blocks eagerly.
-  Both are treated as an interrupted write that was never acknowledged: replay
-  stops cleanly and `open` truncates back to the last intact record so appends
-  resume correctly. Damage *behind* a record that the log already accepted is
-  something no append can do, so we report that as corruption.
+* **The log is numbered segments, not one file.** A table's log lives at
+  `<data>/.wal/<db>/<table>/seg_<origin>.gwal`; the highest-origin file is the
+  live one and every other is the archive. A checkpoint *rolls* -- it publishes
+  a fresh segment and the old one is archived by having stopped being newest.
+  Nothing is linked, copied or renamed to archive it, so a checkpoint costs the
+  same on a filesystem with no hard links as on one with them. The log sits
+  outside the table's own directory because `DROP TABLE` removes that
+  directory, and "restore to just before the drop" is the commonest recovery
+  there is.
+* **An LSN is a stream position** -- the byte offset of a record in the log
+  taken as one continuous stream across segments. The same number is what an
+  append returns, what the checkpoint watermark in `TABLE` records, and what
+  `RESTORE ... UNTIL LSN` takes. It never restarts.
+* **Torn tails are normal, torn middles are not, and the log records which is
+  which.** A crash mid-append leaves a partial record, or a run of zeros on
+  filesystems that allocate blocks eagerly; both are interrupted writes that
+  were never acknowledged, and replay swallows them and truncates back so
+  appends resume. What separates that from damage is not a guess about where
+  the failure sits: every `fsync` first stamps the segment's header with the
+  stream position it is about to make durable, so the log *knows* how far it
+  was acknowledged. A failure at or past that mark is a torn tail. A failure
+  below it is damage to bytes a caller was told were safe, and it is reported,
+  named and quarantined -- never silently truncated away.
 * **The log folds itself.** `wal_fold_bytes` (64 MiB, `0` disables) is the size
-  at which the next statement boundary writes that one table's parts and
-  truncates its log. Without it nothing auto-checkpointed: a process that only
-  ran `INSERT`s grew `wal.log` without bound and wrote no part file at all, so
+  at which the next statement boundary writes that one table's parts and rolls
+  its log. Without it nothing auto-checkpointed: a process that only ran
+  `INSERT`s grew its log without bound and wrote no part file at all, so
   disk-full arrived far ahead of the data volume. The number is large on
   purpose -- a fold costs a whole-table rewrite, which is O(table) and not
   O(log) -- and `system.wal` shows how close each table is to it.
 * **A damaged file quarantines its table, not the database.** A part file, a
-  `wal.log` or a `TABLE` that will not decode refuses that one table by name
+  log segment or a `TABLE` that will not decode refuses that one table by name
   and names the file to restore; every other table keeps answering, keeps
   taking writes, and keeps checkpointing, and the quarantined table holds its
   place in the roster so no later checkpoint collects its directory. The
@@ -421,12 +438,16 @@ A table's durable state is `parts + log`.
 distinction is the whole feature: two of eight `cp -r` copies of a live instance
 came out unopenable, with exit status 0.
 
-Checkpoints archive their sealed log segments beside the parts, so an archive
+Every checkpoint leaves its sealed segment under `<data>/.wal`, so the archive
 carries a replayable stream and not just an instant. `RESTORE ... UNTIL LSN <n>`
 and `UNTIL TIMESTAMP '<ts>'` replay to a chosen point; `UNTIL LATEST` takes
 everything the archive holds. A target before the backup is refused rather than
-approximated, because a backup cannot roll backwards. Restore into the open
-database is refused too. Restore to a new directory and swap.
+approximated, because a backup cannot roll backwards. So is a target past the
+end of the archive, and one that would have to replay across a segment the
+archive no longer has -- `wal_archive_retention` is a byte budget, and
+`system.wal`'s `horizon_seq` is how far back a recovery can still reach.
+Restore into the open database is refused too. Restore to a new directory and
+swap.
 
 `VERIFY BACKUP` checks every checksum in the archive and names the file that
 failed. A single flipped byte anywhere is reported, with a non-zero exit
