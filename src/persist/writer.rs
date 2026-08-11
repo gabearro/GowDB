@@ -59,9 +59,12 @@ pub fn write_part(path: &Path, part: &Part) -> Result<()> {
     store::atomic_write(path, &part_bytes(part)?)
 }
 
-/// [`write_part`] with the delete mask supplied by whoever owns it.
+/// [`write_part`] with the delete mask supplied by whoever owns it, and
+/// **without the directory `fsync`**: the caller owes one before the rename
+/// counts as durable. [`write_table`] is that caller, and it owes exactly one
+/// for however many parts it publishes.
 pub fn write_part_with(path: &Path, part: &Part, del: Option<&Deletes>) -> Result<()> {
-    store::atomic_write(path, &part_bytes_with(part, del)?)
+    store::publish(path, &part_bytes_with(part, del)?)
 }
 
 /// The exact bytes [`write_part`] would publish.
@@ -126,6 +129,11 @@ fn part_meta(part: &Part, del: Option<&Deletes>, offsets: &[u64]) -> Vec<u8> {
     let words = del.map_or(&[][..], |d| d.words());
     let mut w = Writer::with_capacity(64 + part.granules.len() * 24 + words.len() * 8);
     w.varint(part.n_rows as u64);
+    // The part's durable identity, and the whole cost of it: one varint per
+    // *part*, none per row. Written back unchanged by every rewrite, which is
+    // what lets a log record name a row inside this part and still find it
+    // after a checkpoint has moved the part to a new file.
+    w.varint(part.pid);
     w.varint(part.ncols as u64);
     put_opt_index(&mut w, part.sort_col);
     put_opt_index(&mut w, part.pk_col);
@@ -284,7 +292,15 @@ pub fn write_table(dir: &Path, table: &Table, wal_committed: u64) -> Result<()> 
     // Above every sequence number already on disk, so a new part can never
     // land on a file the current commit still refers to -- including the ones
     // this commit is about to reuse.
-    let mut next = on_disk.last().map_or(1, |&(s, _)| s + 1);
+    // ...and above the log's stream position, which is what keeps the numbers
+    // monotone across an *empty* directory. `TRUNCATE`, and `DROP` followed by
+    // `CREATE` under the same name, both leave zero part files behind, so the
+    // listing alone reissues `part_000001` to the new incarnation while the
+    // old one's number may still be cited by an archived backup. The stream
+    // position never restarts and the log deliberately outlives the table
+    // directory, so it is the one monotone number available here. Zero format
+    // bytes, and no manifest field to keep in step.
+    let mut next = on_disk.last().map_or(1, |&(s, _)| s + 1).max(wal_committed + 1);
     let mut taken = vec![false; on_disk.len()];
 
     // One snapshot for the whole commit: the parts and the delete masks that
@@ -293,6 +309,15 @@ pub fn write_table(dir: &Path, table: &Table, wal_committed: u64) -> Result<()> 
     let snap = table.snapshot();
     let set = snap.set();
     let mut names = Vec::with_capacity(snap.len());
+    // Claims to apply once the commit record naming these files is durable,
+    // and not before. `set_origin` asserts two things at once -- "file `seq`
+    // holds these rows" and "recovery will rebuild this part by reading a
+    // file" -- and the second is what a `TAG_MASK_RUN` cites. A `TABLE` commit
+    // that fails after the parts were written would leave memory claiming a
+    // part is durably named when the durable record names the *old* files, and
+    // a mask record minted against it would then have nothing to resolve to.
+    // Costs one `Vec` of two words per dirty part, per checkpoint.
+    let mut claims: Vec<(usize, u64)> = Vec::new();
     for (i, p) in snap.parts().iter().enumerate() {
         // `on_disk` is sorted by sequence number, so this is a binary search
         // over the *files*, of which there are hundreds at most -- against a
@@ -312,13 +337,26 @@ pub fn write_table(dir: &Path, table: &Table, wal_committed: u64) -> Result<()> 
             None => {
                 let name = store::part_file_name(next);
                 write_part_with(&tdir.join(&name), p, set.deletes(i))?;
-                // Only now, with the bytes fsynced and the rename durable, is
-                // the claim this records actually true.
-                set.set_origin(i, next);
+                claims.push((i, next));
                 names.push(name);
                 next += 1;
             }
         }
+    }
+
+    // One directory barrier for every part published above, immediately
+    // before the commit record that names them and strictly after the last
+    // rename. A directory `fsync` persists every rename in it, so K of them
+    // interleaved with the part writes buy nothing that one here does not --
+    // measured on a six-dirty-part checkpoint, seven at 4.66 ms against one.
+    // Ordering is the whole of the safety argument and it is the same one
+    // `atomic_write` makes, one level out: every part's *bytes* were fsynced
+    // by `publish`, every part's rename is persisted by this call, and only
+    // then does a `TABLE` naming them exist. Nothing here is skipped when
+    // `claims` is empty -- a checkpoint that reused every file renamed
+    // nothing, so there is nothing to persist.
+    if !claims.is_empty() {
+        store::sync_dir(&tdir)?;
     }
 
     // Everything already in the log is now inside the parts above. The
@@ -330,6 +368,12 @@ pub fn write_table(dir: &Path, table: &Table, wal_committed: u64) -> Result<()> 
         &tdir.join(store::TABLE_FILE),
         &table_doc(&table.def, &names, wal_committed),
     )?;
+
+    // Now, and only now, with the bytes fsynced, the renames durable, and the
+    // commit record naming them.
+    for (i, seq) in claims {
+        set.set_origin(i, seq);
+    }
 
     for (k, (_, old)) in on_disk.iter().enumerate() {
         if !taken[k] {

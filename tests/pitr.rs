@@ -639,3 +639,182 @@ fn a_recovery_target_is_parsed_or_refused_with_a_reason() {
     }
 }
 
+
+/// **An unkeyed `DELETE` rolls forward.** `t` is the default MergeTree shape --
+/// `ORDER BY` and no `PRIMARY KEY` -- so the sweep has no key lane to log and
+/// its whole durable record is `(part identity, position)`.
+///
+/// Not a nicety: every test above this one is an `INSERT`, so before the
+/// identity existed this file could not have noticed that a roll-forward past
+/// an unkeyed mutation silently under-recovered. It did: the fold wrote the
+/// rows out and dropped the staging group, which is right for crash recovery
+/// (the parts hold the answer) and wrong for a roll-forward, which starts from
+/// a *backup* rather than from the current watermark, so the parts it replays
+/// into are the archived ones.
+///
+/// The rows are inserted and checkpointed in their own CLI invocations first,
+/// which is what puts them in a part file and makes the deletes citable.
+#[test]
+fn an_unkeyed_delete_rolls_forward_into_a_restored_backup() {
+    let _x = exclusive();
+    let s = Scratch::new("unkeyed-delete");
+    let db = s.db();
+    step(&db, DDL);
+    step(&db, "INSERT INTO t VALUES (1,'a'),(2,'b'),(3,'c'),(4,'d'),(5,'e'),(6,'f')");
+    let arc = s.s("base.gbak");
+    step(&db, &format!("BACKUP TO '{arc}'"));
+
+    let mut marks = Vec::new();
+    for id in [2u32, 4, 6] {
+        step(&db, &format!("DELETE FROM t WHERE id = {id}"));
+        marks.push(wal::archive_end(&db).expect("archive end").last_seq);
+    }
+    assert_eq!(ids(&db), ["1", "3", "5"], "fixture: the live database");
+
+    // The backup alone still has everything.
+    let plain = s.at("plain");
+    backup::restore(Path::new(&arc), &plain).expect("restore the base");
+    assert_eq!(ids(&plain), ["1", "2", "3", "4", "5", "6"]);
+
+    // ...and each archived delete, one at a time.
+    let want = [
+        vec!["1", "3", "4", "5", "6"],
+        vec!["1", "3", "5", "6"],
+        vec!["1", "3", "5"],
+    ];
+    for (i, &mark) in marks.iter().enumerate() {
+        let out = s.at(&format!("at-{mark}"));
+        backup::restore_until(Path::new(&arc), &db, &out, Target::Lsn(mark))
+            .unwrap_or_else(|e| panic!("recover to LSN {mark}: {e}"));
+        assert_eq!(ids(&out), want[i], "LSN {mark}");
+    }
+
+    // And the far end agrees with the live database, which is the property a
+    // roll-forward exists to have.
+    let out = s.at("latest");
+    backup::restore_until(Path::new(&arc), &db, &out, Target::Latest).expect("recover");
+    assert_eq!(ids(&out), ids(&db), "a full roll-forward must reproduce the live rows");
+}
+
+/// **A roll-forward hides the row the log named, or it refuses.** There is no
+/// third answer, and there was: this fixture recovered a `DELETE FROM t WHERE
+/// id = 8` by hiding `id = 1002`, exit 0 and no diagnostic.
+///
+/// The mechanism, because the fixture is doing precise work and looks
+/// arbitrary otherwise. A mask record names `(part identity, position)`, and
+/// identities come from a counter that a load seeds from the parts it found.
+/// A restore therefore starts numbering at the backup's highest identity --
+/// exactly where the source database's post-backup parts started. So:
+///
+///   * the two small inserts are each their **own CLI invocation**, so each
+///     one checkpoints into its own part file and the delete against the
+///     second is citable;
+///   * the bulk insert is over `BULK_INSERT_THRESHOLD`, so replay packs it
+///     straight into a part instead of buffering it -- that is what makes the
+///     roll-forward mint an identity at all, and a replay that mints none
+///     cannot reproduce the bug;
+///   * the delete names a row of the *second* small part, so the identity it
+///     cites is the one the replay hands to the bulk part. Different rows,
+///     same number.
+///
+/// The ids are chosen so the two parts do not overlap in sort order: were the
+/// wrong part's row at that position the same row, the wrong answer would be
+/// the right one by luck and the test would prove nothing.
+#[test]
+fn a_roll_forward_hides_the_row_the_log_named_or_refuses() {
+    let _x = exclusive();
+    let s = Scratch::new("mask-identity");
+    let db = s.db();
+    step(&db, DDL);
+    step(&db, "INSERT INTO t VALUES (500,'p'),(501,'p'),(502,'p'),(503,'p'),(504,'p')");
+    let arc = s.s("base.gbak");
+    step(&db, &format!("BACKUP TO '{arc}'"));
+
+    // Two parts after the backup, one CLI invocation each.
+    step(&db, "INSERT INTO t VALUES (1,'a'),(2,'a'),(3,'a'),(4,'a'),(5,'a')");
+    step(&db, "INSERT INTO t VALUES (6,'b'),(7,'b'),(8,'b'),(9,'b'),(10,'b')");
+    // ...and one that replay will pack into a part of its own.
+    let bulk: String = (1000..7000).map(|i| format!(",({i},'z')")).collect();
+    step(&db, &format!("INSERT INTO t VALUES (999,'z'){bulk}"));
+    step(&db, "DELETE FROM t WHERE id = 8");
+
+    let live = ids(&db);
+    assert!(!live.contains(&"8".to_string()), "fixture: the delete landed");
+    assert!(live.contains(&"1002".to_string()), "fixture: nothing else was deleted");
+
+    let out = s.at("latest");
+    match backup::restore_until(Path::new(&arc), &db, &out, Target::Latest) {
+        // Correct is allowed. Silently different is not.
+        Ok(rep) => {
+            assert_eq!(ids(&out), live, "the roll-forward hid a row the log did not name");
+            assert_eq!(rep.rows as usize, live.len(), "the report counted other rows");
+        }
+        // Refusing is allowed -- the archive genuinely does not contain the
+        // part the log names -- but it has to say so, and it has to say so
+        // *here* rather than leaving a database that fails when queried.
+        Err(e) => {
+            let m = e.to_string();
+            assert!(m.contains("default.t"), "a refusal must name the table: {m}");
+            assert!(
+                m.contains("cannot be opened"),
+                "a refusal must say the restored database is the problem: {m}"
+            );
+        }
+    }
+}
+
+/// The same thing through the front door: whatever the library decides, the
+/// operator's `RESTORE` must not exit 0 on a directory it cannot open. A
+/// script's next line is `mv`.
+#[test]
+fn a_restore_that_cannot_be_opened_does_not_exit_zero() {
+    let _x = exclusive();
+    let s = Scratch::new("restore-exit");
+    let db = s.db();
+    step(&db, DDL);
+    step(&db, "INSERT INTO t VALUES (500,'p'),(501,'p')");
+    let arc = s.s("base.gbak");
+    step(&db, &format!("BACKUP TO '{arc}'"));
+    step(&db, "INSERT INTO t VALUES (6,'b'),(7,'b'),(8,'b'),(9,'b'),(10,'b')");
+    let bulk: String = (1000..7000).map(|i| format!(",({i},'z')")).collect();
+    step(&db, &format!("INSERT INTO t VALUES (999,'z'){bulk}"));
+    step(&db, "DELETE FROM t WHERE id = 8");
+
+    let out = s.s("latest");
+    let r = sql(&db, &format!("RESTORE FROM '{arc}' TO '{out}' UNTIL LATEST"));
+    if r.code == 0 {
+        assert_eq!(ids(Path::new(&out)), ids(&db), "a successful RESTORE must be right");
+    } else {
+        // And the directory it refused is still readable, which is what the
+        // per-table quarantine policy promises the operator.
+        assert!(r.err.contains("cannot be opened"), "stderr:\n{}", r.err);
+        assert!(Path::new(&out).join("CATALOG").exists(), "the refusal took the evidence away");
+    }
+}
+
+/// `Report::rows` is documented as "what a `SELECT count()` on the restored
+/// database returns", and for a roll-forward it was the archive's count
+/// instead -- everything the replayed records added or hid was missing from
+/// it. Reported 5, held 3.
+#[test]
+fn the_report_counts_the_rows_the_restored_database_holds() {
+    let _x = exclusive();
+    let s = Scratch::new("report-rows");
+    let db = s.db();
+    step(&db, DDL);
+    step(&db, "INSERT INTO t VALUES (1,'a'),(2,'b'),(3,'c'),(4,'d'),(5,'e')");
+    let arc = s.s("base.gbak");
+    step(&db, &format!("BACKUP TO '{arc}'"));
+    // One hides rows the archive holds, the other adds rows it does not, so a
+    // count taken from the archive is wrong in both directions.
+    step(&db, "DELETE FROM t WHERE id = 2");
+    step(&db, "DELETE FROM t WHERE id = 4");
+    step(&db, "INSERT INTO t VALUES (9,'i')");
+
+    let out = s.at("latest");
+    let rep = backup::restore_until(Path::new(&arc), &db, &out, Target::Latest).expect("recover");
+    let got = ids(&out);
+    assert_eq!(got, ["1", "3", "5", "9"], "fixture");
+    assert_eq!(rep.rows, got.len() as u64, "the report and the database disagree");
+    assert_eq!(rep.rows, 4, "the archive's own count is 5 and is not the answer");
+}

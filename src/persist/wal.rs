@@ -154,6 +154,27 @@
 //! *carrying* truncation used to write, so the guarantee got stronger by
 //! deleting code: it now holds unconditionally.
 //!
+//! ## Two ways to name a deleted row
+//!
+//! [`Wal::append_delete`] names one by its primary-key *lane* -- a value, so
+//! it survives anything that moves the row, and a table with a single-column
+//! key needs nothing else. The *default* MergeTree shape has no such lane:
+//! `ORDER BY` alone is a sort key, not a unique one. Those tables delete by
+//! scanning, so what they have to record is a **position**, and a position is
+//! only meaningful relative to something that pins the rows it indexes.
+//!
+//! [`crate::storage::Part::pid`] is that thing, and it is why a positional
+//! record is sound here where `(part index, row)` would not be. Recovery
+//! rebuilds a *checkpointed* part by reading its file, which holds the same
+//! rows at the same offsets under the same identity -- through the checkpoint
+//! that rewrites the part under a new file name, and through a backup and
+//! restore, because the identity is inside the part's own bytes rather than in
+//! its directory entry. A part built *since* the last checkpoint has no file
+//! and exists only as the `Insert` records that fed it, and how those regroup
+//! on replay depends on flush timing and compaction; such a part is not
+//! citable, and the sweep falls back to writing the table out for exactly
+//! those rows. See `TAG_MASK_RUN` and `Session::apply_sweep`.
+//!
 //! ## LSNs are stream offsets, deliberately
 //!
 //! Every append returns the log-sequence number of the record it wrote: the
@@ -221,6 +242,16 @@
 //! the whole transaction turns on one `fsync` -- the last one -- and a crash
 //! before it drops every participant, including the ones already `fsync`ed.
 //!
+//! The prepares still cost N-1 barriers; what they no longer cost is N-1
+//! *waits*. The protocol wants them durable before the decision is written and
+//! in no order among themselves, so [`Session::commit_durable`](crate::session::Session) appends all of
+//! them, then issues their barriers on the pool and joins before appending the
+//! decision. The join is unconditional -- there is no path on which a failed
+//! barrier is discovered after the decision has been written -- and a failure
+//! aborts the COMMIT with every table still private. See "the barrier is a
+//! device operation" below for the measurement and for the shortcut that is
+//! refused.
+//!
 //! A citation names a *directory* (`../t2`), because a segment's file name
 //! changes at every roll and the directory does not. Citations resolve against
 //! the cited log's **active segment only**, which is exactly the set a roll
@@ -277,6 +308,60 @@
 //! the whole body into it, which on a granule-sized insert was a 128 kB malloc
 //! and a 128 kB copy for nothing.
 //!
+//! ### The barrier is a device operation, and this is what follows from it
+//!
+//! A durability barrier here is `F_FULLFSYNC`, which flushes the *device's*
+//! write cache. Measured on the development machine, best-of-21 with the order
+//! alternated: `F_FULLFSYNC` 3.83-3.92 ms, plain `fsync(2)` 0.025-0.034 ms, a
+//! directory `fsync` 4.0-4.8 ms. So the cost is per **call**, not per byte,
+//! and the only two ways to spend less of it are to make fewer calls or to
+//! make several calls share one flush. Both are used, and the second is the
+//! one that is easy to get wrong:
+//!
+//!   * **Concurrent barriers share a flush; sequential ones cannot.** Measured
+//!     on distinct files: three sequential 11.78 ms against 3.84 ms issued
+//!     from three threads, eight sequential 31.78 against 12.08. That is what
+//!     [`Session::commit_durable`](crate::session::Session) exploits -- the N-1 prepares of a
+//!     multi-table transaction have to be durable before the decision is
+//!     written but in no order relative to each other, so their barriers are
+//!     issued together and joined. An N-table COMMIT costs two barriers of
+//!     latency instead of N, and every prepare still gets a real
+//!     `F_FULLFSYNC` that returned.
+//!   * **What is refused, and why.** Downgrading the prepares to plain
+//!     `fsync(2)` and leaning on the decision's full barrier to flush the
+//!     device for all of them is ~2x faster again and is unsound.
+//!     `F_FULLFSYNC` guarantees a post-condition of its *return*, not an
+//!     ordering during its execution; a power cut inside that last flush can
+//!     persist the decision while a participant's bytes are still in the
+//!     device cache, and replay would then release every prepared group and
+//!     find one participant's records missing. That is the half-committed
+//!     transaction the two-phase protocol exists to prevent, with a smaller
+//!     window. The same reasoning refuses `F_BARRIERFSYNC` (0.31-0.38 ms,
+//!     tempting) for the decision: `kill -9` kills the process and leaves the
+//!     page cache, which is exactly the property in question, so only a real
+//!     power-cut rig could test it and this project does not have one.
+//!
+//! ### There is nothing to group-commit across writers
+//!
+//! Classical group commit batches the commits of *concurrent* writers into one
+//! `fsync`. That mechanism has no state to work on here, and the reason is
+//! structural rather than a matter of scale: [`Session`](crate::session::Session)`::check_txn` and
+//! `check_owner` **refuse** a second connection's statement while a
+//! transaction is open, and the `Writer` guard takes the lock exclusively for
+//! a whole statement. There is no state in which two writers hold uncommitted
+//! work that could share a barrier -- a concurrent writer is an error, not a
+//! queue waiting to be batched. Do not build cross-connection group commit
+//! without a server in front of it, and when there is one, note that what it
+//! buys is bounded by the same measurement above: the second concurrent
+//! barrier is nearly free, so the win is real but it is a *server* feature.
+//!
+//! Deferring the barrier instead -- acknowledging a COMMIT before it and
+//! flushing on a timer, PostgreSQL's `synchronous_commit = off` -- is refused
+//! on the same page. After the batching above, the residual is one barrier per
+//! transaction, which is what a single-writer engine is supposed to pay; what
+//! deferral buys is that last ~4 ms, and the price is the first line of this
+//! file.
+//!
 //! ## Retention
 //!
 //! A byte budget ([`set_archive_retention`], reached from SQL by `SET
@@ -304,6 +389,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::common::{mum, Error, Result};
+use crate::storage::MaskRuns;
 use crate::types::{Block, Schema};
 
 use super::format::{self, Reader, Writer};
@@ -335,6 +421,25 @@ const TAG_DELETE_RUN: u8 = 6;
 /// `fsync` that makes the records behind it facts. Body: the LSN, then
 /// milliseconds since the epoch. See the module docs.
 const TAG_TICK: u8 = 7;
+/// A run of *positions* hidden inside one part, named by that part's durable
+/// identity: `varint pid | varint count | count x varint(pos - prev - 1)`.
+///
+/// The unkeyed counterpart to [`TAG_DELETE_RUN`], and the reason an unkeyed
+/// `DELETE` no longer costs a table rewrite per statement. A key lane is a
+/// *value* and survives anything that moves the row; a position is not, so it
+/// needs something that pins the rows it indexes. [`crate::storage::Part::pid`]
+/// is that thing: recovery rebuilds a checkpointed part by reading its file,
+/// which holds the same rows at the same offsets under the same identity, so
+/// `(pid, pos)` names the same row after a crash, after the checkpoint that
+/// rewrote the part under a new file name, and after a restore. A part built
+/// *since* the last checkpoint has no such file and is not citable; the sweep
+/// falls back to writing the table out for those, and only those.
+///
+/// Delta-varints because positions leave the sweep ascending within a part
+/// (granules in order, offsets in order inside each), which makes a dense
+/// delete one byte per row where the keyed record spends eight. `prev` starts
+/// at -1, so the first delta is the position itself.
+const TAG_MASK_RUN: u8 = 9;
 
 /// Set on an `INSERT`/`DELETE`/`DELETE_RUN` tag to mark the record staged:
 /// durable, but not part of the log's history until a [`TAG_COMMIT`] -- or a
@@ -529,6 +634,15 @@ pub enum WalRecord {
     /// occupies in storage), not by `Value`: the lane is what the delta and
     /// the delete bitmaps are keyed by, and it needs no type context to log.
     Delete(u64),
+    /// Hide these row positions inside the part whose durable identity is the
+    /// first field. The unkeyed counterpart of `Delete`; see `TAG_MASK_RUN`.
+    ///
+    /// One record per part rather than one per row -- the keyed path's
+    /// `Vec<(lsn, WalRecord)>` costs forty bytes of recovery heap per lane,
+    /// and positions are eight times denser in the log than lanes are, so
+    /// expanding them the same way would multiply the peak by eight. A boxed
+    /// slice keeps the enum the width it already was.
+    Mask(u64, Box<[u64]>),
 }
 
 /// What one frame turned out to hold.
@@ -539,6 +653,9 @@ enum Entry<'a> {
     /// borrowed, not decoded, so a 65 kB run costs no allocation until the
     /// records are actually built.
     Deletes(Option<u64>, &'a [u8]),
+    /// A run of hidden positions: the part identity, the count, and the
+    /// delta-varint bytes, still borrowed out of the frame.
+    Masks(Option<u64>, u64, u64, &'a [u8]),
     Commit(u64),
     /// Local group, the directory holding the decision, and the decision's
     /// number.
@@ -1007,6 +1124,15 @@ pub struct Wal {
     /// written. Peak memory is unchanged -- that buffer existed anyway -- only
     /// its lifetime is.
     scratch: Writer,
+    /// Test-only: make [`Wal::barrier`] report a device that refused to flush.
+    ///
+    /// There is no portable way to fail an `fsync` on demand from outside the
+    /// process -- a file-size rlimit fails the *write*, which is a different
+    /// path -- and the one thing two-phase commit turns on is what happens
+    /// when a participant's barrier fails: the decision must not be written.
+    /// A `bool` behind `cfg(test)` is the smallest thing that can assert it.
+    #[cfg(test)]
+    refuse_barrier: bool,
 }
 
 impl Wal {
@@ -1054,6 +1180,8 @@ impl Wal {
             dirty: scanned.dirty,
             sealed: origins,
             scratch: Writer::new(),
+            #[cfg(test)]
+            refuse_barrier: false,
         };
         // A crash can leave a half-written record at the tail. Replay
         // tolerates that and stops, but *appending* after it would not: the
@@ -1106,6 +1234,25 @@ impl Wal {
     /// [`Wal::append_deletes`], staged under `seq`.
     pub fn append_deletes_staged(&mut self, seq: u64, lanes: &[u64]) -> Result<u64> {
         self.put_deletes(Some(seq), lanes)
+    }
+
+    /// Log the positions a sweep hid inside citable parts: one
+    /// `TAG_MASK_RUN` per part. `seq` stages the group as everywhere else.
+    ///
+    /// The deltas arrive already encoded, in the buffer the sweep filled as it
+    /// went, so nothing here walks a per-row collection: this is a tag, two
+    /// varints and one `extend_from_slice` per *part*.
+    pub fn append_masks(&mut self, seq: Option<u64>, masks: &MaskRuns) -> Result<u64> {
+        let lsn = self.len;
+        for (pid, n, deltas) in masks.runs() {
+            let mut body = self.body(deltas.len() + 32);
+            put_tag(&mut body.w, TAG_MASK_RUN, seq);
+            body.w.varint(pid);
+            body.w.varint(n as u64);
+            body.w.raw(deltas);
+            self.append(body)?;
+        }
+        Ok(lsn)
     }
 
     /// Open a staging group. See the module docs: records logged under the
@@ -1386,13 +1533,54 @@ impl Wal {
     /// A `sync` with nothing appended behind it writes nothing at all: an idle
     /// table that is `sync`ed in a loop grows no log and re-stamps no header.
     pub fn sync(&mut self) -> Result<()> {
+        self.stage_sync()?;
+        self.barrier()
+    }
+
+    /// Everything [`Wal::sync`] does except the barrier: the tick, and the
+    /// stamp that says how far the barrier will make this segment durable.
+    ///
+    /// Split out for the one caller that has several logs to make durable at
+    /// once. The bytes have to be written and the header stamped from the
+    /// thread that owns the log -- both mutate it -- but the `fsync` that
+    /// follows does not, and on this platform an `fsync` is a *device*
+    /// operation whose cost several files can share. See
+    /// [`Wal::barrier`].
+    pub fn stage_sync(&mut self) -> Result<()> {
         if self.dirty {
             self.tick()?;
         }
-        self.put_stamp(self.len)?;
-        self.file
-            .sync_all()
-            .map_err(|e| store::io_err("fsync", &self.path, e))
+        self.put_stamp(self.len)
+    }
+
+    /// The barrier alone: make everything [`Wal::stage_sync`] staged durable.
+    ///
+    /// `&self`, which is the whole point -- `File::sync_all` needs no mutable
+    /// access, so N logs staged by one thread can be flushed concurrently by
+    /// N. Nothing in the log's own state changes here: the stamp describing
+    /// what this call makes durable was written before it, deliberately, so
+    /// that when it returns the stamp and the bytes it describes are durable
+    /// together.
+    ///
+    /// Calling this without a preceding `stage_sync` is not unsafe, merely
+    /// useless: it would flush bytes the header does not yet claim.
+    pub fn barrier(&self) -> Result<()> {
+        #[cfg(test)]
+        if self.refuse_barrier {
+            return Err(store::io_err(
+                "fsync",
+                &self.path,
+                std::io::Error::from_raw_os_error(19),
+            ));
+        }
+        self.file.sync_all().map_err(|e| store::io_err("fsync", &self.path, e))
+    }
+
+    /// Test-only: from here on, [`Wal::barrier`] fails. See
+    /// [`Wal::refuse_barrier`].
+    #[cfg(test)]
+    pub(crate) fn refuse_barriers(&mut self) {
+        self.refuse_barrier = true;
     }
 
     /// Record that this segment is acknowledged through stream position `to`.
@@ -1518,6 +1706,17 @@ impl Wal {
         w.raw(&head.encode(origin));
         w.raw(&carried);
         let path = self.dir.join(seg_name(origin));
+        // Two full barriers for a 64-byte header, and left that way on
+        // purpose. There is an argument that they are droppable -- if the
+        // successor's directory entry is lost to a crash, replay opens the
+        // sealed predecessor, whose `stream_end` is the checkpoint watermark,
+        // and correctly finds nothing to replay -- but it turns on
+        // `Wal::open`'s segment discovery agreeing, and on nothing ever having
+        // been appended to the successor first. When a segment carries
+        // decisions it is also the only thing keeping them alive. Rolls are
+        // rare (one per checkpoint, and much rarer now that a citable unkeyed
+        // sweep no longer folds), so this is the wrong place to spend the
+        // audit. Recorded rather than done.
         store::atomic_write(&path, &w.finish())?;
 
         self.file = OpenOptions::new()
@@ -1813,6 +2012,14 @@ impl Wal {
                             let l = u64::from_le_bytes(l.try_into().expect("8 bytes"));
                             out.push((lsn, WalRecord::Delete(l)));
                         }
+                    }
+                    Entry::Masks(seq, pid, n, deltas) => {
+                        if let Some(s) = seq {
+                            staged.push((s, out.len()));
+                        }
+                        let pos =
+                            mask_positions(n, deltas).map_err(|e| record_err(at, seen, e))?;
+                        out.push((lsn, WalRecord::Mask(pid, pos)));
                     }
                     Entry::Commit(seq) => staged.retain(|&(s, _)| s != seq),
                     Entry::Prepare(seq, rel, coord_seq) => {
@@ -2370,17 +2577,22 @@ fn frame_len(body: &[u8]) -> u64 {
 }
 
 fn is_mutation(tag: u8) -> bool {
-    matches!(tag & !STAGED, TAG_INSERT | TAG_DELETE | TAG_DELETE_RUN)
+    matches!(tag & !STAGED, TAG_INSERT | TAG_DELETE | TAG_DELETE_RUN | TAG_MASK_RUN)
 }
 
-/// How many mutations one frame stands for. One, except for a delete run.
+/// How many mutations one frame stands for. One, except for the two runs.
 fn count_of(body: &[u8]) -> u64 {
     let mut r = Reader::new(body);
     let Ok(tag) = r.u8() else { return 1 };
-    if tag & !STAGED != TAG_DELETE_RUN {
+    let bare = tag & !STAGED;
+    if !matches!(bare, TAG_DELETE_RUN | TAG_MASK_RUN) {
         return 1;
     }
-    if tag & STAGED != 0 && r.varint().is_err() {
+    // The staging sequence number, then -- for a mask run only -- the part
+    // identity, both in front of the count.
+    if (tag & STAGED != 0 && r.varint().is_err())
+        || (bare == TAG_MASK_RUN && r.varint().is_err())
+    {
         return 1;
     }
     r.varint().unwrap_or(1)
@@ -2553,6 +2765,30 @@ fn covered_prefix(dir: &Path) -> u64 {
         .map_or(0, |(_, _, committed)| committed)
 }
 
+/// Undo [`crate::storage::MaskRuns`]'s delta encoding: `n` LEB128 gaps back
+/// into ascending absolute positions.
+///
+/// Exactly `n` of them and not one byte left over. A short read or a trailing
+/// byte means the frame is not the shape its own header claims, which is
+/// corruption rather than something to salvage a prefix from -- a mask record
+/// half applied hides a row nobody asked to hide.
+fn mask_positions(n: u64, deltas: &[u8]) -> Result<Box<[u64]>> {
+    let mut r = Reader::new(deltas);
+    let mut out = Vec::with_capacity(n as usize);
+    let mut prev = u64::MAX;
+    for _ in 0..n {
+        prev = prev.wrapping_add(r.varint()?).wrapping_add(1);
+        out.push(prev);
+    }
+    if !r.is_empty() {
+        return Err(Error::corruption(format!(
+            "{} trailing bytes after the {n} positions of a mask run",
+            r.remaining()
+        )));
+    }
+    Ok(out.into_boxed_slice())
+}
+
 fn record_err(at: u64, index: usize, e: Error) -> Error {
     Error::corruption(format!("record {index} of the replay, at offset {at}: {e}"))
 }
@@ -2595,6 +2831,20 @@ fn decode_entry<'a>(body: &'a [u8], schema: &Schema) -> Result<Entry<'a>> {
                         )));
                     };
                     Entry::Deletes(seq, br.take(want as usize)?)
+                }
+                TAG_MASK_RUN => {
+                    let (pid, n) = (br.varint()?, br.varint()?);
+                    // One delta is at least one byte, so a count larger than
+                    // the frame's remainder is a corrupt frame and not a
+                    // gigantic allocation.
+                    if n > br.remaining() as u64 {
+                        return Err(Error::corruption(format!(
+                            "a mask run of {n} positions needs more than the {} bytes in \
+                             its frame",
+                            br.remaining()
+                        )));
+                    }
+                    Entry::Masks(seq, pid, n, br.take(br.remaining())?)
                 }
                 // The raw tag, not the masked one: `0x83` is not "tag 3".
                 _ => return Err(Error::corruption(format!("unknown log record tag {tag}"))),
@@ -3265,10 +3515,99 @@ mod tests {
         let s = Scratch::new("wal-tag");
         let dir = s.join("wal");
         Wal::open(&dir).unwrap();
-        append_raw(&dir, &[9u8, 0, 0]);
+        // 200 rather than 9: the tag space grew a `TAG_MASK_RUN` under it.
+        append_raw(&dir, &[200u8, 0, 0]);
         append_raw(&dir, &[TAG_DELETE, 0, 0, 0, 0, 0, 0, 0, 0]);
         let e = Wal::replay(&dir, &schema()).unwrap_err();
-        assert!(e.to_string().contains("unknown log record tag 9"), "{e}");
+        assert!(e.to_string().contains("unknown log record tag 200"), "{e}");
+    }
+
+    /// The mask record's two halves are written by different modules --
+    /// `storage::MaskRuns` encodes the gaps, `persist::format::Reader` decodes
+    /// them -- so the round trip is the only thing holding them together.
+    /// Dense and scattered runs across two parts, in one log.
+    #[test]
+    fn a_mask_run_round_trips_through_the_log() {
+        let s = Scratch::new("wal-mask-roundtrip");
+        let dir = s.join("wal");
+        let mut w = Wal::open(&dir).unwrap();
+        let mut m = MaskRuns::default();
+        // Dense from zero, then a scatter with gaps past a varint boundary.
+        for p in [0u64, 1, 2, 3] {
+            m.hide(7, p);
+        }
+        for p in [5u64, 300, 301, 100_000, 1 << 20] {
+            m.hide(9, p);
+        }
+        w.append_masks(None, &m).unwrap();
+        w.sync().unwrap();
+        assert_eq!(
+            Wal::replay(&dir, &schema()).unwrap(),
+            vec![
+                WalRecord::Mask(7, vec![0, 1, 2, 3].into_boxed_slice()),
+                WalRecord::Mask(9, vec![5, 300, 301, 100_000, 1 << 20].into_boxed_slice()),
+            ]
+        );
+    }
+
+    /// A dense run is one byte per row, against the keyed record's eight.
+    /// This is the whole reason the unkeyed path can afford to log positions.
+    #[test]
+    fn a_dense_mask_run_costs_a_byte_a_row() {
+        let s = Scratch::new("wal-mask-density");
+        let dir = s.join("wal");
+        let mut w = Wal::open(&dir).unwrap();
+        let before = w.len();
+        let mut m = MaskRuns::default();
+        for p in 0..1_000u64 {
+            m.hide(1, p);
+        }
+        w.append_masks(None, &m).unwrap();
+        let per_row = (w.len() - before) as f64 / 1_000.0;
+        assert!(per_row < 1.1, "{per_row} bytes per hidden row");
+    }
+
+    /// A staged mask run with no commit marker behind it is dropped, exactly
+    /// as a staged insert or delete is. The sweep runs inside a transaction,
+    /// so this is the ordinary crash-in-the-middle case.
+    #[test]
+    fn a_staged_mask_run_needs_its_commit() {
+        let s = Scratch::new("wal-mask-staged");
+        let dir = s.join("wal");
+        let mut w = Wal::open(&dir).unwrap();
+        let mut m = MaskRuns::default();
+        m.hide(3, 4);
+        let seq = w.begin();
+        w.append_masks(Some(seq), &m).unwrap();
+        w.sync().unwrap();
+        assert!(Wal::replay(&dir, &schema()).unwrap().is_empty());
+        w.commit(seq).unwrap();
+        w.sync().unwrap();
+        assert_eq!(
+            Wal::replay(&dir, &schema()).unwrap(),
+            vec![WalRecord::Mask(3, vec![4].into_boxed_slice())]
+        );
+    }
+
+    /// A count that does not match the bytes behind it is corruption, not a
+    /// prefix to salvage: half a mask run hides rows nobody asked to hide.
+    #[test]
+    fn a_mask_run_whose_count_disagrees_with_its_body_is_corruption() {
+        for body in [
+            // Two positions claimed, one gap byte present.
+            vec![TAG_MASK_RUN, 1, 2, 0],
+            // One claimed, two present.
+            vec![TAG_MASK_RUN, 1, 1, 0, 0],
+            // A count larger than the frame could possibly hold.
+            vec![TAG_MASK_RUN, 1, 200, 0],
+        ] {
+            let s = Scratch::new("wal-mask-damage");
+            let dir = s.join("wal");
+            Wal::open(&dir).unwrap();
+            append_raw(&dir, &body);
+            let e = Wal::replay(&dir, &schema()).unwrap_err();
+            assert!(matches!(e, Error::Corruption(_)), "{body:?}: {e}");
+        }
     }
 
     #[test]
@@ -3600,9 +3939,9 @@ mod tests {
         let s = Scratch::new("wal-staged-tag");
         let dir = s.join("wal");
         Wal::open(&dir).unwrap();
-        append_raw(&dir, &[STAGED | 9, 0]);
+        append_raw(&dir, &[STAGED | 72, 0]);
         let e = Wal::replay(&dir, &schema()).unwrap_err();
-        assert!(e.to_string().contains(&format!("tag {}", STAGED | 9)), "{e}");
+        assert!(e.to_string().contains(&format!("tag {}", STAGED | 72)), "{e}");
     }
 
     // ---- LSNs --------------------------------------------------------------

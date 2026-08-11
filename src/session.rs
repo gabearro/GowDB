@@ -131,6 +131,7 @@ use crate::sql::ast::{
 };
 use crate::sql::parse;
 use crate::storage::table::KeyConflict;
+use crate::storage::{MaskRuns, SweepLog};
 use crate::types::{Block, Column, ColumnBuilder, DataType, Field, Schema, TableDef, Value};
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -422,6 +423,9 @@ pub struct Session {
     /// missing the record it is about to truncate the log for -- a durability
     /// hole with a checkpoint's name on it.
     fold_due: Vec<String>,
+    /// The unkeyed sweep's encode buffer, kept across statements so a session
+    /// deleting in a loop allocates once. See [`Session::apply_sweep`].
+    masks: MaskRuns,
 }
 
 /// The per-query governance a session applies, as *settings* rather than as a
@@ -726,6 +730,7 @@ impl Session {
             catalog: Catalog::in_memory(),
             fold_bytes: crate::persist::wal::DEFAULT_FOLD_BYTES,
             fold_due: Vec::new(),
+            masks: MaskRuns::default(),
             owner: 0,
             owner_tok: None,
             wals: Default::default(),
@@ -761,6 +766,7 @@ impl Session {
             catalog,
             fold_bytes: crate::persist::wal::DEFAULT_FOLD_BYTES,
             fold_due: Vec::new(),
+            masks: MaskRuns::default(),
             owner: 0,
             owner_tok: None,
             wals: Default::default(),
@@ -805,6 +811,7 @@ impl Session {
             catalog,
             fold_bytes: crate::persist::wal::DEFAULT_FOLD_BYTES,
             fold_due: Vec::new(),
+            masks: MaskRuns::default(),
             owner: 0,
             owner_tok: None,
             wals: Default::default(),
@@ -1531,6 +1538,26 @@ impl Session {
         Ok(())
     }
 
+    /// [`Session::log_deletes`] for an unkeyed table: one `TAG_MASK_RUN` per
+    /// part the sweep touched, naming positions instead of key lanes.
+    ///
+    /// Same two durability rules and the same fold threshold. What it replaces
+    /// is not a cheaper record but a whole table rewrite -- see
+    /// [`Session::apply_sweep`].
+    fn log_masks(&mut self, path: &str, masks: &MaskRuns) -> Result<()> {
+        let seq = self.enlist(path)?;
+        let t = self.fold_bytes;
+        let Some(w) = self.wal_for(path)? else { return Ok(()) };
+        w.append_masks(seq, masks)?;
+        if seq.is_none() {
+            w.sync()?;
+        }
+        if t != 0 && w.pending() >= t {
+            self.mark_fold_due(path);
+        }
+        Ok(())
+    }
+
     /// Note that `path`'s log has outgrown `wal_fold_bytes`.
     ///
     /// `#[cold]` and allocating on purpose: this runs once per threshold-worth
@@ -1798,12 +1825,18 @@ impl Session {
             // One `PathBuf` for the whole transaction, and only when there is
             // more than one participant to cite it.
             let coord = self.wals.get(&tables[last].path).ok_or_else(missing)?.path().to_owned();
+            // Append and stamp every prepare first, in enlistment order, so
+            // each log's tick sequence is exactly what it was when this loop
+            // also fsynced. Nothing is durable yet; a crash anywhere in here
+            // leaves prepares citing a decision that was never written, which
+            // is abort, which is what an unfinished COMMIT means.
             for e in tables.iter().take(last).filter(|e| !e.fold) {
                 let Some(s) = e.seq else { continue };
                 let w = self.wals.get_mut(&e.path).ok_or_else(missing)?;
                 w.prepare(s, &coord, seq)?;
-                w.sync()?;
+                w.stage_sync()?;
             }
+            self.prepare_barrier(tables, last)?;
         }
         let w = self.wals.get_mut(&tables[last].path).ok_or_else(missing)?;
         if parties > 1 {
@@ -1813,6 +1846,59 @@ impl Session {
         }
         w.sync()?;
         Ok(())
+    }
+
+    /// Make every staged prepare durable, concurrently, and return only once
+    /// all of them have finished.
+    ///
+    /// The protocol wants the N-1 prepares durable **before the decision is
+    /// written**; it does not want them durable in any order relative to each
+    /// other. That is the whole opportunity, and on this platform it is worth
+    /// taking: a barrier here is `F_FULLFSYNC`, a *device* cache flush of
+    /// ~4 ms, and flushes issued concurrently on distinct files share one.
+    /// Measured on the development machine, best-of-21, order alternated:
+    /// three sequential barriers 11.78 ms against 3.84 ms concurrent, eight
+    /// 31.78 against 12.08. So an N-table COMMIT stops costing N barriers of
+    /// latency and starts costing two -- the prepares, then the decision --
+    /// whatever N is.
+    ///
+    /// What it deliberately does **not** do is weaken any prepare. Every one
+    /// still gets a real `F_FULLFSYNC` that has *returned* before the decision
+    /// record is appended. The tempting version -- plain `fsync(2)` on the
+    /// prepares, leaning on the decision's full barrier to flush the device
+    /// for all of them -- is unsound: `F_FULLFSYNC` guarantees a post-condition
+    /// of its return, not an ordering during its execution, so a power cut
+    /// inside that last flush can persist the decision while a participant's
+    /// bytes are still in the device's cache. Replay would then release the
+    /// prepared groups and find one participant's records missing, which is
+    /// the half-committed transaction two-phase commit exists to prevent.
+    /// The concurrent form is at worst 2x the cost of the unsound one and
+    /// introduces no new assumption at all.
+    ///
+    /// The join is unconditional, and that is load-bearing rather than tidy:
+    /// [`Pool::map`](crate::common::pool::Pool::map) returns only once every
+    /// index has run, so there is no path on which a failed barrier is
+    /// discovered after the decision has been written. The first error aborts
+    /// the COMMIT with every table still private, and the caller rolls back.
+    ///
+    /// Costs one `Vec` of N `&Wal` and one of N results per multi-table
+    /// COMMIT. Single-table transactions -- every autocommit statement and the
+    /// whole OLTP path -- never reach it.
+    fn prepare_barrier(&self, tables: &[Enlisted], last: usize) -> Result<()> {
+        let missing = || Error::storage("an enlisted table with a sequence number has no log");
+        let staged: Vec<&crate::persist::Wal> = tables
+            .iter()
+            .take(last)
+            .filter(|e| !e.fold && e.seq.is_some())
+            .map(|e| self.wals.get(&e.path).ok_or_else(missing))
+            .collect::<Result<_>>()?;
+        // One participant has nothing to overlap with, and the pool would
+        // charge a job setup to discover that.
+        if let [w] = staged[..] {
+            return w.barrier();
+        }
+        let n = staged.len();
+        crate::common::pool::global().map(n, |i| staged[i].barrier()).into_iter().collect()
     }
 
     /// Discard the transaction, in memory and on disk.
@@ -1871,6 +1957,14 @@ impl Session {
         if let Some(e) = txn.tables.iter().find(|e| e.path == path) {
             return Ok(e.seq);
         }
+        // The second half of the two-commit-points refusal; see
+        // [`Session::mark_fold`], which is the same rule reached from the
+        // other order. A scan of a `Vec` that is one entry long for every
+        // single-table transaction, and the clone happens only on the way to
+        // an error.
+        if let Some(f) = txn.tables.iter().find(|e| e.fold).map(|e| e.path.clone()) {
+            return Err(two_commit_points(&f, path));
+        }
         // `begin_txn` flushes first, so the buffered rows that were already
         // there are published as committed data *before* the overlay exists --
         // which is what lets `rollback_txn` discard the delta wholesale.
@@ -1895,8 +1989,54 @@ impl Session {
     /// defer to (a direct API caller rather than `atomic_stmt`) the statement
     /// is already committed, so the fold happens now instead: deferring to a
     /// COMMIT that will never arrive is how a durability hole is built.
+    ///
+    /// ## A folding table may not share a transaction, and this is where that
+    /// is enforced
+    ///
+    /// A folding table's commit point is the `TABLE` rename inside
+    /// [`Session::fold_to_parts`], which [`Session::commit`] runs **after**
+    /// [`Session::commit_durable`] has already returned `Ok` -- and
+    /// `commit_durable` excludes folding tables from the two-phase protocol
+    /// outright, selecting its coordinator with `rposition(|e| !e.fold ...)`
+    /// and counting `parties` over `!e.fold`. So a transaction holding one
+    /// folding table and anything else has **two** commit points with a
+    /// window between them, and `kill -9` in that window commits one half.
+    ///
+    /// Measured on this tree, before this refusal existed, 30-round scripts
+    /// killed at a random instant: `BEGIN; INSERT INTO k; DELETE FROM u;
+    /// COMMIT` over a keyed `k` and an unkeyed `u` left the insert durable and
+    /// the delete undone in **16 of 25** trials; two unkeyed tables deleting
+    /// under one `COMMIT` -- where `commit_durable` finds no participant at
+    /// all, writes no marker and performs no fsync -- diverged in **6 of 25**.
+    /// In a 130-trial randomized campaign over mixed workloads it was the only
+    /// failure shape that appeared, 7 times, and nothing else failed at all.
+    ///
+    /// There is no marker-ordering fix. A rename cannot be made conditional on
+    /// a decision written after it, and a decision cannot be made conditional
+    /// on a rename that replay is unable to reproduce -- the rows the fold
+    /// exists for are exactly the ones no log record can name. Writing a
+    /// marker as well would release the group's `Insert` records with the
+    /// sweep's tombstones still only in memory, which resurrects precisely the
+    /// rows the statement deleted. So the transaction is refused instead, at
+    /// the statement that would have created the second commit point rather
+    /// than at `COMMIT`: the message names the statement the user just ran,
+    /// and the transaction is still intact and still rollable.
+    ///
+    /// Both orders are covered -- this one for "a durable table is already
+    /// enlisted and now a table wants to fold", [`Session::enlist`] for "a
+    /// table is already folding and now another wants in".
+    ///
+    /// The refusal is narrow by construction: it fires only for a sweep that
+    /// hid rows in a part with **no durable home**, since `apply_sweep` only
+    /// reaches here when `MaskRuns::dark > 0`. A multi-table transaction whose
+    /// unkeyed `DELETE` hits checkpointed rows logs `TAG_MASK_RUN`, never
+    /// folds, and is unaffected.
     fn mark_fold(&mut self, path: &str) -> Result<()> {
         if let Some(txn) = self.txn.as_mut() {
+            if let Some(other) = txn.tables.iter().find(|e| e.path != path).map(|e| e.path.clone())
+            {
+                return Err(two_commit_points(path, &other));
+            }
             if let Some(e) = txn.tables.iter_mut().rev().find(|e| e.path == path) {
                 e.fold = true;
                 return Ok(());
@@ -2276,9 +2416,24 @@ impl Session {
             }
             Statement::Truncate { table } => {
                 self.guard_ddl_table(table)?;
-                let def = self.catalog.table(table)?.def.clone();
+                let (db, tbl) = self.catalog.resolve(table);
+                // Re-qualified, and this is not tidiness. `Catalog::create_table`
+                // strips the database off the name it is given and stores the
+                // bare one, so handing the stored definition straight back
+                // recreates the table in the *current* database:
+                // `TRUNCATE TABLE m.u` left `default.u` behind and destroyed
+                // `m.u` with its rows, in one statement, exit 0.
+                let mut def = self.catalog.table(table)?.def.clone();
+                def.name = format!("{db}.{tbl}");
                 self.catalog.drop_table(table, false)?;
                 self.catalog.create_table(def, false)?;
+                // A truncated table is a new incarnation with an empty part
+                // list, so its identity counter has to start above the one the
+                // old incarnation was minting from -- see `PartSet::seed_pids`.
+                if let Some(root) = self.catalog.dir().map(Path::to_path_buf) {
+                    let end = crate::persist::wal::stream_end(&root, &db, &tbl);
+                    self.catalog.table_mut(table)?.seed_pids(end);
+                }
                 // Deliberately *not* touching `ext`: TRUNCATE empties a table,
                 // it does not redefine it, so the constraints it was created
                 // with still apply to everything written after.
@@ -3495,7 +3650,7 @@ impl Session {
 
     /// Apply one bulk delete: hide the rows, make them durable, one publish.
     ///
-    /// ## Two durability routes, because a row's identity is not always a key
+    /// ## A row's identity is not always a key, so there are two names for it
     ///
     /// The log's delete record names a primary-key *lane*
     /// ([`crate::persist::Wal::append_delete`]), which is a value and therefore
@@ -3503,28 +3658,35 @@ impl Session {
     /// the whole story: hide the rows, log a lane each, done in O(parts).
     ///
     /// A table with only `ORDER BY`, or with a composite `PRIMARY KEY`, has no
-    /// such lane -- and that is the *default* MergeTree shape, so refusing (as
-    /// this did) left the most ordinary persistent table unable to take a
-    /// DELETE or an UPDATE at all. The sweep hides rows by position, and the
-    /// obvious record for that is the position, `(part, row)`. It is not
-    /// sound here and it is worth writing down why, because the shape looks
-    /// right: replay reconstructs the table as *checkpointed parts + the log*,
-    /// and a part built after the checkpoint exists only as the `Insert`
-    /// records that fed it. Whether those rows end up in one part or three
-    /// depends on when the delta happened to flush and whether auto-compaction
-    /// fired -- neither of which is in the log -- so `(part, row)` captured at
-    /// runtime names a different row after recovery, or none. Making it sound
-    /// needs a durable row identity (a per-row id, 8 bytes on every row of
-    /// every table) or logged part boundaries (a flush/merge record, and
-    /// replay driving them). Both are real work; a positional record without
-    /// one of them is a silently wrong answer waiting for a crash.
+    /// such lane -- and that is the *default* MergeTree shape. The sweep hides
+    /// rows by position, so the record is the position; what a position needs
+    /// is something that pins the rows it indexes. The obvious candidate,
+    /// `(part index, row)`, does not: replay reconstructs the table as
+    /// *checkpointed parts + the log*, and a part built after the checkpoint
+    /// exists only as the `Insert` records that fed it, so whether those rows
+    /// land in one part or three depends on flush timing and compaction --
+    /// neither of which is in the log.
     ///
-    /// So the unkeyed sweep is made durable the other way: the rows are hidden
-    /// in memory and COMMIT writes the table's parts out, delete masks and
-    /// all, then discards the log those parts now cover
-    /// ([`Session::fold_to_parts`]). That is one table rewrite per mutating
-    /// *statement* -- not per row, and not the whole catalog -- and it is
-    /// exact rather than probably-exact.
+    /// [`crate::storage::Part::pid`] is a candidate that does. It is written
+    /// inside the part file, so a part decoded off disk knows it without a
+    /// sidecar; and a rewrite preserves it along with every row position,
+    /// because `write_part_with` copies granules verbatim and only appends a
+    /// mask. So `(pid, pos)` names the same row after a crash, after the
+    /// checkpoint that moved the part to a new file, and after a restore --
+    /// the difference between this and `(part index, row)` is that a part file
+    /// is a *fact* while a part index is a reconstruction.
+    ///
+    /// That leaves exactly one gap, and it is the one the reasoning above
+    /// identified: a part built since the last checkpoint has no file, so
+    /// nothing names it. Those rows -- and only those -- take the old route,
+    /// [`Session::mark_fold`]: hide them in memory and let COMMIT write the
+    /// table's parts out, then discard the log they cover. One table rewrite,
+    /// for the statements that need it instead of for all of them.
+    ///
+    /// Measured, 120 `BEGIN`/`DELETE`/`COMMIT` transactions on an unkeyed
+    /// table: 4 durability barriers per transaction and a full table rewrite
+    /// each, against 1 barrier and ~18 log bytes when the rows are citable --
+    /// which is what the keyed path costs.
     fn apply_sweep(&mut self, path: &str, sweep: &Sweep) -> Result<usize> {
         let keyed = self.catalog.table_by_path(path)?.pk_col().is_some();
         // Enlisted unconditionally, and this is load-bearing:
@@ -3535,24 +3697,38 @@ impl Session {
         // straight into the committed set and ROLLBACK would have nothing to
         // drop.
         self.enlist(path)?;
-        // Only a *logging, keyed* sweep needs the lanes, and asking for them
-        // costs a packed-lane read per hidden row plus a `Vec` that grows to
-        // the affected count. An in-memory delete of a million rows should pay
-        // neither, and neither should the unkeyed path, whose durability comes
-        // from the parts.
-        let want_lanes = self.wal_enabled && keyed;
+        // An in-memory delete of a million rows pays for neither channel: a
+        // lane is a packed-lane read per hidden row, a position is a varint,
+        // and a session with no log needs neither.
         let mut keys = Vec::new();
+        // Taken and put back so the buffer's capacity survives the statement:
+        // a session deleting in a loop allocates once. A statement that fails
+        // forfeits it, which costs one allocation and keeps the happy path
+        // straight.
+        let mut masks = std::mem::take(&mut self.masks);
+        masks.clear();
+        let sink = match (self.wal_enabled, keyed) {
+            (false, _) => SweepLog::None,
+            (true, true) => SweepLog::Keys(&mut keys),
+            (true, false) => SweepLog::Masks(&mut masks),
+        };
         let n = self.catalog.table_by_path_mut(path)?.delete_where_keys(
             &sweep.projection,
             sweep.pred.as_ref(),
             &sweep.zone,
-            want_lanes.then_some(&mut keys),
+            sink,
         )?;
         if !keys.is_empty() {
             self.log_deletes(path, &keys)?;
-        } else if n > 0 && self.wal_enabled && !keyed {
+        } else if !masks.is_empty() {
+            self.log_masks(path, &masks)?;
+        }
+        // Rows hidden where no record could name them. Only these need the
+        // table written out, and a sweep over aged rows has none.
+        if masks.dark > 0 {
             self.mark_fold(path)?;
         }
+        self.masks = masks;
         Ok(n)
     }
 
@@ -4114,6 +4290,14 @@ impl Session {
         // "young table" -- only damage.
         if let Some(root) = self.catalog.dir().map(Path::to_path_buf) {
             let end = crate::persist::wal::stream_end(&root, &db, &tbl);
+            // Same reasoning for part *identities*: this table holds no parts,
+            // so its counter would start at 1 and reissue the numbers a
+            // dropped predecessor's archived parts still carry. The stream
+            // position is monotone across the drop; seeding from it makes a
+            // stale citation name an identity that does not exist, which is
+            // refused, rather than one that resolves to the wrong row.
+            let t = self.catalog.table_by_path_mut(&path)?;
+            t.seed_pids(end);
             let t = self.catalog.table_by_path(&path)?;
             if t.def.engine.is_persistent() {
                 crate::persist::write_table(&root.join(&db), t, end)?;
@@ -5075,6 +5259,27 @@ fn foreign_txn(what: &str) -> Error {
          would publish, discard or read writes this connection did not author -- the same \
          failure a nested BEGIN is refused for, one scope out. This engine has a single \
          writer, so wait for the other connection to COMMIT or ROLLBACK"
+    ))
+}
+
+/// A transaction was about to acquire a second commit point. See
+/// [`Session::mark_fold`] for why that cannot be ordered away.
+///
+/// `folding` is the table whose sweep has no durable row identity; `other` is
+/// whatever else the transaction already holds. Both are named because the
+/// user's fix depends on which is which, and both workarounds are given
+/// because "unsupported" without one is just a wall.
+#[cold]
+fn two_commit_points(folding: &str, other: &str) -> Error {
+    Error::unsupported(format!(
+        "refusing to put this DELETE/UPDATE on `{folding}` in the same transaction as \
+         `{other}`: `{folding}` has no single-column PRIMARY KEY, and this statement hid \
+         rows that are not yet in any part file, so nothing in the log can name them. That \
+         table can only be made durable by writing its parts out, which happens after \
+         COMMIT has already made `{other}` durable -- so a crash between the two would \
+         commit one and lose the other. Either give `{folding}` a single-column PRIMARY \
+         KEY, or run this statement in a transaction of its own (a single table folding on \
+         its own is atomic)"
     ))
 }
 
@@ -6555,6 +6760,62 @@ mod tests {
         assert_eq!((n(&mut s, "a"), n(&mut s, "b"), n(&mut s, "c")), (2, 3, 1));
     }
 
+    /// A prepare whose barrier fails must abort the COMMIT **before** the
+    /// decision is written -- the one property the parallel prepare could have
+    /// broken.
+    ///
+    /// The barriers now run concurrently, so the error does not arrive at the
+    /// statement that caused it; it arrives from a join. A `?` inside that
+    /// scope, or a join that only ran on the happy path, would let the
+    /// decision be appended over a participant whose bytes are not on the
+    /// platter -- and replay would then release every prepared group and find
+    /// one participant's records missing, which is exactly the half-committed
+    /// transaction two-phase commit exists to prevent.
+    ///
+    /// Four tables, so there are three prepares and the failure is in the
+    /// middle one rather than the first or the last. The assertion is made
+    /// twice: in the session that failed, and in a fresh one over the same
+    /// directory, because "nothing moved" has to be true of the disk too.
+    #[test]
+    fn a_prepare_whose_barrier_fails_stops_the_commit_before_the_decision() {
+        let s = Scratch::new("prepare-barrier");
+        let names = ["a", "b", "c", "d"];
+        let mut db = Session::open(s.path()).unwrap();
+        for n in names {
+            db.execute(&KEYED.replace(" t ", &format!(" {n} "))).unwrap();
+            db.execute(&format!("INSERT INTO {n} VALUES (1, 1)")).unwrap();
+        }
+        db.checkpoint().unwrap();
+        let rows = |db: &mut Session| {
+            names.map(|n| match db.query(&format!("SELECT count() FROM {n}")).unwrap().scalar() {
+                Some(Value::UInt(v)) => v,
+                other => panic!("{n}: {other:?}"),
+            })
+        };
+        assert_eq!(rows(&mut db), [1, 1, 1, 1]);
+
+        // Participant 2 of 3. `wal_for` keys on the qualified path and the
+        // transaction below enlists in `names` order, so `b` is the second
+        // prepare and `d` is the coordinator.
+        db.wal_for("default.b").unwrap().expect("a logging session").refuse_barriers();
+
+        db.execute("BEGIN").unwrap();
+        for n in names {
+            db.execute(&format!("INSERT INTO {n} VALUES (2, 2)")).unwrap();
+        }
+        let e = db.execute("COMMIT").unwrap_err().to_string();
+        assert!(e.contains("fsync"), "the refused barrier must be what COMMIT reports: {e}");
+        assert_eq!(rows(&mut db), [1, 1, 1, 1], "a table moved under a COMMIT that failed");
+
+        drop(db);
+        let mut again = Session::open(s.path()).unwrap();
+        assert_eq!(
+            rows(&mut again),
+            [1, 1, 1, 1],
+            "recovery released a transaction whose prepare was never made durable"
+        );
+    }
+
     /// Partly inverted: the last line used to be `COMMIT` succeeding after a
     /// refused nested `BEGIN`, which is the bug. A block that opens its own
     /// transaction, finds one already open, and then commits was committing
@@ -6910,6 +7171,349 @@ mod tests {
         assert!(db.query("SELECT v FROM t WHERE id = 100").unwrap().is_empty());
         assert!(db.query("SELECT v FROM t WHERE id = 1000").unwrap().is_empty());
         assert_eq!(vals(&mut db, "SELECT v FROM t WHERE id = 11000")[0][0], Value::Int(1_000));
+    }
+
+    // ---- the unkeyed sweep's durable row identity -------------------------
+
+    /// Every part file in `db.t`, by name.
+    fn part_files(root: &Path, table: &str) -> Vec<String> {
+        let mut v: Vec<String> = std::fs::read_dir(root.join("default").join(table))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| crate::persist::store::parse_part_seq(n).is_some())
+            .collect();
+        v.sort();
+        v
+    }
+
+    fn log_bytes(root: &Path, table: &str) -> u64 {
+        std::fs::read_dir(root.join(".wal").join("default").join(table))
+            .map(|rd| rd.map(|e| e.unwrap().metadata().unwrap().len()).sum())
+            .unwrap_or(0)
+    }
+
+    /// The claim the whole design exists to make: hiding a row that lives in a
+    /// checkpointed part costs a log record, not a table rewrite.
+    ///
+    /// The part file is the observable. `write_table` only ever *adds* a file
+    /// -- it never edits one in place -- so an unchanged listing is proof no
+    /// checkpoint ran, and the rows still being gone after a reopen with no
+    /// clean shutdown is proof the log carried them.
+    #[test]
+    fn an_unkeyed_delete_of_checkpointed_rows_logs_instead_of_rewriting() {
+        let s = Scratch::new("session-mask-no-rewrite");
+        let before;
+        {
+            let mut db = Session::open(s.path()).unwrap();
+            db.execute("CREATE TABLE u (id UInt64, v Int64) ENGINE = MergeTree ORDER BY id")
+                .unwrap();
+            let rows: Vec<String> = (0..2_000u64).map(|i| format!("({i},{i})")).collect();
+            db.execute(&format!("INSERT INTO u VALUES {}", rows.join(","))).unwrap();
+            db.checkpoint().unwrap();
+            before = part_files(s.path(), "u");
+            assert_eq!(before.len(), 1, "one part after the checkpoint");
+
+            db.execute("DELETE FROM u WHERE id % 100 = 7").unwrap();
+            db.execute("UPDATE u SET v = -1 WHERE id = 3").unwrap();
+            assert_eq!(
+                part_files(s.path(), "u"),
+                before,
+                "an unkeyed DELETE and UPDATE over checkpointed rows must not rewrite the \
+                 table"
+            );
+            // ...and the process dies with no checkpoint and no shutdown.
+        }
+        let mut db = Session::open(s.path()).unwrap();
+        assert_eq!(vals(&mut db, "SELECT count() FROM u")[0][0], Value::UInt(1_980));
+        assert!(db.query("SELECT v FROM u WHERE id = 107").unwrap().is_empty());
+        assert_eq!(vals(&mut db, "SELECT v FROM u WHERE id = 3")[0][0], Value::Int(-1));
+        assert_eq!(vals(&mut db, "SELECT v FROM u WHERE id = 4")[0][0], Value::Int(4));
+    }
+
+    /// The residual, pinned rather than hidden: rows that reached a part only
+    /// since the last checkpoint have no file to be named in, so hiding them
+    /// still writes the table out. This is the case `TAG_FLUSH`/`TAG_MERGE`
+    /// would close and this wave does not.
+    #[test]
+    fn an_unkeyed_delete_of_rows_inserted_in_the_same_transaction_still_folds() {
+        let s = Scratch::new("session-mask-residual");
+        let mut db = Session::open(s.path()).unwrap();
+        db.execute("CREATE TABLE u (id UInt64, v Int64) ENGINE = MergeTree ORDER BY id").unwrap();
+        db.execute("INSERT INTO u VALUES (1,1)").unwrap();
+        db.checkpoint().unwrap();
+        let before = part_files(s.path(), "u");
+
+        db.execute("BEGIN").unwrap();
+        db.execute("INSERT INTO u VALUES (2,2)").unwrap();
+        db.execute("DELETE FROM u WHERE id = 2").unwrap();
+        db.execute("COMMIT").unwrap();
+        assert_ne!(part_files(s.path(), "u"), before, "the fresh part has no durable home");
+        assert_eq!(vals(&mut db, "SELECT count() FROM u")[0][0], Value::UInt(1));
+    }
+
+    /// A rolled-back sweep must leave the log exactly as it found it -- the
+    /// mask record included, since it is appended before COMMIT like every
+    /// other staged record.
+    #[test]
+    fn a_rolled_back_unkeyed_delete_leaves_the_log_byte_identical() {
+        let s = Scratch::new("session-mask-rollback");
+        let mut db = Session::open(s.path()).unwrap();
+        db.execute("CREATE TABLE u (id UInt64, v Int64) ENGINE = MergeTree ORDER BY id").unwrap();
+        db.execute("INSERT INTO u VALUES (1,1),(2,2),(3,3)").unwrap();
+        db.checkpoint().unwrap();
+        let seg = s.path().join(".wal").join("default").join("u");
+        let name = std::fs::read_dir(&seg).unwrap().next().unwrap().unwrap().path();
+        let img = std::fs::read(&name).unwrap();
+
+        db.execute("BEGIN").unwrap();
+        db.execute("DELETE FROM u WHERE id = 2").unwrap();
+        db.execute("ROLLBACK").unwrap();
+        assert_eq!(std::fs::read(&name).unwrap(), img, "rewind must restore the log's bytes");
+        assert_eq!(vals(&mut db, "SELECT count() FROM u")[0][0], Value::UInt(3));
+    }
+
+    /// Re-hiding an already-hidden row changes nothing, so it must log
+    /// nothing. That is what makes replaying a record twice free, which a
+    /// coarse checkpoint watermark guarantees will happen.
+    #[test]
+    fn deleting_the_same_unkeyed_row_twice_logs_nothing_the_second_time() {
+        let s = Scratch::new("session-mask-idempotent");
+        let mut db = Session::open(s.path()).unwrap();
+        db.execute("CREATE TABLE u (id UInt64, v Int64) ENGINE = MergeTree ORDER BY id").unwrap();
+        db.execute("INSERT INTO u VALUES (1,1),(2,2),(3,3)").unwrap();
+        db.checkpoint().unwrap();
+        db.execute("DELETE FROM u WHERE id = 2").unwrap();
+
+        // Against a control that matches nothing at all: both statements pay
+        // the commit marker and the tick an autocommit transaction always
+        // pays, and the question is whether the second logs a *record* on top.
+        let a = log_bytes(s.path(), "u");
+        db.execute("DELETE FROM u WHERE id = 999").unwrap();
+        let empty = log_bytes(s.path(), "u") - a;
+        let b = log_bytes(s.path(), "u");
+        let rs = db.query("DELETE FROM u WHERE id = 2").unwrap();
+        assert_eq!(rs.affected, Some(0), "no row was live to hide");
+        assert_eq!(log_bytes(s.path(), "u") - b, empty, "and no record was written");
+    }
+
+    /// Scattered single-row deletes across many parts: every one is citable,
+    /// none rewrites the table, and the visible set survives a crash. The
+    /// shape the old design was worst at -- one statement straddling several
+    /// parts rewrote all of them.
+    #[test]
+    fn a_sweep_across_many_checkpointed_parts_is_replayed_exactly() {
+        let s = Scratch::new("session-mask-many-parts");
+        {
+            let mut db = Session::open(s.path()).unwrap();
+            db.execute("CREATE TABLE u (id UInt64, v Int64) ENGINE = MergeTree ORDER BY id")
+                .unwrap();
+            for g in 0..6u64 {
+                let rows: Vec<String> =
+                    (0..500u64).map(|i| format!("({},{i})", g * 1_000 + i)).collect();
+                db.execute(&format!("INSERT INTO u VALUES {}", rows.join(","))).unwrap();
+                db.checkpoint().unwrap();
+            }
+            let parts = part_files(s.path(), "u");
+            assert!(parts.len() >= 6, "{parts:?}");
+            db.execute("DELETE FROM u WHERE id % 1000 = 250").unwrap();
+            assert_eq!(part_files(s.path(), "u"), parts, "six parts touched, none rewritten");
+        }
+        let mut db = Session::open(s.path()).unwrap();
+        assert_eq!(vals(&mut db, "SELECT count() FROM u")[0][0], Value::UInt(2_994));
+        assert!(db.query("SELECT v FROM u WHERE id = 3250").unwrap().is_empty());
+    }
+
+    /// The claim the design turns on: a checkpoint moves a part to a new file
+    /// and the identity inside it does not move, so a citation minted before
+    /// the checkpoint still resolves after it.
+    ///
+    /// This is the difference between naming the part *file* and naming the
+    /// part. A file-sequence citation would be unresolvable the moment the
+    /// first delete's rewrite lands, which -- since a clean shutdown
+    /// checkpoints -- is the steady state.
+    #[test]
+    fn a_parts_identity_survives_the_checkpoint_that_rewrites_it() {
+        let s = Scratch::new("session-mask-identity-survives");
+        let pid;
+        {
+            let mut db = Session::open(s.path()).unwrap();
+            db.execute("CREATE TABLE u (id UInt64, v Int64) ENGINE = MergeTree ORDER BY id")
+                .unwrap();
+            let rows: Vec<String> = (0..500u64).map(|i| format!("({i},{i})")).collect();
+            db.execute(&format!("INSERT INTO u VALUES {}", rows.join(","))).unwrap();
+            db.checkpoint().unwrap();
+            let first = part_files(s.path(), "u");
+            pid = db.catalog.table_by_path("default.u").unwrap().snapshot().part(0).pid;
+
+            // A delete, then the checkpoint that rewrites the part it touched.
+            db.execute("DELETE FROM u WHERE id = 1").unwrap();
+            db.checkpoint().unwrap();
+            assert_ne!(part_files(s.path(), "u"), first, "the mask moved, so the file did");
+            assert_eq!(
+                db.catalog.table_by_path("default.u").unwrap().snapshot().part(0).pid,
+                pid,
+                "...but the identity a log record cites did not"
+            );
+
+            // A second delete cites the same identity against the new file,
+            // and is a log record rather than a third rewrite.
+            let second = part_files(s.path(), "u");
+            db.execute("DELETE FROM u WHERE id = 2").unwrap();
+            assert_eq!(part_files(s.path(), "u"), second);
+        }
+        let mut db = Session::open(s.path()).unwrap();
+        assert_eq!(vals(&mut db, "SELECT count() FROM u")[0][0], Value::UInt(498));
+        assert!(db.query("SELECT v FROM u WHERE id = 2").unwrap().is_empty());
+        assert_eq!(
+            db.catalog.table_by_path("default.u").unwrap().snapshot().part(0).pid,
+            pid,
+            "and it round-trips through the part file"
+        );
+    }
+
+    /// Part file numbers and part identities are both monotone across an
+    /// incarnation boundary. `TRUNCATE`, and `DROP` then `CREATE`, both empty
+    /// the directory, so the listing alone would reissue `part_000001` and
+    /// identity 1 to a new table while a backup still holds the old ones.
+    #[test]
+    fn part_numbers_and_identities_never_restart_across_an_incarnation() {
+        let s = Scratch::new("session-mask-incarnation");
+        let mut db = Session::open(s.path()).unwrap();
+        let ddl = "CREATE TABLE u (id UInt64, v Int64) ENGINE = MergeTree ORDER BY id";
+        db.execute(ddl).unwrap();
+        db.execute("INSERT INTO u VALUES (1,1),(2,2)").unwrap();
+        db.checkpoint().unwrap();
+        let seq = |v: &[String]| {
+            v.iter().filter_map(|n| crate::persist::store::parse_part_seq(n)).max().unwrap()
+        };
+        let high = seq(&part_files(s.path(), "u"));
+        let pid = db.catalog.table_by_path("default.u").unwrap().snapshot().part(0).pid;
+
+        for sql in ["TRUNCATE TABLE u", "DROP TABLE u"] {
+            db.execute(sql).unwrap();
+            if sql.starts_with("DROP") {
+                db.execute(ddl).unwrap();
+            }
+            db.execute("INSERT INTO u VALUES (9,9)").unwrap();
+            db.checkpoint().unwrap();
+            assert!(
+                seq(&part_files(s.path(), "u")) > high,
+                "{sql} reissued a part file number"
+            );
+            assert!(
+                db.catalog.table_by_path("default.u").unwrap().snapshot().part(0).pid > pid,
+                "{sql} reissued a part identity"
+            );
+        }
+    }
+
+    /// `TRUNCATE` empties a table; it must not move it to another database.
+    ///
+    /// `Catalog::create_table` stores the *bare* name, so recreating from the
+    /// stored definition put the table in whatever database was current --
+    /// `TRUNCATE TABLE m.u` left a `default.u` behind and destroyed `m.u` with
+    /// its rows, silently, exit 0.
+    #[test]
+    fn truncate_keeps_the_table_in_its_own_database() {
+        let s = Scratch::new("session-truncate-db");
+        let mut db = Session::open(s.path()).unwrap();
+        db.execute("CREATE DATABASE m").unwrap();
+        db.execute("CREATE TABLE m.u (id UInt64) ENGINE = MergeTree ORDER BY id").unwrap();
+        db.execute("INSERT INTO m.u VALUES (1),(2)").unwrap();
+        db.execute("TRUNCATE TABLE m.u").unwrap();
+        assert_eq!(vals(&mut db, "SELECT count() FROM m.u")[0][0], Value::UInt(0));
+        assert!(
+            db.query("SELECT count() FROM default.u").is_err(),
+            "TRUNCATE must not create a table in another database"
+        );
+    }
+
+    /// A citation that does not resolve is corruption, not something to skip.
+    ///
+    /// Skipping would resurrect a row that was deleted and acknowledged --
+    /// silently, and only on the machine that crashed -- which is the exact
+    /// failure the positional record was refused for in the first place. Both
+    /// ways a citation can fail to resolve get a case, and the assertion is on
+    /// the *refusal* so it cannot quietly become a `continue`.
+    #[test]
+    fn a_mask_record_that_does_not_resolve_is_refused() {
+        for (bogus_pid, pos, why) in [(true, 0u64, "does not hold"), (false, 9_999, "rows")] {
+            let s = Scratch::new("session-mask-corrupt");
+            let pid;
+            {
+                let mut db = Session::open(s.path()).unwrap();
+                db.execute("CREATE TABLE u (id UInt64, v Int64) ENGINE = MergeTree ORDER BY id")
+                    .unwrap();
+                db.execute("INSERT INTO u VALUES (1,1),(2,2),(3,3)").unwrap();
+                db.checkpoint().unwrap();
+                let real = db.catalog.table_by_path("default.u").unwrap().snapshot().part(0).pid;
+                pid = if bogus_pid { real + 9_999 } else { real };
+            }
+            let dir = crate::persist::wal::wal_dir(s.path(), "default", "u");
+            let mut w = crate::persist::Wal::open(&dir).unwrap();
+            let mut m = MaskRuns::default();
+            m.hide(pid, pos);
+            w.append_masks(None, &m).unwrap();
+            w.sync().unwrap();
+            drop(w);
+
+            let mut db = Session::open(s.path()).unwrap();
+            let e = db.query("SELECT count() FROM u").unwrap_err();
+            assert!(e.to_string().contains(why), "pid {pid} pos {pos}: {e}");
+        }
+    }
+
+    /// Replay must not compact: a merge retires the part identity a later
+    /// record cites, and the two are not in step. Enough flushes to cross
+    /// `AUTO_COMPACT_PARTS`, with a mask record behind them naming a part from
+    /// before the first.
+    ///
+    /// **MEASURED, AND THIS TEST DOES NOT CURRENTLY DISTINGUISH THE TWO
+    /// ENGINES.** With the `if self.replaying { return Ok(()) }` guard deleted
+    /// from `maybe_auto_compact`, this test still passes, and so does a
+    /// 12-trial `kill -9` campaign built to provoke it (14 checkpointed parts,
+    /// deletes against them interleaved with bulk inserts that pack a part
+    /// each). Instrumenting the merge showed why: the compaction *does* fire
+    /// during replay without the guard -- observed `replaying=true merging 8
+    /// of 16 parts` -- but it takes the smallest parts, and the parts it took
+    /// were the ones replay had just built, never a cited one.
+    ///
+    /// The reason looks structural rather than lucky. Replay's part list is
+    /// the checkpointed one plus whatever the `Insert` records rebuild, and
+    /// runtime flushes strictly more often than replay does -- every `DELETE`
+    /// goes through `plan_sweep`'s `flush_all` and replay's mask arm flushes
+    /// nothing -- so runtime reaches any given part count at or before the
+    /// point replay does. Runtime therefore compacts first, and a runtime
+    /// merge retires the part's durable home, which makes the next sweep over
+    /// those rows `dark` and stops the citation being minted at all.
+    ///
+    /// So the guard is defence in depth against a hazard nobody has yet
+    /// reached, not a fix for a reproduced one. Keep it -- it is one branch on
+    /// a path that runs once per open, and the failure it guards is a silently
+    /// resurrected row -- but do not read this test as evidence that removing
+    /// it breaks anything, because it is not.
+    #[test]
+    fn replay_does_not_compact_away_a_part_a_later_record_cites() {
+        let s = Scratch::new("session-mask-replay-compact");
+        {
+            let mut db = Session::open(s.path()).unwrap();
+            db.execute("CREATE TABLE u (id UInt64, v Int64) ENGINE = MergeTree ORDER BY id")
+                .unwrap();
+            db.execute("INSERT INTO u VALUES (1,1),(2,2),(3,3)").unwrap();
+            db.checkpoint().unwrap();
+            // Twenty logged inserts, each of which becomes a part of its own on
+            // replay -- past `AUTO_COMPACT_PARTS` twice over.
+            for i in 0..20u64 {
+                db.execute(&format!("INSERT INTO u VALUES ({}, {i})", 100 + i)).unwrap();
+                db.execute("SELECT count() FROM u").unwrap();
+            }
+            // Cites the part written by the checkpoint above, which sits at
+            // index 0 and is what an unsuppressed compaction would swallow.
+            db.execute("DELETE FROM u WHERE id = 2").unwrap();
+        }
+        let mut db = Session::open(s.path()).unwrap();
+        assert_eq!(vals(&mut db, "SELECT count() FROM u")[0][0], Value::UInt(22));
+        assert!(db.query("SELECT v FROM u WHERE id = 2").unwrap().is_empty());
     }
 
 }

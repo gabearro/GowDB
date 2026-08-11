@@ -201,7 +201,7 @@ fn decode_part(buf: &[u8], own: Owner) -> Result<Part> {
         );
     }
 
-    Ok(Part::from_parts(
+    let mut p = Part::from_parts(
         meta.n_rows,
         granules,
         meta.deleted,
@@ -209,7 +209,9 @@ fn decode_part(buf: &[u8], own: Owner) -> Result<Part> {
         meta.sort_col,
         meta.pk_col,
         meta.ncols,
-    ))
+    );
+    p.pid = meta.pid;
+    Ok(p)
 }
 
 struct GranuleDesc {
@@ -221,6 +223,7 @@ struct GranuleDesc {
 
 struct Meta {
     n_rows: usize,
+    pid: u64,
     ncols: usize,
     sort_col: Option<usize>,
     pk_col: Option<usize>,
@@ -232,6 +235,7 @@ struct Meta {
 fn decode_meta(body: &[u8], meta_at: u64) -> Result<Meta> {
     let mut r = Reader::new(body);
     let n_rows = row_count(r.varint()?, "part row count")?;
+    let pid = r.varint()?;
     let ncols = count(r.varint()?, "part column count")?;
     let sort_col = get_opt_index(&mut r, ncols, "sort column")?;
     let pk_col = get_opt_index(&mut r, ncols, "primary key column")?;
@@ -288,6 +292,7 @@ fn decode_meta(body: &[u8], meta_at: u64) -> Result<Meta> {
     }
     Ok(Meta {
         n_rows,
+        pid,
         ncols,
         sort_col,
         pk_col,
@@ -1335,6 +1340,7 @@ mod tests {
     fn an_oversized_granule_is_rejected() {
         let mut meta = format::Writer::new();
         meta.varint(GRANULE_SIZE as u64 + 1);
+        meta.varint(1); // part identity
         meta.varint(1);
         meta.u8(0);
         meta.u8(0);
@@ -1365,6 +1371,7 @@ mod tests {
         let ngranules = full + u64::from(tail != 0);
         let mut m = format::Writer::new();
         m.varint(n_rows);
+        m.varint(1); // part identity
         m.varint(1); // ncols
         m.u8(0); // no sort column
         m.u8(0); // no primary key column
@@ -1881,6 +1888,7 @@ mod tests {
 
         let mut meta = format::Writer::new();
         meta.varint(1); // n_rows
+        meta.varint(1); // part identity
         meta.varint(1); // ncols
         meta.u8(0); // no sort column
         meta.u8(0); // no primary key column
@@ -1970,6 +1978,7 @@ mod tests {
 
         let mut meta = format::Writer::new();
         meta.varint(p.n_rows as u64);
+        meta.varint(p.pid); // part identity
         meta.varint(p.ncols as u64);
         meta.u8(1);
         meta.varint(0);

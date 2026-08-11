@@ -108,6 +108,12 @@
 //! a segment retention has dropped, and a segment a crash caught mid-archive.
 //! Every one of those is a state a recovery could otherwise report as success
 //! while silently skipping records.
+//!
+//! And one more, which is the *result* rather than the request: a roll-forward
+//! the restored database cannot open. Because the cut is applied by the loader
+//! and not here, every refusal the loader has -- above all a mask record naming
+//! a part the backup predates -- used to arrive after `RESTORE` had exited 0.
+//! `prove` opens the directory before the report is returned.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -155,6 +161,10 @@ pub struct Report {
     pub tables: usize,
     pub parts: usize,
     /// Live rows -- what a `SELECT count()` on the restored database returns.
+    ///
+    /// For [`restore_until`] that is a count taken *from* the restored
+    /// database (see `prove`) rather than a sum over the archive, because
+    /// the roll-forward is free to insert and hide rows the archive never had.
     pub rows: u64,
     /// Size of the archive file itself.
     pub bytes: u64,
@@ -811,6 +821,13 @@ fn unpack<'a>(
 /// ordinary loader finishes the job. Running it twice with the same target
 /// produces the same bytes: every cut is at a tick, and a tick is a fact about
 /// the archive rather than about when the recovery ran.
+///
+/// Because the loader finishes the job, this function used to be unable to
+/// fail on anything the loader would refuse -- it staged bytes and reported
+/// success, and a roll-forward the restored database could not open was
+/// discovered by the operator, later, as a quarantine. `prove` closes that:
+/// the directory is opened here, and a `Report` is only returned once the
+/// loader has really produced the database it describes.
 pub fn restore_until(
     archive: &Path,
     data_root: &Path,
@@ -842,7 +859,74 @@ pub fn restore_until(
     // and the loader refuses a directory that holds table data without one --
     // which is exactly the state a half-rolled-forward restore is in.
     publish()?;
+    rep.rows = prove(into)?;
     Ok(rep)
+}
+
+/// Open the directory a roll-forward just wrote, and answer with the rows it
+/// really holds.
+///
+/// Two defects, one pass, and both were measured rather than reasoned about:
+///
+///  1. **A roll-forward that refuses reported success.** The records are
+///     staged, not applied, so every reason the loader has to reject one --
+///     chiefly a mask record naming a part built *after* the backup, which the
+///     archive by construction does not contain -- surfaced only when the
+///     operator next queried the restored database, as a quarantine whose
+///     advice ("restore the file from a backup") cannot help. `RESTORE` exited
+///     0 and printed a table of counts. A recovery tool that cannot tell you
+///     it did not recover is worse than one that cannot recover.
+///  2. **`Report::rows` was the archive's row count**, though it is documented
+///     as what a `SELECT count()` on the restored database returns. Everything
+///     the roll-forward added or hid was missing from it. Measured: reported
+///     5, held 3.
+///
+/// The check is the loader itself -- `Catalog::on_disk` plus
+/// [`store::load_catalog`], the same two calls `Session::open` makes -- so
+/// there is no second opinion here to drift from the real one, and a
+/// roll-forward this accepts is one the operator's next `SELECT` can open by
+/// construction.
+///
+/// It costs one extra open of the directory just written. Measured through the
+/// `RESTORE` statement, A/B interleaved against a build without it, best of
+/// nine, order alternated: **111.6 ms -> 127.8 ms (+16.2 ms, 1.15x)** for a
+/// 1M-row, 5-part, 13 MB archive rolled forward over ten records, and
+/// **33.7 ms -> 34.3 ms (+0.6 ms)** for a five-row one. It is a per-restore
+/// cost, not a per-row one: parts are mapped rather than read, so what is paid
+/// for is the replay and the metadata.
+///
+/// A failure leaves the directory **in place and openable**, which is
+/// deliberate and is the one refusal in this module that does not leave the
+/// operator with only the archive they had. The engine's standing policy for
+/// damage is per-table: open the database, refuse the table, name it. Deleting
+/// the `CATALOG` here to make the refusal directory-wide would contradict that
+/// and would take away the operator's ability to look. The error says so.
+fn prove(into: &Path) -> Result<u64> {
+    let mut c = crate::catalog::Catalog::on_disk(into)?;
+    store::load_catalog(&mut c)?;
+    if let Some(&(path, bad)) = c.damaged_parts().first() {
+        // `storage`, not `corruption`, and the distinction is the operator's
+        // next move: nothing here failed a checksum. The archive is whole and
+        // the log is whole -- they do not fit together. Reporting it as
+        // `CHECKSUM_MISMATCH` sent the reader looking for a damaged file that
+        // does not exist. The loader's own wording is quoted rather than
+        // paraphrased, so the two diagnoses can be matched up.
+        return Err(Error::storage(format!(
+            "the roll-forward was written to {} but `{path}` there cannot be opened: {}. \
+             The restored directory is left in place and every other table in it is \
+             readable, so the damage can be inspected -- but this is not the database the \
+             target asked for. A logged mutation whose part the backup predates is the \
+             usual cause: take the recovery from a backup made after that part, or pick a \
+             target before it.",
+            into.display(),
+            bad.why,
+        )));
+    }
+    let mut rows = 0;
+    for (_, t) in c.all_tables_mut() {
+        rows += t.row_count()? as u64;
+    }
+    Ok(rows)
 }
 
 /// Everything that makes a target unanswerable, checked before a byte is

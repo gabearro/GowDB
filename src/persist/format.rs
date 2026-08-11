@@ -37,9 +37,16 @@ pub const MAGIC: [u8; 8] = *b"GRANULR\0";
 
 /// Bumped whenever the layout of anything above this module changes
 /// incompatibly. Readers accept `MIN_READ_VERSION..=FORMAT_VERSION`.
-pub const FORMAT_VERSION: u32 = 3;
+pub const FORMAT_VERSION: u32 = 4;
 
 /// Oldest layout this build can still read.
+///
+/// v4 put a durable identity inside every part (`part_meta`'s second varint)
+/// and gave the log a `TAG_MASK_RUN` record that cites it, which is what makes
+/// an unkeyed `DELETE` cost the rows it touches instead of the whole table.
+/// A v3 part has no identity to read, and the varint the decoder would take
+/// for one is its column count, so a v3 directory is refused rather than
+/// misread.
 ///
 /// v3 replaced the single `wal.log` per table with numbered segments under
 /// `<root>/.wal/<db>/<table>/`, each carrying a 56-byte header whose `durable`
@@ -48,7 +55,7 @@ pub const FORMAT_VERSION: u32 = 3;
 /// this build does not look, so half-reading one would report tables as empty
 /// that are not. It is refused instead, by [`Error::Version`] rather than by
 /// [`Error::Corruption`] -- nothing in such a directory is damaged.
-pub const MIN_READ_VERSION: u32 = 3;
+pub const MIN_READ_VERSION: u32 = 4;
 
 /// `MAGIC` + version word.
 pub const HEADER_LEN: usize = MAGIC.len() + 4;

@@ -44,6 +44,19 @@
 //! it a checkpoint is O(entire database) and a read-only query rewrites the
 //! whole table.
 //!
+//! ## ...and what makes a positional log record possible
+//!
+//! [`Part::pid`] is the part's durable identity: one varint inside its own
+//! file, minted once and written back unchanged by every rewrite. It exists
+//! because an unkeyed `DELETE` has no key lane to log and must therefore log a
+//! *position*, and a position needs something that pins the rows it indexes.
+//! The file number cannot: the first tombstone retracts it and the next
+//! checkpoint reissues the part under a different name. The identity can,
+//! because a rewrite changes only the mask -- `persist::writer::write_part_with`
+//! copies granules verbatim, so rows and their offsets are the same bytes
+//! before and after, and only a merge removes rows (producing a new part with
+//! a new identity). 8 bytes per part, none per row.
+//!
 //! ## Unlink safety
 //!
 //! Compaction removes a part's file as soon as the merged replacement is
@@ -69,6 +82,22 @@ use super::granule::{Granule, Stats};
 
 pub struct Part {
     pub n_rows: usize,
+    /// This part's durable identity: the name a log record uses to say "row
+    /// `pos` of *that* part is hidden", and the reason such a record survives
+    /// the checkpoint that rewrites the part under a new file name.
+    ///
+    /// Minted by [`PartSet::push`] from the set's own counter, written into
+    /// the part file by `persist::writer::part_meta`, and read straight back
+    /// -- so a part loaded from disk knows what it is called without a sidecar
+    /// and without a directory listing. It never changes, because a rewrite
+    /// changes only the delete mask: `write_part_with` copies granules
+    /// verbatim, so row positions and row identity are the same bytes before
+    /// and after. Only a merge removes rows, and a merge produces a *new*
+    /// part with a new identity.
+    ///
+    /// Zero means "not minted yet", which is every part between `build` and
+    /// `push`. 8 bytes per part, none per row.
+    pub pid: u64,
     pub granules: Vec<Granule>,
     /// Sort-key lane of the first row of each granule: the sparse index.
     first_keys: Vec<u64>,
@@ -175,6 +204,7 @@ impl Part {
 
         Ok(Part {
             n_rows: n,
+            pid: 0,
             granules,
             first_keys,
             part_max,
@@ -206,6 +236,7 @@ impl Part {
         let (route_base, route_shift, router) = Self::build_router(&first_keys, part_max);
         Part {
             n_rows,
+            pid: 0,
             granules,
             first_keys,
             part_max,
@@ -228,8 +259,11 @@ impl Part {
     /// read back from disk looks new to the next `write_table`, and the first
     /// checkpoint after a restart rewrites the entire database once more.
     /// Only meaningful between decoding and [`PartSet::push`].
+    ///
+    /// It is also what marks the part [`HOMED`]: it was decoded from a file,
+    /// so recovery will decode it from a file again.
     pub fn set_origin(&mut self, seq: u64) {
-        self.origin = seq;
+        self.origin = HOMED | seq;
     }
 
     fn build_router(first_keys: &[u64], part_max: u64) -> (u64, u32, Vec<u32>) {
@@ -511,6 +545,84 @@ impl Part {
     }
 }
 
+// ------------------------------------------------------------- mask records
+
+/// The positions one sweep hid, grouped by the durable identity of the part
+/// they live in and delta-varint encoded as they arrive.
+///
+/// This is the write-ahead log's copy of a positional delete, built in the
+/// sweep's inner loop so nothing is walked twice and nothing is collected per
+/// row: `hide` appends between one and three bytes, and the log turns each run
+/// into a `TAG_MASK_RUN` frame with one `extend_from_slice`. The obvious
+/// alternative -- collect `Vec<u64>` of positions the way the keyed path
+/// collects lanes -- costs eight bytes of heap per hidden row, which is 8 MB
+/// on a million-row `DELETE` against a path that allocates nothing today.
+///
+/// It lives here rather than in `persist` because the producer is the storage
+/// sweep and `storage` does not depend on `persist`. The encoding is LEB128,
+/// decoded by `persist::format::Reader::varint`; `mask_runs_round_trip` pins
+/// the two against each other.
+///
+/// Reused across statements: `clear` keeps both allocations, so a session
+/// deleting in a loop allocates once.
+#[derive(Default)]
+pub struct MaskRuns {
+    /// One entry per part touched: identity, how many positions, and where
+    /// its deltas start in `bytes`.
+    runs: Vec<(u64, u64, usize)>,
+    bytes: Vec<u8>,
+    /// Previous position within the current run. `u64::MAX` stands for the
+    /// -1 that makes the first delta the position itself.
+    prev: u64,
+    /// Rows hidden in parts with no durable home, which no record can name.
+    /// Non-zero is what makes the caller fall back to writing the table out.
+    pub dark: usize,
+}
+
+impl MaskRuns {
+    pub fn clear(&mut self) {
+        self.runs.clear();
+        self.bytes.clear();
+        self.dark = 0;
+    }
+
+    /// Record that row `pos` of the part with identity `pid` was hidden.
+    ///
+    /// Positions must arrive ascending within a part, which the sweep
+    /// guarantees: it walks granules in order and offsets in order inside
+    /// each, and `base + off` is monotone across both.
+    #[inline]
+    pub fn hide(&mut self, pid: u64, pos: u64) {
+        if self.runs.last().is_none_or(|&(p, ..)| p != pid) {
+            self.runs.push((pid, 0, self.bytes.len()));
+            self.prev = u64::MAX;
+        }
+        let k = self.runs.len() - 1;
+        self.runs[k].1 += 1;
+        // Wrapping, so the `prev = -1` case falls out of the same expression:
+        // `pos - u64::MAX - 1 == pos`.
+        let mut d = pos.wrapping_sub(self.prev).wrapping_sub(1);
+        while d >= 0x80 {
+            self.bytes.push((d as u8) | 0x80);
+            d >>= 7;
+        }
+        self.bytes.push(d as u8);
+        self.prev = pos;
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.runs.is_empty()
+    }
+
+    /// `(pid, count, deltas)` for each part touched, in sweep order.
+    pub fn runs(&self) -> impl Iterator<Item = (u64, u64, &[u8])> {
+        self.runs.iter().enumerate().map(move |(i, &(pid, n, start))| {
+            let end = self.runs.get(i + 1).map_or(self.bytes.len(), |&(_, _, s)| s);
+            (pid, n, &self.bytes[start..end])
+        })
+    }
+}
+
 // ---------------------------------------------------------------- deletes
 
 /// The delete mask of one part, immutable once published.
@@ -626,13 +738,30 @@ impl Deletes {
 /// from 1 -- so zero is free to mean "nowhere".
 pub const NO_FILE: u64 = 0;
 
+/// Top bit of an [`PartSet::origins`] entry: *these rows have been in a part
+/// file at some point*, which is a strictly weaker and much longer-lived claim
+/// than "file `seq` holds them right now".
+///
+/// The two claims answer two different questions and only one of them is
+/// retracted by a tombstone. The checkpoint asks "may I reuse that file?" and
+/// the answer becomes no the instant the mask moves. The log asks "will
+/// recovery rebuild this part by *reading a file*, rather than by replaying
+/// the inserts that built it?" -- and that stays yes forever, because the
+/// checkpoint that rewrites the part writes the same rows in the same
+/// positions under the same [`Part::pid`]. A record naming `(pid, pos)` is
+/// therefore resolvable long after the file number it was minted under is
+/// gone, which is exactly what a positional record has to survive.
+///
+/// One spare bit of a word that is already there: no second vector, no extra
+/// byte resident or on disk.
+const HOMED: u64 = 1 << 63;
+
 /// An immutable, versioned list of parts and their delete masks.
 ///
 /// This is the unit of atomicity for the whole storage layer. Every mutation
 /// clones the three vectors -- pointers, not data -- edits the entries that
 /// changed and bumps `version`; readers take one `Arc` and are then insulated
 /// from every subsequent write. Nothing a reader can see ever changes under it.
-#[derive(Default)]
 pub struct PartSet {
     parts: Vec<Arc<Part>>,
     /// Parallel to `parts`. `None` = nothing deleted, the common case.
@@ -656,6 +785,17 @@ pub struct PartSet {
     ///
     /// Width: 8 bytes per *part*, not per row -- a part holds up to 2^40 rows.
     origins: Vec<AtomicU64>,
+    /// The next [`Part::pid`] to hand out. Monotone within one lineage of the
+    /// set: `push` never lowers it, `remove` never touches it, and the
+    /// copy-on-write clone carries it forward -- so a merge cannot hand a
+    /// fresh part the identity of one it just consumed.
+    ///
+    /// It rides on the set rather than on the `Table` so that every path that
+    /// can add a part mints through one line. A transaction's private set
+    /// carries a copy, and a ROLLBACK that discards it takes back the numbers
+    /// with the parts they named -- sound because a part inside an uncommitted
+    /// overlay has never been written to a file, so nothing can have cited it.
+    next_pid: u64,
     version: u64,
 }
 
@@ -673,7 +813,21 @@ impl Clone for PartSet {
                 .iter()
                 .map(|o| AtomicU64::new(o.load(Ordering::Relaxed)))
                 .collect(),
+            next_pid: self.next_pid,
             version: self.version,
+        }
+    }
+}
+
+impl Default for PartSet {
+    fn default() -> PartSet {
+        PartSet {
+            parts: Vec::new(),
+            deletes: Vec::new(),
+            origins: Vec::new(),
+            // Zero is "unminted"; identities start at one.
+            next_pid: 1,
+            version: 0,
         }
     }
 }
@@ -693,6 +847,10 @@ impl PartSet {
             parts: Vec::with_capacity(parts.len()),
             deletes: Vec::with_capacity(parts.len()),
             origins: Vec::with_capacity(parts.len()),
+            // Above every identity being adopted, so a part that arrives
+            // without one (only a hand-built part can) cannot be minted onto
+            // a number a later part in the same batch already owns.
+            next_pid: 1 + parts.iter().map(|p| p.pid).max().unwrap_or(0),
             version: 0,
         };
         for p in parts {
@@ -701,9 +859,36 @@ impl PartSet {
         set
     }
 
-    /// Append a part, adopting its construction-time deletes and its file
-    /// provenance.
+    /// Start handing out identities above `floor`.
+    ///
+    /// Called with the log's stream position for a table that has **no**
+    /// parts, which is what a table is after `CREATE`, after `TRUNCATE` and
+    /// after a `DROP` and re-`CREATE` under the same name. The log outlives
+    /// all three by design (see the `wal` module docs), and its position never
+    /// restarts, so seeding from it makes a new incarnation's identities
+    /// strictly higher than every one the old incarnation ever minted. A
+    /// citation left behind by the corpse then names a `pid` that does not
+    /// exist and is refused, instead of resolving against a same-numbered part
+    /// of the successor and hiding the wrong row.
+    ///
+    /// Only for the empty case: seeding a populated table would push its
+    /// identities up by 64 MiB per checkpoint for no gain.
+    pub fn seed_pids(&mut self, floor: u64) {
+        if self.parts.is_empty() {
+            self.next_pid = self.next_pid.max(floor.saturating_add(1));
+        }
+    }
+
+    /// Append a part, minting its durable identity and adopting its
+    /// construction-time deletes and file provenance.
     pub fn push(&mut self, mut part: Part) {
+        // A part decoded from a file arrives with the identity it was written
+        // under; one built in memory is minted here. Either way the counter
+        // ends up above it, so the two sources cannot collide.
+        if part.pid == 0 {
+            part.pid = self.next_pid;
+        }
+        self.next_pid = self.next_pid.max(part.pid + 1);
         let del = (part.deleted_count > 0).then(|| {
             let bits = std::mem::take(&mut part.deleted);
             let n = std::mem::replace(&mut part.deleted_count, 0);
@@ -768,7 +953,50 @@ impl PartSet {
     /// record naming a file that is not there.
     #[inline]
     pub fn origin(&self, i: usize) -> u64 {
-        self.origins[i].load(Ordering::Relaxed)
+        self.origins[i].load(Ordering::Relaxed) & !HOMED
+    }
+
+    /// The identity a log record may cite for part `i`, or `None` if recovery
+    /// would not be able to resolve it.
+    ///
+    /// [`HOMED`] is the whole test: a part that has been in a file will be
+    /// rebuilt from a file, positions and all, so `(pid, pos)` names the same
+    /// row after a crash. A part built since the last checkpoint exists only
+    /// as the log records that fed it, and how *those* records regroup into
+    /// parts on replay depends on flush timing and compaction -- neither of
+    /// which is in the log. Such a part is not citable and the caller falls
+    /// back to writing the table out.
+    #[inline]
+    pub fn citable(&self, i: usize) -> Option<u64> {
+        (self.origins[i].load(Ordering::Relaxed) & HOMED != 0).then(|| self.parts[i].pid)
+    }
+
+    /// Which part carries the durable identity `pid` **and came from a file**,
+    /// if any.
+    ///
+    /// Deliberately [`PartSet::citable`] and not a bare `pid` compare: this is
+    /// the read side of the record `citable` mints, and the two have to agree
+    /// on which parts are addressable or the pair is unsound. A part built
+    /// during a replay is not addressable for the reason `citable` gives --
+    /// nothing in the log says where the flush boundaries fell, so its
+    /// positions are an artefact of *this* replay rather than a fact about the
+    /// stream.
+    ///
+    /// It is not a theoretical asymmetry. Identities are minted from a counter
+    /// that a load seeds from the parts it found (`PartSet::adopt`), so a
+    /// point-in-time restore starts numbering at the backup's highest identity
+    /// -- exactly where the source database's post-backup parts started. A
+    /// replay that flushed a part therefore handed it the very identity the
+    /// staged log cites for a part the backup does not contain, and the record
+    /// resolved against it: **measured, a `DELETE` of `id = 8` came back from a
+    /// roll-forward having hidden `id = 1002` instead, exit 0 and no
+    /// diagnostic**. With this test it resolves to nothing, which is the
+    /// refusal the log's decoder already raises as corruption.
+    ///
+    /// Linear over the part list -- tens of entries, and this runs once per
+    /// replayed record, not per row.
+    pub fn index_of(&self, pid: u64) -> Option<usize> {
+        (0..self.parts.len()).find(|&i| self.citable(i) == Some(pid))
     }
 
     /// Record that part `i`, with this set's current mask for it, is durably
@@ -779,7 +1007,7 @@ impl PartSet {
     /// place, because that is the claim it makes.
     #[inline]
     pub fn set_origin(&self, i: usize, seq: u64) {
-        self.origins[i].store(seq, Ordering::Relaxed);
+        self.origins[i].store(HOMED | seq, Ordering::Relaxed);
     }
 
     /// Live rows in part `i`.
@@ -803,21 +1031,22 @@ impl PartSet {
     /// one, then mutates in place for every tombstone after that. A flush that
     /// shadows ten thousand keys pays one clone, not ten thousand.
     ///
-    /// **A moved mask invalidates the file.** The delete bitmap is written
-    /// inside the part file (`persist::writer::part_meta`), so a part whose
-    /// rows are untouched but whose deletes moved has to be rewritten in full.
-    /// The alternative -- a sidecar `part_NNNNNN.gdel` holding just the mask,
-    /// so a tombstone rewrites 8 bytes per 64 rows instead of the whole
-    /// columnar payload -- was rejected for this wave: it needs a second file
-    /// to become durable atomically with the first, which is a new and
-    /// weaker-by-default commit protocol in the one part of this codebase
-    /// that is genuinely production-grade. It is the right next step if
-    /// scattered single-row DELETEs over huge parts ever become the workload;
-    /// today's shape (deletes arrive in flush-sized batches, and a batch
-    /// dirties a bounded number of parts) does not pay for it.
+    /// **A moved mask invalidates the file, but not the identity.** The delete
+    /// bitmap is written inside the part file
+    /// (`persist::writer::part_meta`), so a part whose rows are untouched but
+    /// whose deletes moved has to be rewritten in full before that file can be
+    /// reused -- hence the cleared sequence number. [`HOMED`] survives,
+    /// because the rewrite reproduces the same rows at the same positions
+    /// under the same [`Part::pid`]; a sidecar mask was considered for this
+    /// and rejected, since it would need a second file to become durable
+    /// atomically with the first, which is a new and weaker-by-default commit
+    /// protocol. The write-ahead log is the commit protocol that already
+    /// exists, so the mask goes there instead -- see `Session::apply_sweep`.
     ///
     /// Note the `d.set(pos)` return: re-deleting an already-dead row leaves
-    /// the mask byte-identical, so it must *not* invalidate the file.
+    /// the mask byte-identical, so it must *not* invalidate the file. That
+    /// idempotence is also what makes a replayed mask record safe to apply
+    /// twice, which a coarse checkpoint watermark guarantees will happen.
     pub fn tombstone(&mut self, i: usize, pos: usize) -> bool {
         let ngran = self.parts[i].granules.len();
         let slot = &mut self.deletes[i];
@@ -825,7 +1054,7 @@ impl PartSet {
         if !d.set(pos) {
             return false;
         }
-        *self.origins[i].get_mut() = NO_FILE;
+        *self.origins[i].get_mut() &= HOMED;
         true
     }
 }
@@ -1069,6 +1298,151 @@ mod tests {
 
         // ...and the snapshot taken before any of it is untouched.
         assert_eq!(pinned.origin(0), 7);
+    }
+
+    /// The two claims one word carries, and the fact that only one of them is
+    /// retracted by a tombstone. A part that has stopped naming a file is
+    /// still citable, because the checkpoint that rewrites it reproduces the
+    /// same rows at the same positions under the same identity -- which is the
+    /// whole reason a positional log record works here.
+    #[test]
+    fn a_tombstone_retracts_the_file_but_not_the_identity() {
+        let b = sorted_block(3000, false);
+        let mut p = Part::build(&b, Some(0), Some(0)).unwrap();
+        p.pid = 42;
+        p.set_origin(7);
+        let mut set = PartSet::adopt(vec![p]);
+        assert_eq!(set.citable(0), Some(42));
+        assert_eq!(set.origin(0), 7);
+
+        set.tombstone(0, 5);
+        assert_eq!(set.origin(0), NO_FILE, "the file no longer holds this mask");
+        assert_eq!(set.citable(0), Some(42), "but the rows are still in a file somewhere");
+
+        // A part built in memory has never been in a file, so nothing may name
+        // it -- the residual the fold still covers.
+        let fresh = Part::build(&sorted_block(10, false), Some(0), Some(0)).unwrap();
+        set.push(fresh);
+        assert_eq!(set.citable(1), None);
+        assert_eq!(set.origin(1), NO_FILE);
+    }
+
+    /// Identities are minted once, never reissued, and never inherited: the
+    /// counter only ever goes up, and a part that arrives already carrying one
+    /// keeps it and pushes the counter above it.
+    #[test]
+    fn identities_are_minted_once_and_never_reissued() {
+        let blk = || sorted_block(10, false);
+        let mut set = PartSet::new();
+        for _ in 0..3 {
+            set.push(Part::build(&blk(), Some(0), Some(0)).unwrap());
+        }
+        assert_eq!((0..3).map(|i| set.part(i).pid).collect::<Vec<_>>(), vec![1, 2, 3]);
+        // Resolution is by *citable* identity, so these three have to have
+        // been in a file before they answer to theirs -- the rule
+        // `only_a_part_that_has_been_in_a_file_answers_to_its_identity`
+        // pins. Nothing about minting changes; the lookup gained a
+        // precondition.
+        for i in 0..3 {
+            set.set_origin(i, 1 + i as u64);
+        }
+        assert_eq!(set.index_of(2), Some(1));
+        assert_eq!(set.index_of(9), None);
+
+        // Removing every part -- what a merge does -- must not free the
+        // numbers they held.
+        for i in (0..3).rev() {
+            set.remove(i);
+        }
+        set.push(Part::build(&blk(), Some(0), Some(0)).unwrap());
+        assert_eq!(set.part(0).pid, 4, "a merge must not reissue a consumed identity");
+
+        // A decoded part keeps the identity in its bytes, and the counter
+        // steps over it.
+        let mut loaded = Part::build(&blk(), Some(0), Some(0)).unwrap();
+        loaded.pid = 100;
+        set.push(loaded);
+        set.push(Part::build(&blk(), Some(0), Some(0)).unwrap());
+        assert_eq!(set.part(2).pid, 101);
+
+        // And the empty-table seed lifts it past a previous incarnation's.
+        let mut fresh = PartSet::new();
+        fresh.seed_pids(5_000);
+        fresh.push(Part::build(&blk(), Some(0), Some(0)).unwrap());
+        assert_eq!(fresh.part(0).pid, 5_001);
+        fresh.seed_pids(9_000);
+        fresh.push(Part::build(&blk(), Some(0), Some(0)).unwrap());
+        assert_eq!(fresh.part(1).pid, 5_002, "a populated table is left alone");
+    }
+
+    /// The read side of a mask record has to agree with the write side about
+    /// which parts are addressable, or the pair is unsound.
+    ///
+    /// This is not hypothetical. Identities are minted from a counter a load
+    /// seeds from the parts it found, so a point-in-time restore starts
+    /// numbering at the backup's highest identity -- precisely where the
+    /// source database's post-backup parts started. A replay that flushed a
+    /// part therefore handed it the very identity the staged log cites for a
+    /// part the backup does not contain, and `index_of` resolved the record
+    /// against it: a `DELETE FROM t WHERE id = 8`, rolled forward, hid
+    /// `id = 1002` instead. Exit 0, no diagnostic.
+    #[test]
+    fn only_a_part_that_has_been_in_a_file_answers_to_its_identity() {
+        let blk = || sorted_block(10, false);
+        let mut set = PartSet::new();
+        let mut replayed = Part::build(&blk(), Some(0), Some(0)).unwrap();
+        replayed.pid = 7;
+        set.push(replayed);
+        assert_eq!(set.part(0).pid, 7);
+        assert_eq!(
+            set.index_of(7),
+            None,
+            "a part built in this replay has no durable positions to name"
+        );
+
+        // The same identity, once it really is in a file: the ordinary crash
+        // recovery, which must keep working.
+        set.set_origin(0, 3);
+        assert_eq!(set.index_of(7), Some(0));
+
+        // And a collision resolves to the one the log could have meant. The
+        // second part is what a replay flush builds; it must not shadow the
+        // first, whichever order they sit in.
+        let mut ghost = Part::build(&blk(), Some(0), Some(0)).unwrap();
+        ghost.pid = 7;
+        set.push(ghost);
+        assert_eq!(set.index_of(7), Some(0));
+    }
+
+    /// The gap encoding, against the numbers it is supposed to produce: a
+    /// dense run is one byte a row, and the runs come back grouped by part in
+    /// sweep order.
+    #[test]
+    fn mask_runs_group_by_part_and_encode_gaps() {
+        let mut m = MaskRuns::default();
+        for p in [0u64, 1, 2] {
+            m.hide(4, p);
+        }
+        m.hide(6, 1_000);
+        m.hide(6, 1_001);
+        // Back to a part already seen: a new run, because the log frames one
+        // record per contiguous group and replay resolves each independently.
+        m.hide(4, 9);
+        let got: Vec<(u64, u64, Vec<u8>)> =
+            m.runs().map(|(p, n, d)| (p, n, d.to_vec())).collect();
+        assert_eq!(
+            got,
+            vec![
+                // 0, then +1, then +1 -- one byte each.
+                (4, 3, vec![0, 0, 0]),
+                // 1000 needs two bytes; the next is adjacent.
+                (6, 2, vec![0xE8, 0x07, 0]),
+                (4, 1, vec![9]),
+            ]
+        );
+        assert!(!m.is_empty());
+        m.clear();
+        assert!(m.is_empty());
     }
 
     /// The three vectors are indexed by the same `i` everywhere, so a removal

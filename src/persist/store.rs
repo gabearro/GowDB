@@ -168,6 +168,30 @@ fn tmp_path(target: &Path) -> PathBuf {
 /// 3. `rename` over the target -- atomic, so no reader sees a prefix;
 /// 4. `fsync` the directory -- otherwise the rename itself can be lost.
 pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
+    publish(path, bytes)?;
+    sync_dir(path.parent().unwrap_or_else(|| Path::new(".")))
+}
+
+/// Steps 1 to 3 of [`atomic_write`]. **The caller owes step 4 -- a
+/// [`sync_dir`] of the parent -- before anything treats the rename as
+/// durable.**
+///
+/// Split out because step 4 is the one step of the four that is shared: a
+/// checkpoint publishing K parts into one directory does the same directory
+/// `fsync` K times, and a directory `fsync` on this machine is a full device
+/// barrier -- measured at 4.0 to 4.8 ms, indistinguishable from the file one.
+/// One at the end persists every rename before it just as well as K
+/// interleaved, so K-1 of them are pure waste. See [`writer::write_table`],
+/// which is the caller that has K.
+///
+/// The other three steps are *not* shareable and are not touched. In
+/// particular the temp file's own `fsync` stays where it is: it is what makes
+/// the rename unable to outlive the bytes it names, and moving it into the
+/// same device flush as the rename would let a power cut persist the rename
+/// over a partial file.
+///
+/// [`writer::write_table`]: super::writer::write_table
+pub fn publish(path: &Path, bytes: &[u8]) -> Result<()> {
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     if !dir.as_os_str().is_empty() {
         fs::create_dir_all(dir).map_err(|e| io_err("create directory", dir, e))?;
@@ -187,7 +211,7 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
         let _ = fs::remove_file(&tmp);
         return Err(io_err("rename into place", path, e));
     }
-    sync_dir(dir)
+    Ok(())
 }
 
 /// [`atomic_write`], skipped when the file already holds exactly `bytes`.
@@ -584,6 +608,10 @@ pub fn load_catalog(catalog: &mut Catalog) -> Result<()> {
             let path = format!("{db}.{bare}");
             let t = catalog.table_by_path_mut(&path)?;
             t.set_parts(image.parts);
+            // No parts means a fresh, truncated or re-created table, whose
+            // identity counter must start above everything the previous
+            // incarnation minted. See `PartSet::seed_pids`.
+            t.seed_pids(image.wal_committed);
 
             let wal = wal::wal_dir(&root, &db, &bare);
             // Not replayed at all when the `TABLE` file is already the damage:
@@ -607,22 +635,24 @@ pub fn load_catalog(catalog: &mut Catalog) -> Result<()> {
                         });
                     }
                     Ok(recs) => {
-                        for rec in recs {
-                            match rec {
-                                WalRecord::Insert(b) => {
-                                    t.insert(b)?;
-                                }
-                                WalRecord::Delete(lane) => {
-                                    let pk = t.def.pk_col().ok_or_else(|| {
-                                        Error::corruption(format!(
-                                            "log for `{path}` holds a key delete, but the \
-                                             table has no single-column primary key"
-                                        ))
-                                    })?;
-                                    let v = value_from_lane(t.def.schema.ty(pk), lane)?;
-                                    t.delete_key(&v)?;
-                                }
-                            }
+                        // Append-only for the whole replay: a merge would
+                        // retire a part identity a later record still cites.
+                        // See `Table::set_replaying`.
+                        t.set_replaying(true);
+                        let r = apply_replay(t, &path, recs);
+                        t.set_replaying(false);
+                        // A record that will not *apply* quarantines its own
+                        // table for the same reason one that will not decode
+                        // does: the operator has to be able to open the
+                        // database and find out which table it is. Refusing
+                        // the whole open would hide the answer behind the
+                        // question.
+                        match r {
+                            Err(e) => broken.push(reader::DamagedPart {
+                                file: crate::persist::wal::WAL_DIR.to_string(),
+                                why: e.to_string(),
+                            }),
+                            Ok(()) => t.compact_to_steady()?,
                         }
                     }
                 }
@@ -633,6 +663,57 @@ pub fn load_catalog(catalog: &mut Catalog) -> Result<()> {
             // -- so this call extends that list rather than replacing it.
             if !broken.is_empty() {
                 catalog.quarantine(&path, broken);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Replay one table's records into it, in order.
+///
+/// Split out of [`load_catalog`] so the replay flag is cleared on every exit
+/// -- including the error one, which leaves the table quarantined but must not
+/// leave it unable to compact.
+fn apply_replay(t: &mut crate::storage::Table, path: &str, recs: Vec<WalRecord>) -> Result<()> {
+    for rec in recs {
+        match rec {
+            WalRecord::Insert(b) => {
+                t.insert(b)?;
+            }
+            WalRecord::Delete(lane) => {
+                let pk = t.def.pk_col().ok_or_else(|| {
+                    Error::corruption(format!(
+                        "log for `{path}` holds a key delete, but the table has no \
+                         single-column primary key"
+                    ))
+                })?;
+                let v = value_from_lane(t.def.schema.ty(pk), lane)?;
+                t.delete_key(&v)?;
+            }
+            // An unkeyed delete, naming rows by position inside the part that
+            // holds them. Anything that does not resolve is corruption and is
+            // reported: the log and the parts disagree, and the two ways that
+            // can happen -- an identity this table has never held, or a
+            // position past the end of the part that does -- are both
+            // "somebody's bytes are wrong", not "skip this one". Skipping
+            // would resurrect a row that was deleted and acknowledged, which
+            // is the exact failure the whole design exists to prevent.
+            WalRecord::Mask(pid, positions) => {
+                let (i, rows) = t.part_by_pid(pid).ok_or_else(|| {
+                    Error::corruption(format!(
+                        "log for `{path}` hides rows in part {pid}, which this table does \
+                         not hold"
+                    ))
+                })?;
+                for &pos in &positions {
+                    if pos >= rows as u64 {
+                        return Err(Error::corruption(format!(
+                            "log for `{path}` hides row {pos} of part {pid}, which has \
+                             {rows} rows"
+                        )));
+                    }
+                    t.mark_deleted(i, pos as usize);
+                }
             }
         }
     }

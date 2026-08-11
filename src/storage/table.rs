@@ -87,7 +87,7 @@ use crate::types::{
 
 use super::delta::{Delta, DeltaEntry, DeltaImage};
 use super::granule::{Granule, Stats};
-use super::part::{gather_rows, Deletes, Part, PartSet, Snapshot};
+use super::part::{gather_rows, Deletes, MaskRuns, Part, PartSet, Snapshot};
 
 /// Inserts at least this large bypass the delta and become a part directly:
 /// sorting and packing a big batch in one pass beats routing it through a hash
@@ -235,6 +235,23 @@ pub enum RowLoc {
     Part { part: u32, pos: u32 },
 }
 
+/// Where a sweep writes the durable name of each row it hides.
+///
+/// One parameter with three shapes rather than one `Option` per shape: asking
+/// for lanes on a table that has no key would read a column that is not the
+/// key, and asking for positions on one that does would pay for a record the
+/// keyed path already has a cheaper form of. The choice is made once per
+/// statement and matched once per hidden row, next to a bitmap write that
+/// costs more.
+pub enum SweepLog<'a> {
+    /// In memory, or a session with no log: name nothing.
+    None,
+    /// Primary-key lanes, for `TAG_DELETE_RUN`.
+    Keys(&'a mut Vec<u64>),
+    /// Positions by part identity, for `TAG_MASK_RUN`.
+    Masks(&'a mut MaskRuns),
+}
+
 pub struct Table {
     pub def: TableDef,
     /// Derived from `def` once at construction.
@@ -256,6 +273,9 @@ pub struct Table {
     /// tuned for -- see the module docs.
     txn: Option<Arc<PartSet>>,
     delta_limit: usize,
+    /// Log replay is in progress, so nothing may compact on its own. See
+    /// [`Table::set_replaying`].
+    replaying: bool,
     pub stats: Stats,
 }
 
@@ -360,6 +380,7 @@ impl Table {
             parts: RwLock::new(Arc::new(set)),
             txn: None,
             delta_limit,
+            replaying: false,
             stats: Stats::default(),
         }
     }
@@ -501,6 +522,59 @@ impl Table {
             Some(view) => view.len(),
             None => self.parts.read().unwrap_or_else(|e| e.into_inner()).len(),
         }
+    }
+
+    /// Where the part with durable identity `pid` sits, and how many rows it
+    /// holds. `None` if this table has no such part.
+    ///
+    /// The pair, not just the index: every caller is a log record about to
+    /// address a position inside that part, and the row count is what turns a
+    /// corrupt position into a refusal instead of a bitmap that silently grows
+    /// past the rows it is supposed to mask.
+    pub fn part_by_pid(&mut self, pid: u64) -> Option<(usize, usize)> {
+        let set = peek(&mut self.parts, &self.txn);
+        set.index_of(pid).map(|i| (i, set.part(i).n_rows))
+    }
+
+    /// Start the table's identity counter above `floor`. See
+    /// [`PartSet::seed_pids`]; a no-op once the table holds any part.
+    pub fn seed_pids(&mut self, floor: u64) {
+        let mut none = None;
+        edit(&mut self.parts, &mut none).seed_pids(floor);
+    }
+
+    /// Stop [`Table::flush`] and the bulk ingest path compacting on their own.
+    ///
+    /// Set for the duration of a log replay, and it is a correctness
+    /// requirement rather than a speed-up -- though it is both. A mask record
+    /// names a part by identity, and a merge *retires* an identity: a
+    /// spontaneous compaction part way through the record stream can consume
+    /// the very part a later record cites, and the two are not in step because
+    /// a replayed insert need not pack the way the statements that produced it
+    /// did. Suppressing it makes replay's part list append-only, which is what
+    /// the resolution depends on. Recovery then compacts once, deliberately,
+    /// at the end.
+    ///
+    /// Measured on a 64 MiB log: 3911 ms -> 1177 ms, and the first full scan
+    /// afterwards was 764 ms against 783 ms -- not slower.
+    pub fn set_replaying(&mut self, on: bool) {
+        self.replaying = on;
+    }
+
+    /// Bring the part count down to what auto-compaction would have left,
+    /// after a replay that suppressed it.
+    ///
+    /// A loop, because one pass takes at most `AUTO_COMPACT_PARTS / 2` parts
+    /// and stops: a single call on 39 parts leaves 31.
+    pub fn compact_to_steady(&mut self) -> Result<()> {
+        while self.part_count() >= AUTO_COMPACT_PARTS {
+            let before = self.part_count();
+            self.maybe_auto_compact()?;
+            if self.part_count() >= before {
+                break;
+            }
+        }
+        Ok(())
     }
     /// Monotonic version of the part set this session reads. Bumped by every
     /// mutation, so a cached plan can tell whether the storage under it moved.
@@ -1194,8 +1268,16 @@ impl Table {
         Ok(())
     }
 
-    /// Mark a row deleted by absolute `(part, position)`. Used by
-    /// `ALTER TABLE ... DELETE WHERE`, which locates rows by scanning.
+    /// Mark a row deleted by absolute `(part index, position)`.
+    ///
+    /// Recovery's half of an unkeyed `DELETE`: `persist::store` resolves a
+    /// log record's part identity to an index with [`Table::part_by_pid`] and
+    /// applies the positions through here. Returns whether the row was live,
+    /// which is what makes replaying a record twice a no-op -- and a coarse
+    /// checkpoint watermark guarantees that happens.
+    ///
+    /// The caller must have bounds-checked `pos` against the part's row
+    /// count; `part_by_pid` returns it for exactly that.
     pub fn mark_deleted(&mut self, part: usize, pos: usize) -> bool {
         let set = edit(&mut self.parts, &mut self.txn);
         if part >= set.len() {
@@ -1238,30 +1320,39 @@ impl Table {
         pred: Option<&BoundExpr>,
         zone: &[ZoneFilter],
     ) -> Result<usize> {
-        self.delete_where_keys(projection, pred, zone, None)
+        self.delete_where_keys(projection, pred, zone, SweepLog::None)
     }
 
-    /// [`Table::delete_where`], additionally collecting the primary-key lane
-    /// of every row it hid.
+    /// [`Table::delete_where`], additionally recording what the log needs to
+    /// replay it.
     ///
-    /// A logging session with a keyed table needs them:
-    /// [`crate::persist::Wal::append_delete`] names a row by key lane and
-    /// there is no other delete record, so the lanes are what makes the sweep
-    /// replayable. A table with no single-column key passes `None` and gets
-    /// its durability from `Session::fold_to_parts` instead -- asking for
-    /// lanes there would read a column that is not the key. They have to be
-    /// the rows *newly* hidden rather than
-    /// the rows the predicate matched -- a row an earlier statement already
-    /// tombstoned is not part of this statement's effect, and logging it again
-    /// would make the count the caller reports disagree with the log. Reading
-    /// one is a packed-lane load at a position the sweep already holds, which
-    /// is why it happens here instead of in a second pass.
+    /// Both kinds of table have a durable name for a hidden row and they are
+    /// not the same kind of name, so `sink` carries whichever applies:
+    ///
+    ///   * a **keyed** table names the row by its primary-key *lane*
+    ///     ([`crate::persist::Wal::append_delete`]) -- a value, which survives
+    ///     anything that moves the row;
+    ///   * an **unkeyed** table names it by `(part identity, position)`
+    ///     ([`crate::persist::Wal::append_masks`]), which survives because a
+    ///     checkpointed part is rebuilt from a file that holds the same rows
+    ///     at the same offsets under the same identity. Rows in a part with no
+    ///     durable home have no such name; they are counted in
+    ///     [`MaskRuns::dark`] and the caller writes the table out for them.
+    ///
+    /// Either way it is the rows *newly* hidden rather than the rows the
+    /// predicate matched -- a row an earlier statement already tombstoned is
+    /// not part of this statement's effect, and naming it again would make the
+    /// count the caller reports disagree with the log. Both are read at a
+    /// position the sweep already holds, which is why it happens here rather
+    /// than in a second pass, and neither allocates per row: a lane goes into
+    /// a `Vec` the caller reuses, a position into one to three bytes of
+    /// delta-varint.
     pub fn delete_where_keys(
         &mut self,
         projection: &[usize],
         pred: Option<&BoundExpr>,
         zone: &[ZoneFilter],
-        mut keys: Option<&mut Vec<u64>>,
+        mut sink: SweepLog<'_>,
     ) -> Result<usize> {
         // Buffered rows are not in any part, and a position is only meaningful
         // inside one. Free when the caller already planned a query.
@@ -1273,11 +1364,15 @@ impl Table {
         // before it visible, which is exactly the guarantee `publish` exists to
         // restore. The clone is two `Vec`s of pointers: O(parts).
         let mut set = peek(&mut self.parts, &self.txn).clone();
-        let pk = keys.as_ref().and(self.pk_col);
+        let pk = matches!(sink, SweepLog::Keys(_)).then_some(self.pk_col).flatten();
         let mut sel: Vec<u32> = Vec::new();
         let mut hidden = 0usize;
 
         for pi in 0..set.len() {
+            // One relaxed load per part, not one per row -- and stable
+            // across the tombstones below, because hiding a row retracts the
+            // *file* claim and never the identity.
+            let cite = set.citable(pi);
             // One refcount bump per part detaches it from `set`'s borrow, so
             // the sweep can tombstone into the same set it is reading without
             // re-resolving the part per row.
@@ -1299,8 +1394,17 @@ impl Table {
                     if !set.tombstone(pi, base + off) {
                         return 0;
                     }
-                    if let (Some(k), Some(c)) = (keys.as_deref_mut(), lanes) {
-                        k.push(c.lane(off));
+                    match &mut sink {
+                        SweepLog::Keys(k) => {
+                            if let Some(c) = lanes {
+                                k.push(c.lane(off));
+                            }
+                        }
+                        SweepLog::Masks(m) => match cite {
+                            Some(pid) => m.hide(pid, (base + off) as u64),
+                            None => m.dark += 1,
+                        },
+                        SweepLog::None => {}
                     }
                     1
                 };
@@ -1486,6 +1590,9 @@ impl Table {
     /// table, so a large compacted part is left alone and merge cost stays
     /// proportional to the churn rather than to the data.
     fn maybe_auto_compact(&mut self) -> Result<()> {
+        if self.replaying {
+            return Ok(());
+        }
         let set = peek(&mut self.parts, &self.txn);
         if set.len() < AUTO_COMPACT_PARTS {
             return Ok(());
@@ -3443,14 +3550,14 @@ mod tests {
 
         let mut keys = Vec::new();
         let p = pred(0, BinaryOp::LtEq, Value::UInt(2), DataType::UInt64);
-        assert_eq!(t.delete_where_keys(&[0], Some(&p), &[], Some(&mut keys)).unwrap(), 2);
+        assert_eq!(t.delete_where_keys(&[0], Some(&p), &[], SweepLog::Keys(&mut keys)).unwrap(), 2);
         keys.sort_unstable();
         assert_eq!(keys, vec![1, 2], "primary-key lanes, not positions");
 
         // Overlapping re-run: only the newly hidden row is reported.
         let mut keys = Vec::new();
         let p = pred(0, BinaryOp::LtEq, Value::UInt(3), DataType::UInt64);
-        assert_eq!(t.delete_where_keys(&[0], Some(&p), &[], Some(&mut keys)).unwrap(), 1);
+        assert_eq!(t.delete_where_keys(&[0], Some(&p), &[], SweepLog::Keys(&mut keys)).unwrap(), 1);
         assert_eq!(keys, vec![3]);
     }
 

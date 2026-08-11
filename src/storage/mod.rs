@@ -17,8 +17,8 @@ pub mod table;
 pub use column::PackedColumn;
 pub use delta::{Delta, DeltaEntry};
 pub use granule::{Granule, PkIndex, Stats};
-pub use part::Part;
+pub use part::{MaskRuns, Part};
 pub use table::{
-    sort_permutation, ColumnCompression, CompressionReport, RowLoc, Table, AUTO_COMPACT_PARTS,
-    BULK_INSERT_THRESHOLD,
+    sort_permutation, ColumnCompression, CompressionReport, RowLoc, SweepLog, Table,
+    AUTO_COMPACT_PARTS, BULK_INSERT_THRESHOLD,
 };
